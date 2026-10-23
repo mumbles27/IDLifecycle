@@ -1,0 +1,7 @@
+bin/
+*.db
+*.db-wal
+*.db-shm
+secret.key
+scripts/Logs/
+tests/powershell/**/Logs/

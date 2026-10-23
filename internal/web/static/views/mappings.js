@@ -1,0 +1,159 @@
+// Attribute mappings: global templates that compute AD attributes from source records.
+
+import { api } from '../api.js';
+import {
+  h, replaceContent, pageHeader, pill, dataTable, listItems, act, confirmDialog, toast,
+  errorBox, loading, field, inputText, inputNumber, inputArea, inputCheck, formModal, mutBtn, truncCell, notice,
+} from '../ui.js';
+import {
+  selectWithHelp, previewPanel, MODE_OPTIONS, MODE_INFO, ON_EMPTY_OPTIONS, ON_EMPTY_INFO,
+  VALUE_TYPE_OPTIONS, VALUE_TYPE_INFO,
+} from '../components.js';
+
+export async function render(root, ctx) {
+  const isAdmin = ctx.can('admin');
+  const listEl = h('div', null, loading());
+  const header = pageHeader('Attribute mappings',
+    isAdmin ? mutBtn('New mapping', { class: 'btn-primary', 'data-test': 'new-mapping', onclick: () => openEditor(null) }) : null);
+
+  root.append(header, explainer(), listEl);
+
+  function explainer() {
+    return h('details', { class: 'card explain', open: true },
+      h('summary', null, 'How mappings and modes work'),
+      h('p', null, 'Each mapping renders a template from the HR source record and writes it to one AD attribute. Mappings apply to everyone; role rules can override an attribute for matching people. ', h('code', null, 'employeeID'), ' (the link key) is always treated as immutable.'),
+      h('dl', { class: 'kv kv-wide' },
+        Object.keys(MODE_INFO).flatMap((k) => [h('dt', null, pill(k)), h('dd', null, MODE_INFO[k])])));
+  }
+
+  async function load() {
+    let items;
+    try {
+      items = listItems(await api.get('/mappings', { limit: 500 }));
+    }
+    catch (e) {
+      replaceContent(listEl, errorBox(e));
+      return;
+    }
+    items.sort((a, b) => (a.sort_order - b.sort_order) || String(a.name).localeCompare(String(b.name)));
+    const columns = [
+      { label: 'Order', key: 'sort_order', className: 'num' },
+      { label: 'Name', render: (m) => h('strong', null, m.name) },
+      { label: 'Target attribute', render: (m) => h('code', null, m.target_attr) },
+      { label: 'Template', render: (m) => h('span', { class: 'mono' }, truncCell(m.template, 60)) },
+      { label: 'Mode', render: (m) => pill(m.mode) },
+      { label: 'On empty', key: 'on_empty' },
+      { label: 'Type', key: 'value_type' },
+      { label: 'Enabled', render: (m) => pill(m.enabled ? 'enabled' : 'disabled') },
+    ];
+    if (isAdmin) {
+      columns.push({
+        label: 'Actions',
+        className: 'col-actions',
+        render: (m) => h('div', { class: 'row-actions' },
+          mutBtn('Edit', { class: 'btn-sm', 'data-test': 'edit-mapping', onclick: () => openEditor(m) }),
+          mutBtn('Delete', { class: 'btn-sm btn-danger', 'data-test': 'delete-mapping', onclick: (e) => remove(m, e.currentTarget) })),
+      });
+    }
+    replaceContent(listEl, dataTable(columns, items, {
+      caption: 'Attribute mappings',
+      empty: 'No mappings yet. Add one to start populating AD attributes.',
+    }));
+    load.items = items;
+  }
+
+  async function remove(m, button) {
+    const ok = await confirmDialog({
+      title: 'Delete mapping',
+      message: `Delete the mapping "${m.name}" (${m.target_attr})? Future runs will no longer manage this attribute. Existing AD values are not changed.`,
+      confirmLabel: 'Delete',
+      danger: true,
+    });
+    if (!ok) {
+      return;
+    }
+    await act(button, async () => {
+      await api.del(`/mappings/${encodeURIComponent(m.id)}`);
+      toast('Mapping deleted.', 'ok');
+      await load();
+    });
+  }
+
+  function openEditor(existing) {
+    const items = load.items || [];
+    const nextOrder = items.reduce((mx, m) => Math.max(mx, Number(m.sort_order) || 0), 0) + 10;
+    const model = {
+      name: '',
+      target_attr: '',
+      template: '',
+      mode: 'sync',
+      on_empty: 'skip',
+      value_type: 'string',
+      enabled: true,
+      sort_order: nextOrder,
+      description: '',
+      ...(existing || {}),
+    };
+    const preview = previewPanel({
+      getTemplates: () => [{ label: model.target_attr || 'Result', template: model.template }],
+    });
+
+    const tpl = inputArea(model, 'template', {
+      rows: '3',
+      class: 'mono',
+      required: true,
+      placeholder: '{{ .FirstName }} {{ .LastName }}',
+      'data-test': 'map-template',
+      oninput: () => preview.run(),
+    });
+    const target = inputText(model, 'target_attr', { required: true, placeholder: 'displayName', 'data-test': 'map-target', oninput: () => preview.run() });
+    const name = inputText(model, 'name', { required: true, placeholder: 'Display name', 'data-test': 'map-name' });
+
+    const form = h('div', { class: 'editor-cols' },
+      h('div', { class: 'editor-main' },
+        field('Name', name, { required: true }),
+        field('Target attribute (LDAP name)', target, { required: true, help: 'The AD attribute to write, e.g. displayName, title, department, manager.' }),
+        field('Template', tpl, { required: true, help: 'Go template evaluated against the source record.' }),
+        selectWithHelp('Mode', model, 'mode', MODE_OPTIONS, MODE_INFO, { 'data-test': 'map-mode' }),
+        selectWithHelp('When the result is empty', model, 'on_empty', ON_EMPTY_OPTIONS, ON_EMPTY_INFO),
+        selectWithHelp('Value type', model, 'value_type', VALUE_TYPE_OPTIONS, VALUE_TYPE_INFO),
+        h('div', { class: 'field-row' },
+          field('Order', inputNumber(model, 'sort_order', { step: '1' }), { help: 'Lower numbers are evaluated first.' }),
+          inputCheck(model, 'enabled', 'Enabled')),
+        field('Description', inputArea(model, 'description', { rows: '2' }))),
+      h('div', { class: 'editor-side' }, preview.el));
+
+    formModal({
+      title: existing ? `Edit mapping: ${existing.name}` : 'New mapping',
+      content: [existing && existing.target_attr && String(existing.target_attr).toLowerCase() === 'employeeid'
+        ? notice('warn', 'employeeID is the link key between the source and AD and is always enforced as immutable.') : null, form],
+      wide: true,
+      submitLabel: existing ? 'Save mapping' : 'Create mapping',
+      onSubmit: async () => {
+        const body = {
+          name: model.name.trim(),
+          target_attr: model.target_attr.trim(),
+          template: model.template,
+          mode: model.mode,
+          on_empty: model.on_empty,
+          value_type: model.value_type,
+          enabled: Boolean(model.enabled),
+          sort_order: Number(model.sort_order) || 0,
+          description: model.description || '',
+        };
+        if (existing) {
+          await api.put(`/mappings/${encodeURIComponent(existing.id)}`, { ...existing, ...body });
+        }
+        else {
+          await api.post('/mappings', body);
+        }
+        toast(existing ? 'Mapping saved.' : 'Mapping created.', 'ok');
+        await load();
+        return true;
+      },
+    });
+    preview.run();
+  }
+
+  await load();
+}

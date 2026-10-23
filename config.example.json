@@ -1,0 +1,19 @@
+{
+  "listen": "127.0.0.1:8443",
+  "tls": {
+    "cert_file": "",
+    "key_file": ""
+  },
+  "data_dir": "C:\\ProgramData\\IDLifecycle",
+  "database": {
+    "driver": "sqlite",
+    "dsn": "file:C:/ProgramData/IDLifecycle/idlifecycle.db"
+  },
+  "powershell": {
+    "exe": "pwsh.exe",
+    "scripts_dir": "C:\\Program Files\\IDLifecycle\\scripts",
+    "execution_policy": "RemoteSigned",
+    "timeout_seconds": 600
+  },
+  "log_level": "info"
+}

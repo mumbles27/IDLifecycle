@@ -1,0 +1,258 @@
+<#
+.SYNOPSIS
+    Disables AD user accounts for IDLifecycle (optionally strips groups, stamps a description, moves to a disabled OU).
+
+.DESCRIPTION
+    Reads ONE JSON request from stdin and writes ONE JSON response to stdout.
+
+    Request:
+      {"server":"", "idAttribute":"employeeID", "items":[
+         {"changeId":"c1","externalId":"E1001","objectGuid":"<guid>","moveTo":"OU=Disabled,DC=...",
+          "removeGroups":["GG-AllStaff"],"description":"Disabled by IDLifecycle 2026-10-16"} ]}
+
+    Per item the script finds the account by objectGuid (all items in one bulk query), VERIFIES that its
+    idAttribute equals externalId (otherwise the item fails and nothing is touched), then:
+      1. disables the account (if it is enabled),
+      2. sets the description (if given and different),
+      3. removes it from the listed groups it is a member of (sAMAccountName or DN; unknown groups are warned and ignored),
+      4. moves it to moveTo (if given and it is not already there; the OU must exist).
+    It is idempotent: an already-disabled account still gets steps 2-4; if nothing needed doing the status is "skipped".
+    One failing item never stops the others.
+
+    Response: {"ok":true,"dryRun":false,"results":[{"changeId","externalId","status":"applied|would|skipped|failed",
+    "message","objectGuid","dn","sam","upn","error"}],"summary":{"total","applied","would","skipped","failed"}}
+
+.PARAMETER DryRun
+    Do every lookup and log/report everything as WOULD: statements, but make NO changes. Successful items
+    come back with status "would".
+
+.EXAMPLE
+    '{"idAttribute":"employeeID","items":[{"changeId":"c1","externalId":"E1001","objectGuid":"11111111-1111-1111-1111-111111111111"}]}' |
+        pwsh -NoProfile -File .\Disable-IDLUser.ps1 -DryRun
+
+.EXAMPLE
+    Get-Content .\disable-request.json -Raw | pwsh -NoProfile -File .\Disable-IDLUser.ps1 | ConvertFrom-Json
+
+.NOTES
+    Requires PowerShell 7+, the ActiveDirectory module, and delegated rights to disable/move users and change
+    group membership. Exit codes: 0 ok, 1 some items failed, 2 invalid input, 3 module missing, 4 cannot reach AD,
+    5 unexpected error. Logs and the CSV report (Disable-IDLUser_Report_<ts>.csv) are written to $PSScriptRoot\Logs.
+#>
+
+#Requires -Version 7.0
+
+[CmdletBinding()]
+param(
+    [switch]$DryRun
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+Import-Module (Join-Path $PSScriptRoot 'IDLifecycle.Common.psm1') -Force
+
+$exitCode = 5
+$response = $null
+
+try{
+    Start-IDLRun -ScriptName 'Disable-IDLUser' -ScriptRoot $PSScriptRoot -IsAction -DryRun:$DryRun -Parameters @{ DryRun = [bool]$DryRun }
+
+    # ---- Phase: read and validate the request ----
+    $request = Read-IDLRequest
+    $common = Get-IDLRequestCommon -Request $request -RequireItems
+    $server = $common.Server
+    $idAttribute = $common.IdAttribute
+    $items = $common.Items
+    Add-IDLCounter -Name 'Total' -By $items.Count
+    Write-IDLLog ("Request: server='{0}' idAttribute={1} items={2}" -f $server, $idAttribute, $items.Count)
+
+    # ---- Phase: dependencies and connection ----
+    try{
+        Import-Module ActiveDirectory -Global -ErrorAction Stop
+        if (-not (Get-Module -Name ActiveDirectory)){
+            throw 'ActiveDirectory module did not load.'
+        }
+    }
+    catch{
+        throw (New-IDLException -Kind Dependency -Message "ActiveDirectory module could not be loaded: $($_.Exception.Message)" -InnerException $_.Exception)
+    }
+
+    Write-IDLLog "ActiveDirectory module loaded (version $((Get-Module ActiveDirectory).Version))"
+    Test-IDLAdConnection -Server $server
+    $serverParams = Get-IDLServerParams -Server $server
+
+    # ---- Phase: bulk resolution ----
+    $phase = Start-IDLPhase -Name 'Resolve accounts and groups'
+    $needDescription = $false
+    $needMemberOf = $false
+    $allGroups = [System.Collections.Generic.List[string]]::new()
+    foreach ($item in $items){
+        if (-not [string]::IsNullOrWhiteSpace((ConvertTo-IDLString -Value (Get-IDLField -Object $item -Name 'description')))){
+            $needDescription = $true
+        }
+
+        $groups = Get-IDLStringList -Value (Get-IDLField -Object $item -Name 'removeGroups')
+        if ($groups.Count -gt 0){
+            $needMemberOf = $true
+            $allGroups.AddRange($groups)
+        }
+    }
+
+    $extraProperties = @()
+    if ($needDescription){
+        $extraProperties += 'description'
+    }
+
+    if ($needMemberOf){
+        $extraProperties += 'memberOf'
+    }
+
+    $targets = Resolve-IDLTargetUsers -Items $items -IdAttribute $idAttribute -Server $server -ExtraProperties $extraProperties
+    $groupMap = Resolve-IDLGroups -Identities $allGroups.ToArray() -Server $server
+    Stop-IDLPhase -Phase $phase
+
+    # ---- Phase: process items ----
+    $phase = Start-IDLPhase -Name 'Process items'
+    $results = [System.Collections.Generic.List[object]]::new()
+
+    for ($i = 0; $i -lt $items.Count; $i++){
+        $item = $items[$i]
+        $changeId = ConvertTo-IDLString -Value (Get-IDLField -Object $item -Name 'changeId')
+        $externalId = ConvertTo-IDLString -Value (Get-IDLField -Object $item -Name 'externalId')
+        $target = $targets[$i]
+        $user = $target.User
+        $done = [System.Collections.Generic.List[string]]::new()
+        $result = $null
+
+        try{
+            if ($target.Status -ne 'Found'){
+                $userFields = Get-IDLUserFields -User $user
+                $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status failed -Message $target.Message -ErrorText $target.Message @userFields
+                Add-IDLReportRow -Action 'DisableUser' -Result 'Failed' -Identity $externalId -Details $target.Status -ErrorText $target.Message
+                $results.Add($result)
+                Register-IDLResult -Result $result
+                continue
+            }
+
+            $identity = [string]$user.SamAccountName
+            $userDn = [string]$user.DistinguishedName
+            Write-IDLLog "Processing $changeId ($externalId) -> $userDn"
+
+            $description = ConvertTo-IDLString -Value (Get-IDLField -Object $item -Name 'description')
+            $moveTo = ConvertTo-IDLString -Value (Get-IDLField -Object $item -Name 'moveTo')
+            $moveTo = (($null -eq $moveTo) ? ('') : ($moveTo.Trim()))
+            # Throws (item fails, nothing changed) for ambiguous or privileged groups.
+            $removeInfo = Get-IDLGroupDns -Identities (Get-IDLStringList -Value (Get-IDLField -Object $item -Name 'removeGroups')) -GroupMap $groupMap
+            foreach ($missingGroup in $removeInfo.Missing){
+                Write-IDLLog "  Group '$missingGroup' not found; nothing to remove" 'WARN'
+            }
+
+            $removeDns = $removeInfo.Dns
+
+            # Validate the destination before touching anything.
+            if ($moveTo -ne ''){
+                if (-not (Test-IDLDnShape -Value $moveTo)){
+                    throw "moveTo is not a distinguished name: $moveTo"
+                }
+
+                if (-not (Test-IDLContainerExists -Dn $moveTo -Server $server)){
+                    throw "Target OU does not exist: $moveTo"
+                }
+            }
+
+            $changes = 0
+            $guid = [guid]$user.ObjectGUID
+
+            if ([bool]$user.Enabled){
+                $changes++
+                if ($DryRun){
+                    Write-IDLLog "  WOULD: disable $identity"
+                    Add-IDLReportRow -Action 'DisableAccount' -Result 'Would' -Identity $identity -ObjectIdOrDN $userDn
+                    $done.Add('would disable')
+                }
+                else{
+                    Disable-ADAccount -Identity $guid @serverParams
+                    Write-IDLLog "  Disabled $identity"
+                    Add-IDLReportRow -Action 'DisableAccount' -Result 'Applied' -Identity $identity -ObjectIdOrDN $userDn
+                    $done.Add('disabled')
+                }
+            }
+            else{
+                Write-IDLLog "  $identity is already disabled"
+            }
+
+            if (
+                (-not [string]::IsNullOrWhiteSpace($description)) -and
+                ((Get-IDLAdValue -Object $user -Name 'description') -cne $description)
+            ){
+                $changes++
+                if ($DryRun){
+                    Write-IDLLog "  WOULD: set description on $identity"
+                    Add-IDLReportRow -Action 'SetDescription' -Result 'Would' -Identity $identity -ObjectIdOrDN $userDn -Details $description
+                    $done.Add('would set description')
+                }
+                else{
+                    Set-ADUser -Identity $guid -Replace @{ description = $description } @serverParams
+                    Write-IDLLog "  Set description on $identity"
+                    Add-IDLReportRow -Action 'SetDescription' -Result 'Applied' -Identity $identity -ObjectIdOrDN $userDn -Details $description
+                    $done.Add('set description')
+                }
+            }
+
+            if ($removeDns.Count -gt 0){
+                $changes += Update-IDLGroupMembership -User $user -RemoveDns $removeDns -Server $server -DryRun:$DryRun -Done $done
+            }
+
+            $finalDn = $userDn
+            if ($moveTo -ne ''){
+                $newDn = Move-IDLUser -User $user -TargetOu $moveTo -Server $server -DryRun:$DryRun -Done $done
+                if ($null -ne $newDn){
+                    $changes++
+                    $finalDn = $newDn
+                }
+            }
+
+            $userFields = Get-IDLUserFields -User $user -DnOverride $finalDn
+            if ($changes -eq 0){
+                $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status skipped -Message 'nothing to do (already disabled)' @userFields
+                Add-IDLReportRow -Action 'DisableUser' -Result 'Skipped' -Identity $identity -ObjectIdOrDN $userDn -Details 'already in desired state'
+            }
+            elseif ($DryRun){
+                $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status would -Message ($done -join '; ') @userFields
+            }
+            else{
+                $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status applied -Message ($done -join '; ') @userFields
+            }
+        }
+        catch{
+            $errorText = Protect-IDLText -Text $_.Exception.Message
+            Write-IDLLog "  Item $changeId failed: $errorText" 'ERROR'
+            Write-IDLLog "  Stack: $($_.ScriptStackTrace)" 'DEBUG'
+            $userFields = Get-IDLUserFields -User $user
+            $message = (($done.Count -gt 0) ? ('failed after: ' + ($done -join '; ')) : ('failed'))
+            $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status failed -Message $message -ErrorText $errorText @userFields
+            Add-IDLReportRow -Action 'DisableUser' -Result 'Failed' -Identity $externalId -ObjectIdOrDN ([string]$userFields['Dn']) -Details $message -ErrorText $errorText
+        }
+
+        $results.Add($result)
+        Register-IDLResult -Result $result
+    }
+
+    Stop-IDLPhase -Phase $phase
+
+    $response = New-IDLActionResponse -Results $results.ToArray() -DryRun:$DryRun
+    $exitCode = (($response.summary.failed -gt 0) ? (1) : (0))
+}
+catch{
+    $exitCode = Get-IDLExitCode -Exception $_.Exception
+    $message = Protect-IDLText -Text $_.Exception.Message
+    Write-IDLLog "FATAL: $message" 'ERROR'
+    Write-IDLLog "Stack: $($_.ScriptStackTrace)" 'DEBUG'
+    $response = New-IDLErrorResponse -Message $message
+}
+finally{
+    Stop-IDLRun -ExitCode $exitCode
+}
+
+Write-IDLResponse -Response $response
+exit $exitCode
