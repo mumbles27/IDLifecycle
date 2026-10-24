@@ -139,6 +139,51 @@ $null = Get-ADUser -Identity jdoe
         @($calls | ForEach-Object { $_.cmdlet } | Select-Object -Unique) -join ',' | Should Be 'Add-ADGroupMember,Remove-ADGroupMember'
     }
 
+    It 'models child objects: Remove-ADUser and non-recursive Remove-ADObject throw the leaf-object error, -Recursive deletes the subtree' {
+        $jane = New-StubUserEntry -Sam 'jdoe' -ExternalId 'E1001' -Cn 'Jane Doe'
+        $bob = New-StubUserEntry -Sam 'bsmith' -ExternalId 'E1002' -Cn 'Bob Smith'
+        $eas = "CN=ExchangeActiveSyncDevices,$($jane.dn)"
+        $objects = @(
+            @{ dn = $eas; objectClass = 'msExchActiveSyncDevices' },
+            @{ dn = "CN=Phone1,$eas"; objectClass = 'msExchActiveSyncDevice' }
+        )
+        $state = New-StandardState -Users @($jane, $bob) -Objects $objects
+        $code = @"
+`$one = @(Get-ADObject -LDAPFilter '(objectClass=*)' -SearchBase '$($jane.dn)' -SearchScope OneLevel)
+"onelevel=" + `$one.Count + "|" + `$one[0].ObjectClass
+`$sub = @(Get-ADObject -LDAPFilter '(objectClass=*)' -SearchBase '$($jane.dn)' -SearchScope Subtree)
+"subtree=" + `$sub.Count
+try { Remove-ADUser -Identity jdoe -Confirm:`$false } catch { "removeuser=" + `$_.Exception.Message }
+try { Remove-ADObject -Identity '$($jane.objectGuid)' -Confirm:`$false } catch { "removeobject=" + `$_.Exception.Message }
+Remove-ADObject -Identity '$($jane.objectGuid)' -Recursive -Confirm:`$false
+Remove-ADUser -Identity bsmith -Confirm:`$false
+"done=1"
+"@
+        $r = Invoke-Snippet -State $state -Code $code
+        $r.StdOutRaw | Should Match 'onelevel=1\|msExchActiveSyncDevices'
+        $r.StdOutRaw | Should Match 'subtree=3'
+        $r.StdOutRaw | Should Match 'removeuser=.*only on a leaf object'
+        $r.StdOutRaw | Should Match 'removeobject=.*only on a leaf object'
+        $r.StdOutRaw | Should Match 'done=1'
+        $after = Read-StubStateFile -Path $state
+        @($after.users).Count | Should Be 0
+        @($after.objects).Count | Should Be 0
+        $calls = Get-StubCalls -Path $state
+        @($calls | ForEach-Object { $_.cmdlet }) -join ',' | Should Be 'Remove-ADUser,Remove-ADObject,Remove-ADObject,Remove-ADUser'
+        $calls[0].result | Should Match '^error'
+        $calls[1].result | Should Match '^error'
+        $calls[2].result | Should Be 'ok'
+        $calls[2].args.Recursive | Should Be 'True'
+    }
+
+    It 'moves child objects together with their parent user' {
+        $jane = New-StubUserEntry -Sam 'jdoe' -ExternalId 'E1001' -Cn 'Jane Doe'
+        $state = New-StandardState -Users @($jane) -Objects @(@{ dn = "CN=ExchangeActiveSyncDevices,$($jane.dn)"; objectClass = 'msExchActiveSyncDevices' })
+        $r = Invoke-Snippet -State $state -Code "Move-ADObject -Identity jdoe -TargetPath 'OU=Disabled,DC=stub,DC=test'; 'ok'"
+        $r.StdOutRaw | Should Match 'ok'
+        @((Read-StubStateFile -Path $state).objects)[0].dn | Should Be "CN=ExchangeActiveSyncDevices,CN=Jane Doe,OU=Disabled,$script:Root"
+    }
+
     It 'throws a connection error from every cmdlet when failConnect is set' {
         $state = New-StubStateFile -FailConnect $true
         $r = Invoke-Snippet -State $state -Code 'try { Get-ADRootDSE } catch { "type=" + $_.Exception.GetType().Name }'

@@ -21,7 +21,9 @@ import (
 	"idlifecycle/internal/ad"
 	"idlifecycle/internal/api"
 	"idlifecycle/internal/config"
+	"idlifecycle/internal/datadir"
 	"idlifecycle/internal/engine"
+	"idlifecycle/internal/notify"
 	"idlifecycle/internal/scheduler"
 	"idlifecycle/internal/secrets"
 	"idlifecycle/internal/sources"
@@ -55,14 +57,26 @@ func NewLogger(cfg config.Config, alsoStderr bool) (*slog.Logger, io.Closer, err
 	return slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{Level: level})), lj, nil
 }
 
-// OpenStore connects using the bootstrap config.
+// OpenStore connects using the bootstrap config and keys the audit hash chain. Every writer (the service
+// and the CLI) must go through here: an entry written without the key breaks verification for good.
 func OpenStore(ctx context.Context, cfg config.Config) (*store.Store, error) {
 	dsn, err := cfg.ResolvedDSN()
 	if err != nil {
 		return nil, err
 	}
-	return store.Open(ctx, cfg.Database.Driver, dsn)
+	cipher, err := secrets.Load(cfg.DataDir)
+	if err != nil {
+		return nil, fmt.Errorf("secrets: %w", err)
+	}
+	st, err := store.Open(ctx, cfg.Database.Driver, dsn)
+	if err != nil {
+		return nil, err
+	}
+	st.SetAuditKey(cipher.Derive(auditKeyLabel))
+	return st, nil
 }
+
+const auditKeyLabel = "audit-chain-v1"
 
 // App is a running service instance.
 type App struct {
@@ -78,6 +92,9 @@ type App struct {
 
 // New builds everything and verifies prerequisites, but does not start serving.
 func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error) {
+	if err := datadir.Check(cfg.DataDir); err != nil {
+		return nil, err
+	}
 	st, err := OpenStore(ctx, cfg)
 	if err != nil {
 		return nil, err
@@ -100,11 +117,17 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error)
 			log.Warn("AD script missing; syncs will fail until it is installed", "script", f, "dir", cfg.PowerShell.ScriptsDir)
 		}
 	}
+	if blocked := ad.BlockedScripts(cfg.PowerShell.ScriptsDir); len(blocked) > 0 {
+		log.Error("PowerShell scripts are blocked (downloaded-file mark); with execution policy "+cfg.PowerShell.ExecutionPolicy+
+			" they will not run. Fix: Get-ChildItem <scripts_dir> -Recurse | Unblock-File (the installer does this)",
+			"dir", cfg.PowerShell.ScriptsDir, "files", blocked)
+	}
 
 	sources.PathPolicy = cfg.CSVPathPolicy()
-	st.SetAuditKey(cipher.Derive("audit-chain-v1"))
 
+	notifier := &notify.Service{Settings: st.GetSettings, Cipher: cipher, Log: log}
 	eng := engine.New(st, pwsh, cipher, log)
+	eng.Notifier = notifier
 	if err := eng.Recover(ctx); err != nil {
 		_ = st.Close()
 		return nil, fmt.Errorf("recover: %w", err)
@@ -113,7 +136,7 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error)
 
 	a := &App{Cfg: cfg, Log: log, Store: st, Engine: eng, Scheduler: sched}
 	apiSrv := &api.Server{
-		Store: st, Engine: eng, Cipher: cipher, Scheduler: sched, Static: web.Handler(), Log: log,
+		Store: st, Engine: eng, Cipher: cipher, Scheduler: sched, Notifier: notifier, Static: web.Handler(), Log: log,
 		Version: Version, TLS: cfg.TLSEnabled(), BaseCtx: ctx,
 	}
 	a.Server = &http.Server{

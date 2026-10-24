@@ -30,10 +30,13 @@ type Engine struct {
 	Cipher *secrets.Cipher
 	Log    *slog.Logger
 	Now    func() time.Time
+	// Notifier receives operator notifications (optional).
+	Notifier Notifier
 
-	runMu  sync.Mutex
-	execMu sync.Mutex
-	kick   chan struct{}
+	runMu        sync.Mutex
+	execMu       sync.Mutex
+	kick         chan struct{}
+	lastDeferred int // deletes held back by max_deletes_per_day at the last executor pass (guarded by execMu)
 
 	runCtx    context.Context
 	runCancel context.CancelFunc
@@ -161,7 +164,13 @@ func dedupe(in []string) []string {
 
 type openKey struct{ identity, typ string }
 
-func (e *Engine) sync(ctx context.Context, run *model.Run) error {
+// runNotes collects what a run should tell operators about.
+type runNotes struct {
+	pending    []string // "type display (external id)" of changes waiting for a human
+	thresholds []string // safety limits that held changes back
+}
+
+func (e *Engine) sync(ctx context.Context, run *model.Run, notes *runNotes) error {
 	cnt := run.Counters
 	st := e.Store
 
@@ -271,6 +280,7 @@ func (e *Engine) sync(ctx context.Context, run *model.Run) error {
 	}
 	var plans []plan
 	processed := map[string]bool{}
+	decided := map[string]bool{} // identities the planner reached a verdict for (with or without a change)
 	var planErrs []string
 
 	extCount := map[string]int{}
@@ -315,12 +325,13 @@ func (e *Engine) sync(ctx context.Context, run *model.Run) error {
 			e.Log.Error("plan failed", "identity", id.ExternalID, "error", err)
 			continue
 		}
+		decided[id.ID] = true
 		if p != nil && len(p.Observed) > 0 {
 			if id.Applied == nil {
 				id.Applied = map[string]string{}
 			}
 			for k, v := range p.Observed {
-				id.Applied[k] = v
+				setApplied(id.Applied, k, v)
 			}
 			if err := st.UpdateIdentity(ctx, id); err != nil {
 				return fmt.Errorf("update identity %s: %w", id.ExternalID, err)
@@ -354,9 +365,13 @@ func (e *Engine) sync(ctx context.Context, run *model.Run) error {
 		openBy[k] = append(openBy[k], c)
 	}
 
-	destructive := 0
+	destructive, deletes := 0, 0
 	for _, pl := range plans {
-		if pl.p.Type == model.ChangeDisable || pl.p.Type == model.ChangeDelete {
+		switch pl.p.Type {
+		case model.ChangeDelete:
+			deletes++
+			destructive++
+		case model.ChangeDisable:
 			destructive++
 		}
 	}
@@ -364,6 +379,13 @@ func (e *Engine) sync(ctx context.Context, run *model.Run) error {
 	if held {
 		e.Log.Warn("bulk-destructive guard tripped; disables/deletes need manual approval", "count", destructive, "limit", settings.Engine.MaxDestructivePerRun)
 		cnt["guard_tripped"] = 1
+		notes.thresholds = append(notes.thresholds, fmt.Sprintf("%d disables/deletes were planned in one run, above engine.max_destructive_per_run (%d); all of them need manual approval.", destructive, settings.Engine.MaxDestructivePerRun))
+	}
+	heldDeletes := settings.Engine.MaxDeletesPerRun > 0 && deletes > settings.Engine.MaxDeletesPerRun
+	if heldDeletes {
+		e.Log.Warn("delete limit per run exceeded; deletes need manual approval", "count", deletes, "limit", settings.Engine.MaxDeletesPerRun)
+		cnt["delete_guard_tripped"] = 1
+		notes.thresholds = append(notes.thresholds, fmt.Sprintf("%d deletes were planned in one run, above engine.max_deletes_per_run (%d); all of them need manual approval.", deletes, settings.Engine.MaxDeletesPerRun))
 	}
 
 	keep := map[string]bool{} // ids of open changes still valid
@@ -400,11 +422,18 @@ func (e *Engine) sync(ctx context.Context, run *model.Run) error {
 			Type: p.Type, Payload: p.Payload, Summary: p.Summary, PayloadHash: hash, CreatedAt: e.Now(),
 		}
 		destructiveChange := p.Type == model.ChangeDisable || p.Type == model.ChangeDelete
+		var holds []string
+		if held && destructiveChange {
+			holds = append(holds, fmt.Sprintf("HELD for manual approval: %d disables/deletes in one run exceeds the limit of %d", destructive, settings.Engine.MaxDestructivePerRun))
+		}
+		if heldDeletes && p.Type == model.ChangeDelete {
+			holds = append(holds, fmt.Sprintf("HELD for manual approval: %d deletes in one run exceeds the limit of %d", deletes, settings.Engine.MaxDeletesPerRun))
+		}
 		switch {
 		case settings.Engine.DryRun:
 			c.Status = model.StatusSimulated
 			cnt["simulated"]++
-		case settings.Approval.For(p.Type) == "auto" && !(held && destructiveChange):
+		case settings.Approval.For(p.Type) == "auto" && len(holds) == 0:
 			c.Status = model.StatusApproved
 			now := e.Now()
 			c.DecidedBy, c.DecidedAt, c.DecisionNote = "system:auto", &now, "auto-approved by policy"
@@ -412,8 +441,9 @@ func (e *Engine) sync(ctx context.Context, run *model.Run) error {
 		default:
 			c.Status = model.StatusPending
 			cnt["pending"]++
-			if held && destructiveChange && settings.Approval.For(p.Type) == "auto" {
-				c.Summary = append([]string{fmt.Sprintf("HELD for manual approval: %d disables/deletes in one run exceeds the limit of %d", destructive, settings.Engine.MaxDestructivePerRun)}, c.Summary...)
+			notes.pending = append(notes.pending, fmt.Sprintf("%s %s (%s)", c.Type, c.Display, c.ExternalID))
+			if len(holds) > 0 && settings.Approval.For(p.Type) == "auto" {
+				c.Summary = append(holds, c.Summary...)
 				cnt["held"]++
 			}
 		}
@@ -432,9 +462,13 @@ func (e *Engine) sync(ctx context.Context, run *model.Run) error {
 		}
 	}
 
-	// Plans that disappeared (data reverted, person left scope...) make open proposals obsolete.
+	// Plans that disappeared (data reverted, person rehired, someone fixed AD by hand...) make open proposals
+	// obsolete - including approved ones that have not run yet (e.g. approved during dry-run): applying a
+	// decision about a state that no longer exists is how a rehire gets disabled.
 	for _, oc := range open {
-		if (oc.Status == model.StatusPending || oc.Status == model.StatusSimulated) && processed[oc.IdentityID] && !keep[oc.ID] {
+		stale := oc.Status == model.StatusPending || oc.Status == model.StatusSimulated ||
+			(oc.Status == model.StatusApproved && decided[oc.IdentityID]) // a plan error is not a verdict
+		if stale && processed[oc.IdentityID] && !keep[oc.ID] {
 			e.supersede(ctx, oc, cnt)
 		}
 	}

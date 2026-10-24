@@ -19,6 +19,7 @@ import (
 
 	"idlifecycle/internal/engine"
 	"idlifecycle/internal/model"
+	"idlifecycle/internal/notify"
 	"idlifecycle/internal/secrets"
 	"idlifecycle/internal/store"
 )
@@ -40,6 +41,7 @@ type Server struct {
 	Engine    *engine.Engine
 	Cipher    *secrets.Cipher
 	Scheduler Scheduler
+	Notifier  *notify.Service // optional; a default one is built from Store/Cipher when nil
 	Static    http.Handler
 	Log       *slog.Logger
 	Version   string

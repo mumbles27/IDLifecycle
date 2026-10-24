@@ -32,10 +32,16 @@ export const db = {
   settings: {
     schedule: { enabled: true, kind: 'interval', interval_minutes: 60, daily_time: '02:00', cron_expr: '0 */4 * * *', timezone: 'America/Chicago' },
     approval: { create: 'manual', update: 'auto', disable: 'manual', enable: 'manual', delete: 'manual' },
-    engine: { dry_run: true, max_destructive_per_run: 10, delete_after_days: 30, remove_stale_groups: true, enforce_ou: false },
+    engine: { dry_run: true, max_destructive_per_run: 10, delete_after_days: 30, remove_stale_groups: true, enforce_ou: false, max_deletes_per_run: 5, max_deletes_per_day: 20 },
     ad: { server: '', search_bases: ['OU=Staff,DC=corp,DC=example,DC=com'], default_ou: 'OU=Staff,DC=corp,DC=example,DC=com', disabled_ou: '', id_attribute: 'employeeID', upn_suffix: 'corp.example.com', strip_groups_on_disable: true },
     naming: { sam_template: '{{ first .FirstName 1 | lower }}{{ .LastName | lower }}', upn_template: '{{ .FirstName | lower }}.{{ .LastName | lower }}', cn_template: '{{ .FirstName }} {{ .LastName }}', max_candidates: 9 },
     new_user: { password_length: 20, change_password_at_logon: true, enabled: true },
+    notifications: {
+      enabled: false, provider: 'm365_smtp', from: 'idlifecycle@corp.example.com', to: ['ops@corp.example.com'], subject_prefix: '[IDLifecycle]', gui_base_url: '',
+      smtp: { host: 'smtp.office365.com', port: 587, security: 'starttls', auth: 'oauth2', username: '', password: '' },
+      oauth: { tenant_id: 'corp.onmicrosoft.com', client_id: '00000000-0000-0000-0000-000000000001', client_secret: '********' },
+      events: { run_failed: true, approvals_pending: true, changes_failed: true, threshold: true, run_summary: false },
+    },
   },
   changes: [],
   runs: [
@@ -376,6 +382,14 @@ function route(method, path, params, body) {
       audit(db.session.user.username, 'settings.update', 'settings', 'all', {});
       return db.settings;
     }
+  }
+  if (method === 'POST' && path === '/notifications/test') {
+    need('admin');
+    const n = (body && body.notifications) || {};
+    if (!Array.isArray(n.to) || n.to.length === 0) {
+      return { ok: false, error: 'notifications.to needs at least one recipient' };
+    }
+    return { ok: true };
   }
   if (method === 'GET' && path === '/changes') {
     need('viewer');

@@ -23,6 +23,7 @@ import (
 	"idlifecycle/internal/api"
 	"idlifecycle/internal/app"
 	"idlifecycle/internal/config"
+	"idlifecycle/internal/datadir"
 	"idlifecycle/internal/model"
 	"idlifecycle/internal/store"
 )
@@ -33,6 +34,8 @@ Usage:
   idlifecycled run      [-config FILE]     run in the foreground (Ctrl+C to stop)
   idlifecycled service  [-config FILE]     run under the Windows Service Control Manager
   idlifecycled init     [-dir DIR] [-scripts DIR]   create a default config.json and data directory
+  idlifecycled lockdown [-config FILE] [-account NAME]  restrict the data directory to SYSTEM, Administrators,
+                                                      you and the service account (the service refuses to start otherwise)
   idlifecycled user add    -username NAME -role viewer|approver|admin [-config FILE]
   idlifecycled user passwd -username NAME [-config FILE]
   idlifecycled user list   [-config FILE]
@@ -58,6 +61,8 @@ func realMain(args []string, stdout, stderr io.Writer) int {
 		return runService(args[1:], stderr)
 	case "init":
 		return cmdInit(args[1:], stdout, stderr)
+	case "lockdown":
+		return cmdLockdown(args[1:], stdout, stderr)
 	case "user":
 		return cmdUser(args[1:], stdout, stderr)
 	case "version", "-v", "--version":
@@ -140,6 +145,11 @@ func cmdInit(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "error:", err)
 		return 1
 	}
+	// Before anything sensitive is written: under ProgramData the folder would otherwise inherit Users:Read.
+	if err := datadir.Lockdown(*dir); err != nil {
+		fmt.Fprintln(stderr, "error: restrict the data directory:", err)
+		return 1
+	}
 	path := filepath.Join(*dir, "config.json")
 	if _, err := os.Stat(path); err == nil {
 		fmt.Fprintf(stderr, "refusing to overwrite existing %s\n", path)
@@ -156,6 +166,35 @@ func cmdInit(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintf(stdout, "Wrote %s\n\nNext steps:\n  1. Copy the scripts folder to %s\n  2. idlifecycled user add -config %q -username admin -role admin\n  3. idlifecycled run -config %q   (or install the service with scripts\\Install-IDLifecycleService.ps1)\n  4. Open http://%s/ and finish configuration in the GUI. The service starts in DRY-RUN mode.\n",
 		path, cfg.PowerShell.ScriptsDir, path, path, cfg.Listen)
+	return 0
+}
+
+func cmdLockdown(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("lockdown", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	cfgPath := configFlag(fs)
+	account := fs.String("account", "", `service account to grant Modify (e.g. CORP\svc-idl$); omit when it runs as LocalSystem`)
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	if err := datadir.Lockdown(cfg.DataDir, *account); err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	if err := datadir.Check(cfg.DataDir); err != nil {
+		fmt.Fprintln(stderr, "error: still not restricted:", err)
+		return 1
+	}
+	who := "SYSTEM, Administrators and the current user"
+	if *account != "" {
+		who = "SYSTEM, Administrators, the current user and " + *account
+	}
+	fmt.Fprintf(stdout, "Restricted %s to %s\n", cfg.DataDir, who)
 	return 0
 }
 

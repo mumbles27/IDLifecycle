@@ -59,7 +59,13 @@ func ValidateRole(r model.RoleRule) error {
 			return fmt.Errorf("grants.groups[%d] is empty", i)
 		}
 	}
+	seen := map[string]bool{}
 	for i, a := range r.Grants.Attributes {
+		key := strings.ToLower(strings.TrimSpace(a.TargetAttr))
+		if seen[key] {
+			return fmt.Errorf("grants.attributes[%d]: %s is granted twice in this rule", i, a.TargetAttr)
+		}
+		seen[key] = true
 		if err := ValidateMapping(model.Mapping{Name: "grant", TargetAttr: a.TargetAttr, Template: a.Template, Mode: a.Mode, OnEmpty: a.OnEmpty, ValueType: a.ValueType}); err != nil {
 			return fmt.Errorf("grants.attributes[%d]: %w", i, err)
 		}
@@ -75,17 +81,11 @@ func ValidateMapping(m model.Mapping) error {
 	if strings.TrimSpace(m.TargetAttr) == "" {
 		return fmt.Errorf("target_attr is required")
 	}
-	if strings.ContainsAny(m.TargetAttr, " ,;=()*\\") {
-		return fmt.Errorf("target_attr %q is not a valid LDAP attribute name", m.TargetAttr)
+	if !attrNameRe.MatchString(m.TargetAttr) {
+		return fmt.Errorf("target_attr %q is not a valid LDAP attribute name (a letter, then letters, digits or '-', at most 64)", m.TargetAttr)
 	}
-	lower := strings.ToLower(m.TargetAttr)
-	switch lower {
-	case "samaccountname", "userprincipalname", "cn", "name", "distinguishedname", "objectguid", "objectsid", "memberof", "unicodepwd", "userpassword", "useraccountcontrol", "primarygroupid",
-		"altsecurityidentities", "serviceprincipalname", "scriptpath", "userworkstations", "admincount", "sidhistory", "ntsecuritydescriptor", "lockouttime", "pwdlastset":
-		return fmt.Errorf("%s is security-sensitive or managed by the naming policy / lifecycle and cannot be mapped", m.TargetAttr)
-	}
-	if strings.HasPrefix(lower, "msds-") || strings.HasPrefix(lower, "msexch") {
-		return fmt.Errorf("%s (msDS-*/msExch*) attributes cannot be mapped", m.TargetAttr)
+	if IsProtectedAttribute(m.TargetAttr) {
+		return fmt.Errorf("%s is security-sensitive, multi-valued or managed by the naming policy / lifecycle and cannot be mapped", m.TargetAttr)
 	}
 	switch m.Mode {
 	case model.ModeCreateOnly, model.ModeSync, model.ModeImmutable:
@@ -99,6 +99,47 @@ func ValidateMapping(m model.Mapping) error {
 		return fmt.Errorf("value_type must be string or user_ref")
 	}
 	return ValidateTemplate(m.Template)
+}
+
+// attrNameRe is the LDAP display-name shape the scripts accept (Test-IDLAttributeName).
+var attrNameRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9-]{0,63}$`)
+
+// ProtectedAttributes and ProtectedPrefixes may never be written through mappings or role grants. They MUST
+// match $script:IDLProtectedAttributes / $script:IDLProtectedAttributePrefixes in scripts\IDLifecycle.Common.psm1
+// (a test compares them): identity and naming attributes (the lifecycle sets those), credentials and
+// account control, logon scripts/home paths (a UNC path there harvests NTLM hashes), certificate mappings,
+// and multi-valued attributes this single-value plumbing would overwrite.
+var ProtectedAttributes = []string{
+	"samaccountname", "userprincipalname", "cn", "name", "distinguishedname", "objectguid", "objectsid", "objectclass",
+	"objectcategory", "memberof", "member", "unicodepwd", "userpassword", "unixuserpassword", "useraccountcontrol",
+	"primarygroupid", "pwdlastset", "lockouttime", "accountexpires", "logonhours", "userworkstations",
+	"altsecurityidentities", "serviceprincipalname", "scriptpath", "homedirectory", "homedrive", "profilepath",
+	"admincount", "sidhistory", "ntsecuritydescriptor", "usercertificate", "usersmimecertificate", "proxyaddresses",
+	"msnpallowdialin",
+}
+
+var ProtectedPrefixes = []string{"msds-", "ms-ds-", "msexch", "mspki-"}
+
+var protectedSet = func() map[string]bool {
+	m := make(map[string]bool, len(ProtectedAttributes))
+	for _, a := range ProtectedAttributes {
+		m[a] = true
+	}
+	return m
+}()
+
+// IsProtectedAttribute reports whether an attribute may never be mapped (case-insensitive).
+func IsProtectedAttribute(name string) bool {
+	lower := strings.ToLower(strings.TrimSpace(name))
+	if protectedSet[lower] {
+		return true
+	}
+	for _, p := range ProtectedPrefixes {
+		if strings.HasPrefix(lower, p) {
+			return true
+		}
+	}
+	return false
 }
 
 func condMatch(c model.Condition, attrs map[string]string) bool {

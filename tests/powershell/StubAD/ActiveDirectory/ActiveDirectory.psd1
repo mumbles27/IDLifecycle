@@ -9,7 +9,7 @@
     FunctionsToExport     = @(
         'Get-ADRootDSE', 'Get-ADUser', 'Get-ADGroup', 'Get-ADObject',
         'New-ADUser', 'Set-ADUser', 'Disable-ADAccount', 'Enable-ADAccount', 'Remove-ADUser',
-        'Move-ADObject', 'Add-ADGroupMember', 'Remove-ADGroupMember'
+        'Remove-ADObject', 'Move-ADObject', 'Add-ADGroupMember', 'Remove-ADGroupMember'
     )
     CmdletsToExport       = @()
     VariablesToExport     = @()

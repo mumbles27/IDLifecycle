@@ -80,7 +80,9 @@ func newPwshEnv(t *testing.T) *pwshEnv {
 	}
 
 	// Safety: prove a child pwsh resolves ActiveDirectory to the stub before anything runs.
-	chk := exec.Command(pwsh, "-NoProfile", "-NonInteractive", "-Command",
+	// Bypass (process scope only): a checkout may carry Mark-of-the-Web, which RemoteSigned refuses. The
+	// production client keeps the configured policy; these tests only ever reach the stub module.
+	chk := exec.Command(pwsh, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
 		"Import-Module ActiveDirectory -ErrorAction Stop; (Get-Module ActiveDirectory).Version.ToString()")
 	chk.Env = append(os.Environ(), "PSModulePath="+stub, "IDL_STUB_AD_STATE="+state)
 	out, err := chk.CombinedOutput()
@@ -99,7 +101,7 @@ func newPwshEnv(t *testing.T) *pwshEnv {
 	})
 
 	e.eng.AD = &ad.PowerShellClient{
-		Exe: pwsh, ScriptsDir: scripts, Timeout: 2 * time.Minute,
+		Exe: pwsh, ScriptsDir: scripts, Timeout: 2 * time.Minute, ExecutionPolicy: "Bypass",
 		ExtraEnv: []string{"PSModulePath=" + stub, "IDL_STUB_AD_STATE=" + state},
 	}
 	return &pwshEnv{env: e, state: state}
@@ -325,4 +327,42 @@ func TestRealScriptsRefuseWrongAccount(t *testing.T) {
 	res, _ = p.eng.AD.Remove(p.ctx, ad.ActionOpts{IDAttribute: "employeeID"}, []ad.RemoveItem{{ChangeID: "y", ExternalID: "E1", ObjectGUID: guid}})
 	eq(t, "enabled account not deleted", res[0].Status, ad.StatusFailed)
 	eq(t, "still there", len(p.read().Users), 1)
+}
+
+// A terminated user who is also in a protected group (adminCount=1, e.g. nested under Account Operators)
+// must still be disabled: the privileged membership is kept and reported, never a reason to leave the
+// account enabled. (It used to fail the whole disable, forever.)
+func TestRealScriptsDisableIsNotBlockedByPrivilegedGroup(t *testing.T) {
+	p := newPwshEnv(t)
+	p.tweak(func(s *model.Settings) { s.Approval.Create = "auto" })
+	p.writeCSV(row("E1", "Jane", "Doe", "Marketing", "Designer", "A", ""))
+	p.run()
+
+	b, _ := os.ReadFile(p.state)
+	var st map[string]any
+	if err := json.Unmarshal(b, &st); err != nil {
+		t.Fatal(err)
+	}
+	helpdesk := "CN=IT-Helpdesk,OU=Groups,DC=corp,DC=example,DC=com"
+	st["groups"] = append(st["groups"].([]any), map[string]any{"dn": helpdesk, "sam": "IT-Helpdesk", "adminCount": 1})
+	for _, u := range st["users"].([]any) {
+		um := u.(map[string]any)
+		um["memberOf"] = append(um["memberOf"].([]any), helpdesk)
+	}
+	b, _ = json.Marshal(st)
+	_ = os.WriteFile(p.state, b, 0o600)
+
+	p.writeCSV(row("E1", "Jane", "Doe", "Marketing", "Designer", "T", ""))
+	run := p.run()
+	eq(t, "disable proposed", run.Counters["planned_disable"], 1)
+	p.approveAll(model.ChangeDisable)
+
+	i, s := p.account("jdoe")
+	eq(t, "terminated user disabled", s.Users[i].Enabled, false)
+	eq(t, "only the privileged group is kept", strings.Join(s.Users[i].MemberOf, ";"), helpdesk)
+	eq(t, "no failed changes", len(p.changes(model.StatusFailed, "")), 0)
+	applied := p.changes(model.StatusApplied, model.ChangeDisable)
+	if len(applied) != 1 {
+		t.Fatalf("applied disables: %d", len(applied))
+	}
 }

@@ -193,7 +193,7 @@ Describe 'Security hardening' {
     #region 3 - protected attributes
 
     It 'Test-IDLProtectedAttribute covers the list and the msDS-/msExch- prefixes case-insensitively' {
-        foreach ($n in @('sAMAccountName', 'USERPRINCIPALNAME', 'altSecurityIdentities', 'servicePrincipalName', 'scriptPath', 'userWorkstations', 'adminCount', 'primaryGroupId', 'sIDHistory', 'nTSecurityDescriptor', 'msDS-AllowedToDelegateTo', 'MSDS-Foo', 'msExchHideFromAddressLists', 'msExch-Whatever', 'memberOf', 'objectSid')){
+        foreach ($n in @('sAMAccountName', 'USERPRINCIPALNAME', 'altSecurityIdentities', 'servicePrincipalName', 'scriptPath', 'userWorkstations', 'adminCount', 'primaryGroupId', 'sIDHistory', 'nTSecurityDescriptor', 'msDS-AllowedToDelegateTo', 'MSDS-Foo', 'msExchHideFromAddressLists', 'msExch-Whatever', 'memberOf', 'objectSid', 'homeDirectory', 'profilePath', 'proxyAddresses', 'accountExpires', 'msPKI-Foo', 'ms-DS-Bar', 'cn', 'name', 'member', 'objectClass', 'unixUserPassword', 'msNPAllowDialin', 'logonHours')){
             Test-IDLProtectedAttribute -Name $n | Should Be $true
         }
 
@@ -207,7 +207,7 @@ Describe 'Security hardening' {
     It 'Set-IDLUser refuses every protected attribute in set and clear, naming the attribute, changing nothing' {
         $jane = New-StubUserEntry -Sam 'jdoe' -ExternalId 'E1001' -Cn 'Jane Doe'
         $state = New-SecState -Users @($jane)
-        $names = @('samaccountname', 'userPrincipalName', 'altSecurityIdentities', 'servicePrincipalName', 'scriptPath', 'userWorkstations', 'adminCount', 'primaryGroupId', 'sIDHistory', 'nTSecurityDescriptor', 'msDS-AllowedToDelegateTo', 'MSDS-Foo', 'msExchHideFromAddressLists', 'MSEXCH-Foo')
+        $names = @('samaccountname', 'userPrincipalName', 'altSecurityIdentities', 'servicePrincipalName', 'scriptPath', 'userWorkstations', 'adminCount', 'primaryGroupId', 'sIDHistory', 'nTSecurityDescriptor', 'msDS-AllowedToDelegateTo', 'MSDS-Foo', 'msExchHideFromAddressLists', 'MSEXCH-Foo', 'homeDirectory', 'profilePath', 'proxyAddresses', 'accountExpires', 'mspki-foo', 'ms-DS-Bar', 'homeDrive', 'lockoutTime', 'userCertificate')
         $items = @()
         foreach ($n in $names){
             $items += , ([ordered]@{ changeId = "s-$n"; externalId = 'E1001'; objectGuid = $jane.objectGuid; set = @{ $n = 'x' } })
@@ -237,6 +237,30 @@ Describe 'Security hardening' {
         $r.Json.results[1].status | Should Be 'failed'
         $r.Json.results[2].status | Should Be 'applied'
         $r.Json.results[2].sam | Should Be 'okuser'
+        (Get-StubCalls -Path $state -Cmdlet 'New-ADUser').Count | Should Be 1
+    }
+
+    It 'New-IDLUser refuses the extended protected list (home/profile paths, proxyAddresses, accountExpires, msPKI-*) and cannot override the id attribute' {
+        $state = New-SecState
+        $names = @('homeDirectory', 'profilePath', 'proxyAddresses', 'accountExpires', 'mspki-foo', 'homeDrive', 'ms-DS-Bar')
+        $items = @()
+        $n = 0
+        foreach ($name in $names){
+            $n++
+            $items += , (New-NewItem -Ext ('E86{0:00}' -f $n) -Sam "prot$n" -Cn "Prot $n" -Attributes @{ givenName = 'P'; $name = 'x' })
+        }
+
+        $id = New-NewItem -Ext 'E8699' -Sam 'idover' -Cn 'Id Over' -Attributes @{ givenName = 'I'; employeeID = 'E0000' }
+        $r = Invoke-IDLScript -Script 'New-IDLUser' -Request (New-Req ($items + , $id)) -StatePath $state
+        $r.ExitCode | Should Be 1
+        for ($i = 0; $i -lt $names.Count; $i++){
+            $r.Json.results[$i].status | Should Be 'failed'
+            $r.Json.results[$i].error | Should Match 'protected'
+            $r.Json.results[$i].error | Should Match ([regex]::Escape($names[$i]))
+        }
+
+        $r.Json.results[$names.Count].status | Should Be 'applied'
+        (Get-StubUser -Path $state -Sam 'idover').attributes.employeeID | Should Be 'E8699'
         (Get-StubCalls -Path $state -Cmdlet 'New-ADUser').Count | Should Be 1
     }
 
@@ -280,7 +304,7 @@ Describe 'Security hardening' {
         @($u.memberOf).Count | Should Be ($privileged.Count + 1)
     }
 
-    It 'Enable/Disable/New refuse privileged groups (also in DryRun) before changing anything' {
+    It 'Enable/New refuse privileged groups (also in DryRun) before changing anything; Disable keeps them and still disables' {
         $off = New-StubUserEntry -Sam 'off1' -ExternalId 'E2001' -Cn 'Off One' -Enabled $false -Ou "OU=Disabled,$root"
         $on = New-StubUserEntry -Sam 'on1' -ExternalId 'E2002' -Cn 'On One' -MemberOf @("CN=Administrators,OU=Groups,$root")
         $state = New-SecState -Users @($off, $on)
@@ -290,12 +314,19 @@ Describe 'Security hardening' {
         $r.Json.results[0].status | Should Be 'failed'
         $r.Json.results[0].error | Should Match 'privileged'
 
+        # Disable is lifecycle-critical: a privileged group is KEPT (warned), never a reason to leave the account enabled.
         $d = [ordered]@{ changeId = 'd'; externalId = 'E2002'; objectGuid = $on.objectGuid; removeGroups = @('Administrators'); moveTo = "OU=Disabled,$root" }
-        $r = Invoke-IDLScript -Script 'Disable-IDLUser' -Request (New-Req @($d)) -StatePath $state
-        $r.Json.results[0].status | Should Be 'failed'
-        $r.Json.results[0].error | Should Match 'privileged'
         $r = Invoke-IDLScript -Script 'Disable-IDLUser' -Request (New-Req @($d)) -StatePath $state -DryRun
-        $r.Json.results[0].status | Should Be 'failed'
+        $r.Json.results[0].status | Should Be 'would'
+        $r.Json.results[0].message | Should Match 'kept privileged group\(s\): Administrators'
+        (Get-StubCalls -Path $state).Count | Should Be 0
+        $r = Invoke-IDLScript -Script 'Disable-IDLUser' -Request (New-Req @($d)) -StatePath $state
+        $r.Json.results[0].status | Should Be 'applied'
+        $r.Json.results[0].message | Should Match 'kept privileged group\(s\): Administrators'
+        (Get-StubCalls -Path $state -Cmdlet 'Remove-ADGroupMember').Count | Should Be 0
+        $u = Get-StubUser -Path $state -Sam 'on1'
+        $u.enabled | Should Be $false
+        @($u.memberOf) -contains "CN=Administrators,OU=Groups,$root" | Should Be $true
 
         $n1 = New-NewItem -Ext 'E8201' -Sam 'privnew' -Cn 'Priv New' -Groups @('GG-Plain', 'GG-Flagged')
         $n2 = New-NewItem -Ext 'E8202' -Sam 'privnew2' -Cn 'Priv New2' -Groups @('Backup Operators')
@@ -313,7 +344,7 @@ Describe 'Security hardening' {
         (Get-StubUser -Path $state -Sam 'privnew2') | Should BeNullOrEmpty
         (Get-StubUser -Path $state -Sam 'plainnew') | Should Not BeNullOrEmpty
         (Get-StubCalls -Path $state -Cmdlet 'Enable-ADAccount').Count | Should Be 0
-        (Get-StubCalls -Path $state -Cmdlet 'Disable-ADAccount').Count | Should Be 0
+        (Get-StubCalls -Path $state -Cmdlet 'Disable-ADAccount').Count | Should Be 1
         (Get-StubCalls -Path $state -Cmdlet 'New-ADUser').Count | Should Be 1
     }
 
@@ -329,10 +360,12 @@ Describe 'Security hardening' {
         $r.Json.results[0].status | Should Be 'failed'
         $r.Json.results[0].error | Should Match 'ambiguous'
 
+        # Disable never guesses either, but an ambiguous group must not keep a leaver enabled: kept + warned.
         $d = [ordered]@{ changeId = 'd'; externalId = 'E1001'; objectGuid = $jane.objectGuid; removeGroups = @('GG-Dup') }
         $r = Invoke-IDLScript -Script 'Disable-IDLUser' -Request (New-Req @($d)) -StatePath $state
-        $r.Json.results[0].status | Should Be 'failed'
-        $r.Json.results[0].error | Should Match 'ambiguous'
+        $r.Json.results[0].status | Should Be 'applied'
+        $r.Json.results[0].message | Should Match 'kept ambiguous group\(s\): GG-Dup'
+        (Get-StubCalls -Path $state -Cmdlet 'Remove-ADGroupMember').Count | Should Be 0
 
         $n = New-NewItem -Ext 'E8301' -Sam 'dupnew' -Cn 'Dup New' -Groups @('GG-Dup')
         $ok = New-NewItem -Ext 'E8302' -Sam 'dupok' -Cn 'Dup Ok' -Groups @('GG-Plain')
@@ -343,7 +376,7 @@ Describe 'Security hardening' {
         $r.Json.results[1].status | Should Be 'applied'
         (Get-StubUser -Path $state -Sam 'dupnew') | Should BeNullOrEmpty
         (Get-StubCalls -Path $state -Cmdlet 'Add-ADGroupMember').Count | Should Be 1
-        (Get-StubCalls -Path $state -Cmdlet 'Disable-ADAccount').Count | Should Be 0
+        (Get-StubCalls -Path $state -Cmdlet 'Disable-ADAccount').Count | Should Be 1
     }
 
     #endregion

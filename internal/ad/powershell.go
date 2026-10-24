@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -188,8 +190,32 @@ func (c *PowerShellClient) run(ctx context.Context, script string, dryRun bool, 
 	if msg == "" {
 		msg = snippet(scrub(stderr.String(), redact))
 	}
+	if strings.Contains(stderr.String(), "is not digitally signed") {
+		msg += blockedHint
+	}
 	return &ScriptError{Script: script, ExitCode: exit, Message: scrub(msg, redact), kind: kindFor(exit)}
 }
+
+// BlockedScripts lists .ps1/.psm1/.psd1 files under dir that carry a Zone.Identifier stream (Mark of the
+// Web). Under RemoteSigned/AllSigned PowerShell refuses to load them, so every sync would fail.
+func BlockedScripts(dir string) []string {
+	var out []string
+	_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		switch strings.ToLower(filepath.Ext(p)) {
+		case ".ps1", ".psm1", ".psd1":
+			if _, err := os.Stat(p + ":Zone.Identifier"); err == nil {
+				out = append(out, p)
+			}
+		}
+		return nil
+	})
+	return out
+}
+
+const blockedHint = " (the script files are blocked as downloaded from the internet; run: Get-ChildItem <scripts_dir> -Recurse | Unblock-File, or reinstall with Install-IDLifecycleService.ps1)"
 
 func kindFor(code int) error {
 	switch code {

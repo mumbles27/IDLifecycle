@@ -112,7 +112,7 @@ func TestApprovedButStaleChangeIsReplaced(t *testing.T) {
 	e.eng.runMu.Lock() // plan only; skip the executor part of a full run
 	run := model.Run{ID: "x", Counters: map[string]int{}}
 	e.must(e.st.CreateRun(e.ctx, run))
-	e.must(e.eng.sync(e.ctx, &run))
+	e.must(e.eng.sync(e.ctx, &run, &runNotes{}))
 	e.eng.runMu.Unlock()
 
 	got, _ := e.st.GetChange(e.ctx, old.ID)

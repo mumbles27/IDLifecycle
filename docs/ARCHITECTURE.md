@@ -6,7 +6,7 @@ queue (or auto-applies), and executes them through PowerShell scripts. Admins op
 embedded web GUI.
 
 ```
- Sources (CSV, Paylocity)        +------------------ idlifecycled.exe ------------------+
+ Sources (CSV, Paylocity, SQL)   +------------------ idlifecycled.exe ------------------+
         |  fetch                 |  scheduler -> engine(plan) -> approvals -> executor  |
         v                        |        |           |                      |          |
    normalized records  --------> |      store (SQLite | Postgres | MSSQL | MySQL)       |
@@ -25,8 +25,10 @@ embedded web GUI.
 | `internal/config` | Bootstrap config file (DB connection, listen addr, TLS, PowerShell paths) |
 | `internal/store` | DB access, dialect layer (sqlite/postgres/mssql/mysql), migrations, all queries |
 | `internal/secrets` | AES-GCM encryption for source secrets; key wrapped by DPAPI on Windows |
+| `internal/datadir` | Data-directory ACL check (service refuses to start when broad principals can read it) and `lockdown` |
+| `internal/notify` | E-mail notifications: generic SMTP, M365 SMTP AUTH (OAuth2 XOAUTH2), M365 Graph sendMail |
 | `internal/model` | Plain data types shared by store/engine/api (JSON = snake_case) |
-| `internal/sources` | `Source` interface + CSV + Paylocity implementations + registry |
+| `internal/sources` | `Source` interface + CSV + Paylocity + SQL (table/view) implementations + registry |
 | `internal/engine` | Template rendering, role resolution, planner (diff), approval policy, executor, run orchestration |
 | `internal/ad` | `Client` interface; `PowerShellClient` (real) and `FakeClient` (tests) |
 | `internal/scheduler` | Interval / daily / cron scheduling, hot-reloaded from settings |
@@ -87,7 +89,8 @@ embedded web GUI.
 | (none) | `simulated` | planner while `engine.dry_run=true` (never applied) | system |
 | `pending` | `approved` | approve | admin/approver |
 | `pending` | `rejected` | reject (note required) | admin/approver |
-| `pending` | `superseded` | next run produced a different plan for the same identity+type | system |
+| `pending` | `superseded` | next run produced a different plan for the same identity+type, or none at all | system |
+| `approved` | `superseded` | not yet applied, and the next run planned something different or nothing (rehire, data corrected) | system |
 | `approved` | `applying` | executor picks it up | system |
 | `applying` | `applied` / `failed` | PowerShell result | system |
 | `applying` | `failed` | service restart found it interrupted ("interrupted – verify in AD") | system |
@@ -175,9 +178,9 @@ equals externalId** and fails the item otherwise.
   Idempotent: if an account with `idAttribute == externalId` already exists ⇒ `status:"skipped"`, `message:"exists"`, returns its guid/dn/sam/upn (no changes). Otherwise picks the first candidate whose sam AND upn are free
   directory-wide and whose cn is free in the OU; creates the user (attributes applied via `-OtherAttributes`, the `idAttribute` set to `externalId`), then adds groups (an unresolvable group ⇒ item `failed` after creation with message listing it, account kept; result still includes guid/dn).
 * **`Set-IDLUser.ps1`** item: `{"changeId","externalId","objectGuid","set":{"title":"New"},"clear":["telephoneNumber"],"addGroups":["..."],"removeGroups":["..."],"moveTo":"OU=...|"" }`. Uses `-Replace`/`-Clear` with LDAP names. No-ops are `skipped`. Returns the new dn.
-* **`Disable-IDLUser.ps1`** item: `{"changeId","externalId","objectGuid","moveTo":"","removeGroups":[],"description":"Disabled by IDLifecycle 2026-10-16"}`. Idempotent (already disabled ⇒ still applies move/groups/description, status `applied` or `skipped` if nothing to do).
+* **`Disable-IDLUser.ps1`** item: `{"changeId","externalId","objectGuid","moveTo":"","removeGroups":[],"description":"Disabled by IDLifecycle 2026-10-16"}`. Idempotent (already disabled ⇒ still applies move/groups/description, status `applied` or `skipped` if nothing to do). The account is **disabled first**, before anything else can fail: an invalid/nonexistent `moveTo` ⇒ `failed` with `message:"failed after: disabled; ..."`. Privileged (adminCount=1 / well-known RID) and ambiguous groups in `removeGroups` are **kept**, never a failure: WARN log, `Skipped` report row, and `message` ends with `kept privileged group(s): <names>` (or `kept ambiguous group(s): ...`).
 * **`Enable-IDLUser.ps1`** item: `{"changeId","externalId","objectGuid","moveTo":"","addGroups":[]}`.
-* **`Remove-IDLUser.ps1`** item: `{"changeId","externalId","objectGuid"}`. **Refuses** (`failed`, "account is enabled") if the account is enabled; refuses if object is not a user. Already gone ⇒ `skipped`.
+* **`Remove-IDLUser.ps1`** item: `{"changeId","externalId","objectGuid"}`. **Refuses** (`failed`, "account is enabled") if the account is enabled; refuses if object is not a user. Already gone ⇒ `skipped`. Deletes with `Remove-ADObject -Recursive` so leaf children (e.g. `CN=ExchangeActiveSyncDevices`) go with the account; refuses (`failed`) if any child is a user/computer/group/inetOrgPerson.
 
 ## 7. HTTP API (JSON, snake_case)
 
@@ -197,7 +200,8 @@ Lists: `{"items":[...],"total":N}` with `?limit=&offset=` (default 50, max 500).
 | `POST /api/templates/preview` | admin | `{template, record:{...}}` → `{ok,output,error}` |
 | `GET/POST /api/roles`, `GET/PUT/DELETE /api/roles/{id}` | admin (GET viewer) | `{id,name,description,enabled,priority,match:"all|any",conditions:[{attr,op,value}],grants:{groups:[],ou,attributes:[{target_attr,template,mode,on_empty,value_type}]}}`, ops: `eq ne in contains starts_with regex exists` |
 | `POST /api/roles/preview` | admin | `{record:{...}}` → `{matched:[{id,name}],groups:[],ou,attributes:{attr:value}}` |
-| `GET/PUT /api/settings` | admin (GET viewer) | see §8 |
+| `GET/PUT /api/settings` | admin (GET viewer) | see §8; notification secrets are returned as `"********"` (sending it back keeps the stored value) |
+| `POST /api/notifications/test` `{notifications:{...}}` | admin | sends a test message with the unsaved form values (masked secrets fall back to stored ones) → `{ok,error}` |
 | `GET /api/changes?status=&type=&q=` · `GET /api/changes/{id}` | viewer | change: `{id,run_id,identity_id,external_id,display,type,status,payload,summary:[strings],created_at,decided_by,decided_at,decision_note,applied_at,error,attempts}` |
 | `POST /api/changes/{id}/approve|reject|retry` `{note}` | approver | reject requires note |
 | `POST /api/changes/bulk` `{ids:[],action:"approve|reject",note}` | approver | → `{results:[{id,ok,error}]}` |
@@ -215,13 +219,20 @@ Static SPA served at `/` (any non-`/api` path ⇒ `index.html`).
 {
  "schedule":{"enabled":true,"kind":"interval|daily|cron","interval_minutes":60,"daily_time":"02:00","cron_expr":"0 */4 * * *","timezone":"America/Chicago"},
  "approval":{"create":"manual","update":"auto","disable":"manual","enable":"manual","delete":"manual"},
- "engine":{"dry_run":true,"max_destructive_per_run":10,"delete_after_days":30,"remove_stale_groups":true,"enforce_ou":false},
+ "engine":{"dry_run":true,"max_destructive_per_run":10,"delete_after_days":30,"remove_stale_groups":true,"enforce_ou":false,"max_deletes_per_run":5,"max_deletes_per_day":20},
  "ad":{"server":"","search_bases":["OU=Staff,DC=corp,DC=example,DC=com"],"default_ou":"OU=Staff,DC=...","disabled_ou":"","id_attribute":"employeeID","upn_suffix":"corp.example.com","strip_groups_on_disable":true},
  "naming":{"sam_template":"{{ first .FirstName 1 | lower }}{{ .LastName | lower }}","upn_template":"{{ .FirstName | lower }}.{{ .LastName | lower }}","cn_template":"{{ .FirstName }} {{ .LastName }}","max_candidates":9},
- "new_user":{"password_length":20,"change_password_at_logon":true,"enabled":true}
+ "new_user":{"password_length":20,"change_password_at_logon":true,"enabled":true},
+ "notifications":{"enabled":false,"provider":"smtp|m365_smtp|m365_graph","from":"idl@corp.example.com","to":["ops@corp.example.com"],"subject_prefix":"[IDLifecycle]","gui_base_url":"",
+   "smtp":{"host":"","port":587,"security":"starttls|tls|none","auth":"none|login|oauth2","username":"","password":"(secret)"},
+   "oauth":{"tenant_id":"","client_id":"","client_secret":"(secret)"},
+   "events":{"run_failed":true,"approvals_pending":true,"changes_failed":true,"threshold":true,"run_summary":false}}
 }
 ```
 Defaults: `dry_run=true` (fresh installs plan but never write until an admin flips it), all approvals `manual`.
+`max_deletes_per_run`: more deletes than this in one run ⇒ all of that run's deletes are held for manual approval. `max_deletes_per_day`:
+the executor completes at most this many deletes per rolling 24 h; further approved deletes wait (status stays `approved`). 0 = no limit.
+The executor sends at most 50 changes to one PowerShell invocation.
 
 ## 9. Bootstrap config (`config.json`)
 ```json
@@ -238,7 +249,7 @@ Defaults: `dry_run=true` (fresh installs plan but never write until an admin fli
 |---|---|
 | store | table tests on in-memory SQLite; Postgres/MSSQL/MySQL suites run when `IDL_TEST_POSTGRES_DSN` / `IDL_TEST_MSSQL_DSN` / `IDL_TEST_MYSQL_DSN` are set (same shared suite) |
 | templates/roles/mappings/planner | pure unit tests |
-| sources | CSV fixtures; Paylocity against `httptest` server |
+| sources | CSV fixtures; Paylocity against `httptest` server; SQL against a temp SQLite DB (plus query-validation table) |
 | engine | end-to-end with SQLite + `ad.FakeClient` (create/update/disable/delete flows, approvals, dry-run, guards, crash recovery) |
 | api | `httptest` server: auth, CSRF, RBAC, CRUD, approval flow |
 | PowerShell | Pester tests run the real scripts in a child `pwsh` with `PSModulePath` pointing **only** at `tests/powershell/StubAD` (in-memory-JSON fake `ActiveDirectory` module), so tests can never reach a real domain; Go integration test drives `PowerShellClient` through the same stub |
@@ -250,3 +261,16 @@ Defaults: `dry_run=true` (fresh installs plan but never write until an admin fli
 * Matching source→AD is by the ID attribute only; no fuzzy matching/adoption wizard.
 * Single service instance (no HA/leader election).
 * Paylocity field names were written from public API docs and are configurable; validate against your tenant.
+
+## SQL source (`internal/sources/sql.go`)
+For customers whose own job writes HR data into a database table/view. Config: `driver` (`sqlserver|postgres|mysql|sqlite`;
+aliases `mssql`, `postgresql`/`pgx`, `mariadb`), `dsn` (a `password` field, so encrypted at rest and masked; `env:VAR` is
+resolved at fetch time), `query`, `timeout_seconds` (120), `max_rows` (200000).
+* **Query check** (`ValidateSQLQuery`, on save and on build): comments removed (`-- ` needs trailing whitespace; MySQL `/*! */`
+  kept as code; done under both `''` and backslash string-escape rules, both must pass), then it must start with
+  `SELECT`/`WITH`, have no `;` except one trailing, and no whole-word INSERT/UPDATE/DELETE/MERGE/DROP/ALTER/CREATE/TRUNCATE/
+  EXEC/EXECUTE/GRANT/REVOKE/INTO/CALL. String literals are *not* exempt (conservative). Defence in depth only: the login must be read-only.
+* **Fetch**: one connection, `PingContext`, `BeginTx(ReadOnly)` (Postgres/MySQL enforce it; SQLite additionally gets
+  `PRAGMA query_only`; go-mssqldb rejects ReadOnly so SQL Server gets a plain transaction) — always rolled back, never committed.
+  Columns → keys (trimmed; unnamed/duplicate case-insensitive ⇒ error); NULL → "", time → RFC3339, floats without exponent.
+  More than `max_rows` ⇒ error (never truncated). Errors are prefixed `sql:` and scrubbed of the DSN and its password.

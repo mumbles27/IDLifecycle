@@ -44,6 +44,7 @@ func register(t Type) { registry[t.Name] = t }
 func init() {
 	register(csvType())
 	register(paylocityType())
+	register(sqlType())
 }
 
 // Types lists registered source types sorted by name (New funcs are not serialized).
@@ -84,6 +85,11 @@ func Validate(src model.Source) error {
 	if src.Type == "csv" && PathPolicy != nil {
 		if err := PathPolicy(asString(src.Config["path"])); err != nil {
 			return fmt.Errorf("config.path: %w", err)
+		}
+	}
+	if src.Type == "sql" {
+		if err := validateSQLConfig(src.Config); err != nil {
+			return err
 		}
 	}
 	return nil

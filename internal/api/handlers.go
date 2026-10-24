@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"sort"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 	"idlifecycle/internal/engine"
 	"idlifecycle/internal/model"
+	"idlifecycle/internal/notify"
 	"idlifecycle/internal/sources"
 	"idlifecycle/internal/store"
 )
@@ -49,6 +51,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 
 	s.route(mux, "GET /api/settings", model.RoleViewer, s.handleGetSettings)
 	s.route(mux, "PUT /api/settings", model.RoleAdmin, s.handlePutSettings)
+	s.route(mux, "POST /api/notifications/test", model.RoleAdmin, s.handleTestNotification)
 
 	s.route(mux, "GET /api/changes", model.RoleViewer, s.handleListChanges)
 	s.route(mux, "POST /api/changes/bulk", model.RoleApprover, s.handleBulkChanges)
@@ -313,6 +316,13 @@ func (s *Server) handleSaveMapping(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
+	if msg, err := s.mappingConflict(r, in, id); err != nil {
+		s.fail(w, r, err)
+		return
+	} else if msg != "" {
+		badRequest(w, msg)
+		return
+	}
 	if id == "" {
 		now := time.Now()
 		in.ID, in.CreatedAt, in.UpdatedAt = uuid.NewString(), now, now
@@ -332,6 +342,39 @@ func (s *Server) handleSaveMapping(w http.ResponseWriter, r *http.Request) {
 	s.audit(r, "mapping.update", "mapping", id, map[string]any{"name": in.Name, "target": in.TargetAttr, "mode": in.Mode})
 	out, _ := s.Store.GetMapping(r.Context(), id)
 	writeJSON(w, http.StatusOK, out)
+}
+
+// linkKeyMessage refuses targeting ad.id_attribute: the service sets it from the external id and matches
+// accounts by it, so a mapping could re-point an account at another person.
+func (s *Server) linkKeyMessage(r *http.Request, attr string) (string, error) {
+	st, err := s.Store.GetSettings(r.Context())
+	if err != nil {
+		return "", err
+	}
+	if strings.EqualFold(strings.TrimSpace(attr), st.AD.IDAttribute) {
+		return attr + " is the link key (ad.id_attribute); the service sets it from the source's external id and it cannot be mapped", nil
+	}
+	return "", nil
+}
+
+// mappingConflict returns a user-facing reason why the mapping cannot be saved ("" when it can).
+func (s *Server) mappingConflict(r *http.Request, in model.Mapping, selfID string) (string, error) {
+	if msg, err := s.linkKeyMessage(r, in.TargetAttr); msg != "" || err != nil {
+		return msg, err
+	}
+	if !in.Enabled {
+		return "", nil
+	}
+	all, err := s.Store.ListMappings(r.Context())
+	if err != nil {
+		return "", err
+	}
+	for _, m := range all {
+		if m.ID != selfID && m.Enabled && strings.EqualFold(m.TargetAttr, in.TargetAttr) {
+			return fmt.Sprintf("mapping %q already writes %s; disable or edit it instead (two enabled mappings for one attribute would fight each other)", m.Name, m.TargetAttr), nil
+		}
+	}
+	return "", nil
 }
 
 func (s *Server) handleDeleteMapping(w http.ResponseWriter, r *http.Request) {
@@ -406,6 +449,15 @@ func (s *Server) handleSaveRole(w http.ResponseWriter, r *http.Request) {
 	if err := engine.ValidateRole(in); err != nil {
 		badRequest(w, err.Error())
 		return
+	}
+	for _, a := range in.Grants.Attributes {
+		if msg, err := s.linkKeyMessage(r, a.TargetAttr); err != nil {
+			s.fail(w, r, err)
+			return
+		} else if msg != "" {
+			badRequest(w, "grants.attributes: "+msg)
+			return
+		}
 	}
 	id := r.PathValue("id")
 	if id == "" {
@@ -484,7 +536,46 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	st.Notify = notify.Mask(st.Notify)
 	writeJSON(w, http.StatusOK, st)
+}
+
+// handleTestNotification sends a test message with the (unsaved) notification settings from the form.
+// Masked secrets fall back to the stored ones, so a test never needs the secret re-typed.
+func (s *Server) handleTestNotification(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Notifications model.NotifySettings `json:"notifications"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	stored, err := s.Store.GetSettings(r.Context())
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	res := map[string]any{"ok": true}
+	cfg, err := notify.PrepareForStorage(in.Notifications, stored.Notify, s.Cipher)
+	if err == nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+		defer cancel()
+		err = s.notifier().Send(ctx, cfg, model.Notification{
+			Event: model.EventTest, Subject: "Test message",
+			Lines: []string{"This is a test message from IDLifecycle.", "Requested by " + principal(r).User.Username + "."},
+		})
+	}
+	if err != nil {
+		res = map[string]any{"ok": false, "error": err.Error()}
+	}
+	s.audit(r, "notifications.test", "settings", "notifications", map[string]any{"ok": err == nil, "provider": cfg.Provider})
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) notifier() *notify.Service {
+	if s.Notifier != nil {
+		return s.Notifier
+	}
+	return &notify.Service{Settings: s.Store.GetSettings, Cipher: s.Cipher, Log: s.Log}
 }
 
 func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
@@ -513,12 +604,25 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	if in.Notify.To == nil {
+		in.Notify.To = []string{}
+	}
+	if in.Notify, err = notify.PrepareForStorage(in.Notify, old.Notify, s.Cipher); err != nil {
+		badRequest(w, "notifications: "+err.Error())
+		return
+	}
+	if err := notify.Validate(in.Notify); err != nil {
+		badRequest(w, "notifications: "+err.Error())
+		return
+	}
 	if err := s.Store.SaveSettings(r.Context(), in, principal(r).User.Username); err != nil {
 		s.fail(w, r, err)
 		return
 	}
 	s.Scheduler.Reload()
+	// diffPaths sees ciphertext for secrets, so a changed secret shows up as a path - never as a value.
 	s.audit(r, "settings.update", "settings", "settings", map[string]any{"changed": diffPaths(old, in)})
+	in.Notify = notify.Mask(in.Notify)
 	writeJSON(w, http.StatusOK, in)
 }
 

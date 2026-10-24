@@ -12,11 +12,14 @@
 
     Per item the script finds the account by objectGuid (all items in one bulk query), VERIFIES that its
     idAttribute equals externalId (otherwise the item fails and nothing is touched), then:
-      1. disables the account (if it is enabled),
-      2. sets the description (if given and different),
-      3. removes it from the listed groups it is a member of (sAMAccountName or DN; unknown groups are warned and ignored),
-      4. moves it to moveTo (if given and it is not already there; the OU must exist).
-    It is idempotent: an already-disabled account still gets steps 2-4; if nothing needed doing the status is "skipped".
+      1. disables the account (if it is enabled) - ALWAYS first, so nothing below can leave it enabled,
+      2. validates moveTo (shape and existence; a bad one fails the item as "failed after: disabled; ..."),
+      3. sets the description (if given and different),
+      4. removes it from the listed groups it is a member of (sAMAccountName or DN; unknown groups are warned and ignored;
+         privileged and ambiguous groups are KEPT with a WARN log, a 'Skipped' report row and a
+         "kept privileged group(s): ..." note in the message - never a failure),
+      5. moves it to moveTo (if given and it is not already there).
+    It is idempotent: an already-disabled account still gets steps 2-5; if nothing needed doing the status is "skipped".
     One failing item never stops the others.
 
     Response: {"ok":true,"dryRun":false,"results":[{"changeId","externalId","status":"applied|would|skipped|failed",
@@ -141,28 +144,11 @@ try{
             $description = ConvertTo-IDLString -Value (Get-IDLField -Object $item -Name 'description')
             $moveTo = ConvertTo-IDLString -Value (Get-IDLField -Object $item -Name 'moveTo')
             $moveTo = (($null -eq $moveTo) ? ('') : ($moveTo.Trim()))
-            # Throws (item fails, nothing changed) for ambiguous or privileged groups.
-            $removeInfo = Get-IDLGroupDns -Identities (Get-IDLStringList -Value (Get-IDLField -Object $item -Name 'removeGroups')) -GroupMap $groupMap
-            foreach ($missingGroup in $removeInfo.Missing){
-                Write-IDLLog "  Group '$missingGroup' not found; nothing to remove" 'WARN'
-            }
-
-            $removeDns = $removeInfo.Dns
-
-            # Validate the destination before touching anything.
-            if ($moveTo -ne ''){
-                if (-not (Test-IDLDnShape -Value $moveTo)){
-                    throw "moveTo is not a distinguished name: $moveTo"
-                }
-
-                if (-not (Test-IDLContainerExists -Dn $moveTo -Server $server)){
-                    throw "Target OU does not exist: $moveTo"
-                }
-            }
-
             $changes = 0
             $guid = [guid]$user.ObjectGUID
 
+            # Step 1: disable FIRST. Nothing else in the request (bad moveTo, privileged or ambiguous groups) may
+            # leave a terminated account enabled; later failures end the item as "failed after: disabled; ...".
             if ([bool]$user.Enabled){
                 $changes++
                 if ($DryRun){
@@ -180,6 +166,31 @@ try{
             else{
                 Write-IDLLog "  $identity is already disabled"
             }
+
+            # Validate the destination before the remaining changes.
+            if ($moveTo -ne ''){
+                if (-not (Test-IDLDnShape -Value $moveTo)){
+                    throw "moveTo is not a distinguished name: $moveTo"
+                }
+
+                if (-not (Test-IDLContainerExists -Dn $moveTo -Server $server)){
+                    throw "Target OU does not exist: $moveTo"
+                }
+            }
+
+            # Privileged and ambiguous groups are kept (never removed, never a failure): the disable must not be blocked.
+            $removeInfo = Get-IDLGroupDns -Identities (Get-IDLStringList -Value (Get-IDLField -Object $item -Name 'removeGroups')) -GroupMap $groupMap -SkipPrivileged
+            foreach ($missingGroup in $removeInfo.Missing){
+                Write-IDLLog "  Group '$missingGroup' not found; nothing to remove" 'WARN'
+            }
+
+            foreach ($skip in $removeInfo.Skipped){
+                $why = (($skip.Kind -eq 'privileged') ? ("privileged group ($($skip.Reason)); membership kept") : ("ambiguous group ($($skip.Reason)); membership kept"))
+                Write-IDLLog "  Group '$($skip.Identity)' is $why" 'WARN'
+                Add-IDLReportRow -Action 'RemoveGroupMember' -Result 'Skipped' -Identity $identity -ObjectIdOrDN $userDn -Details "$($skip.Identity): $why"
+            }
+
+            $removeDns = $removeInfo.Dns
 
             if (
                 (-not [string]::IsNullOrWhiteSpace($description)) -and
@@ -212,16 +223,29 @@ try{
                 }
             }
 
+            # Tell the operator about memberships that were deliberately left in place.
+            $notes = [System.Collections.Generic.List[string]]::new()
+            $keptPrivileged = @($removeInfo.Skipped | Where-Object { $_.Kind -eq 'privileged' } | ForEach-Object { $_.Identity })
+            $keptAmbiguous = @($removeInfo.Skipped | Where-Object { $_.Kind -eq 'ambiguous' } | ForEach-Object { $_.Identity })
+            if ($keptPrivileged.Count -gt 0){
+                $notes.Add('kept privileged group(s): ' + ($keptPrivileged -join ', '))
+            }
+
+            if ($keptAmbiguous.Count -gt 0){
+                $notes.Add('kept ambiguous group(s): ' + ($keptAmbiguous -join ', '))
+            }
+
             $userFields = Get-IDLUserFields -User $user -DnOverride $finalDn
             if ($changes -eq 0){
-                $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status skipped -Message 'nothing to do (already disabled)' @userFields
+                $message = (@('nothing to do (already disabled)') + $notes) -join '; '
+                $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status skipped -Message $message @userFields
                 Add-IDLReportRow -Action 'DisableUser' -Result 'Skipped' -Identity $identity -ObjectIdOrDN $userDn -Details 'already in desired state'
             }
             elseif ($DryRun){
-                $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status would -Message ($done -join '; ') @userFields
+                $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status would -Message ((@($done) + $notes) -join '; ') @userFields
             }
             else{
-                $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status applied -Message ($done -join '; ') @userFields
+                $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status applied -Message ((@($done) + $notes) -join '; ') @userFields
             }
         }
         catch{

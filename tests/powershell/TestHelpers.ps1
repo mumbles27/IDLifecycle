@@ -125,6 +125,7 @@ function New-StubStateFile {
         [object[]]$Users = @(),
         [object[]]$Groups = @(),
         [string[]]$Ous = @(),
+        [object[]]$Objects = @(),
         [object[]]$Faults = @(),
         [bool]$FailConnect = $false
     )
@@ -135,6 +136,7 @@ function New-StubStateFile {
         users       = @($Users)
         groups      = @($Groups)
         ous         = @($Ous)
+        objects     = @($Objects)
         calls       = @()
         faults      = @($Faults)
         failConnect = $FailConnect
@@ -226,7 +228,7 @@ function New-StubUserEntry {
 
 function New-StandardState {
     # Standard fixture: OUs, groups and (optionally) extra users.
-    param([object[]]$Users = @(), [object[]]$Faults = @(), [bool]$FailConnect = $false)
+    param([object[]]$Users = @(), [object[]]$Faults = @(), [bool]$FailConnect = $false, [object[]]$Objects = @())
 
     $ous = @("OU=Staff,$script:Root", "OU=Sales,$script:Root", "OU=Disabled,$script:Root", "OU=Groups,$script:Root")
     $groups = @(
@@ -235,7 +237,7 @@ function New-StandardState {
         @{ dn = "CN=GG-Old,OU=Groups,$script:Root"; sam = 'GG-Old' }
     )
 
-    return (New-StubStateFile -Users $Users -Groups $groups -Ous $ous -Faults $Faults -FailConnect $FailConnect)
+    return (New-StubStateFile -Users $Users -Groups $groups -Ous $ous -Objects $Objects -Faults $Faults -FailConnect $FailConnect)
 }
 
 function Get-LogDirSnapshot {

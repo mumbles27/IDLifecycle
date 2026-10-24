@@ -20,6 +20,7 @@
       "groups": [ { "dn": "CN=GG-AllStaff,OU=Groups,DC=stub,DC=test", "sam": "GG-AllStaff",
                     "adminCount": 1, "objectSid": "S-1-5-21-1-2-3-512" } ],
       "ous":    [ "OU=Staff,DC=stub,DC=test", "OU=Groups,DC=stub,DC=test" ],
+      "objects": [ { "dn": "CN=ExchangeActiveSyncDevices,CN=Jane Doe,OU=Staff,DC=stub,DC=test", "objectClass": "msExchActiveSyncDevices" } ],
       "calls":  [ { "cmdlet": "New-ADUser", "args": { "Name": "Jane Doe", "AccountPassword": "***" }, "result": "ok" } ],
       "faults": [ { "cmdlet": "Add-ADGroupMember", "match": "jdoe", "message": "boom {password}" } ],
       "failConnect": false
@@ -29,8 +30,10 @@
       * groups[].adminCount / objectSid (both optional) are returned by Get-ADGroup -Properties adminCount,objectSid.
       * faults[] with cmdlet "Get-ADObject" also make READS throw when "match" is found in the Identity/filter/
         search base (reads are not recorded in calls).
+      * objects[] are generic child objects; one whose DN ends with ",<user DN>" makes that user a non-leaf:
+        Remove-ADUser and Remove-ADObject without -Recursive throw the leaf-object error, -Recursive deletes the subtree.
       * calls[] is appended to by every MUTATING cmdlet (New/Set/Remove-ADUser, Enable/Disable-ADAccount,
-        Move-ADObject, Add/Remove-ADGroupMember), including attempts that fail (result starts with "error").
+        Move-ADObject, Remove-ADObject, Add/Remove-ADGroupMember), including attempts that fail (result starts with "error").
         Passwords are never recorded (AccountPassword is "***").
       * faults[] makes a matching mutating cmdlet throw ADException(message). "match" is a case-insensitive
         substring searched in the call's JSON args ("" matches all). "{password}" in message is replaced with the
@@ -63,6 +66,7 @@ class ADServerDownException : ADException {
 
 $script:StubRoot = 'DC=stub,DC=test'
 $script:Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+$script:StubLeafError = 'The directory service can perform the requested operation only on a leaf object.'
 
 #region State file
 
@@ -123,6 +127,7 @@ function Read-StubState {
         users       = [System.Collections.Generic.List[object]]::new()
         groups      = [System.Collections.Generic.List[object]]::new()
         ous         = [System.Collections.Generic.List[object]]::new()
+        objects     = [System.Collections.Generic.List[object]]::new()
         calls       = [System.Collections.Generic.List[object]]::new()
         faults      = [System.Collections.Generic.List[object]]::new()
         failConnect = [bool](Get-StubKey $source 'failConnect' $false)
@@ -169,6 +174,21 @@ function Read-StubState {
 
     foreach ($ou in @(Get-StubKey $source 'ous' @())){
         $state.ous.Add([string]$ou)
+    }
+
+    # Generic child objects (e.g. CN=ExchangeActiveSyncDevices,CN=<user>,...) that make a user a non-leaf.
+    foreach ($o in @(Get-StubKey $source 'objects' @())){
+        $dn = [string](Get-StubKey $o 'dn')
+        $guid = [string](Get-StubKey $o 'objectGuid')
+        if ([string]::IsNullOrEmpty($guid)){
+            $guid = New-StubDeterministicGuid -Text $dn
+        }
+
+        $state.objects.Add(@{
+                objectGuid  = ([guid]$guid).ToString()
+                dn          = $dn
+                objectClass = [string](Get-StubKey $o 'objectClass' 'container')
+            })
     }
 
     foreach ($c in @(Get-StubKey $source 'calls' @())){
@@ -384,7 +404,38 @@ function Get-StubEntities {
         }
     }
 
+    if ('object' -in $Kinds){
+        foreach ($o in $State.objects){
+            $all.Add(@{ Kind = 'object'; Source = $o; Dn = $o.dn; Guid = $o.objectGuid; Sam = ''; Upn = ''; ObjectClass = $o.objectClass })
+        }
+    }
+
     return $all
+}
+
+function Get-StubDescendants {
+    # Every user/group/object entity whose DN lies strictly below $Dn.
+    param($State, [string]$Dn)
+
+    $suffix = ',' + $Dn
+    return @(Get-StubEntities -State $State -Kinds @('user', 'group', 'object') | Where-Object { $_.Dn.EndsWith($suffix, [System.StringComparison]::OrdinalIgnoreCase) })
+}
+
+function Test-StubSearchBase {
+    # A search base is valid when it is a container or any existing object (e.g. a user with child objects).
+    param($State, [string]$Dn)
+
+    if (Test-StubContainer -State $State -Dn $Dn){
+        return $true
+    }
+
+    foreach ($entity in (Get-StubEntities -State $State -Kinds @('user', 'group', 'object'))){
+        if ($entity.Dn -ieq $Dn){
+            return $true
+        }
+    }
+
+    return $false
 }
 
 function Get-StubEntityValues {
@@ -662,7 +713,7 @@ function Search-StubEntities {
 
     if (
         ($SearchBase) -and
-        (-not (Test-StubContainer -State $State -Dn $SearchBase))
+        (-not (Test-StubSearchBase -State $State -Dn $SearchBase))
     ){
         throw [ADException]::new("Directory object not found (search base '$SearchBase')")
     }
@@ -774,7 +825,7 @@ function New-StubAdObject {
     $o['Name'] = Get-StubRdnValue -Dn $Entity.Dn
     $o['ObjectClass'] = $Entity.ObjectClass
     $o['ObjectGUID'] = [guid]$Entity.Guid
-    if ($Entity.Kind -ne 'ou'){
+    if ($Entity.Kind -notin @('ou', 'object')){
         $o['SamAccountName'] = $Entity.Sam
     }
 
@@ -939,7 +990,7 @@ function Get-ADObject {
         [pscredential]$Credential
     )
 
-    Invoke-StubGet -CmdletName 'Get-ADObject' -Kinds @('user', 'group', 'ou') -Identity $Identity -LDAPFilter $LDAPFilter -Filter $Filter -SearchBase $SearchBase -SearchScope $SearchScope -Properties $Properties -HasIdentity ($PSCmdlet.ParameterSetName -eq 'Identity')
+    Invoke-StubGet -CmdletName 'Get-ADObject' -Kinds @('user', 'group', 'ou', 'object') -Identity $Identity -LDAPFilter $LDAPFilter -Filter $Filter -SearchBase $SearchBase -SearchScope $SearchScope -Properties $Properties -HasIdentity ($PSCmdlet.ParameterSetName -eq 'Identity')
 }
 
 #endregion
@@ -1247,8 +1298,56 @@ function Remove-ADUser {
     try{
         Invoke-StubFault -State $state -Cmdlet 'Remove-ADUser' -Call $call -PlainPassword ''
         $entity = Resolve-StubIdentity -State $state -Identity $Identity -Kinds @('user')
+        # Like real AD: Remove-ADUser only deletes leaf objects (use Remove-ADObject -Recursive otherwise).
+        if (@(Get-StubDescendants -State $state -Dn $entity.Dn).Count -gt 0){
+            throw [ADException]::new($script:StubLeafError)
+        }
+
         if ($PSCmdlet.ShouldProcess($entity.Dn, 'Remove')){
             $null = $state.users.Remove($entity.Source)
+        }
+
+        $call.result = 'ok'
+    }
+    catch{
+        $call.result = 'error: ' + $_.Exception.Message
+        throw
+    }
+    finally{
+        Save-StubState -State $state
+    }
+}
+
+function Remove-ADObject {
+    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
+    param(
+        [Parameter(Mandatory, Position = 0)]$Identity,
+        [switch]$Recursive,
+        [string]$Server,
+        [pscredential]$Credential
+    )
+
+    $state = Read-StubState
+    $call = Add-StubCall -State $state -Cmdlet 'Remove-ADObject' -CallArgs (ConvertTo-StubCallArgs -Bound $PSBoundParameters)
+    try{
+        Invoke-StubFault -State $state -Cmdlet 'Remove-ADObject' -Call $call -PlainPassword ''
+        $entity = Resolve-StubIdentity -State $state -Identity $Identity -Kinds @('user', 'group', 'object')
+        $children = @(Get-StubDescendants -State $state -Dn $entity.Dn)
+        if (
+            ($children.Count -gt 0) -and
+            (-not $Recursive)
+        ){
+            throw [ADException]::new($script:StubLeafError)
+        }
+
+        if ($PSCmdlet.ShouldProcess($entity.Dn, 'Remove')){
+            foreach ($victim in @($children) + @($entity)){
+                switch ($victim.Kind){
+                    'user' { $null = $state.users.Remove($victim.Source) }
+                    'group' { $null = $state.groups.Remove($victim.Source) }
+                    'object' { $null = $state.objects.Remove($victim.Source) }
+                }
+            }
         }
 
         $call.result = 'ok'
@@ -1283,6 +1382,11 @@ function Move-ADObject {
 
         $newDn = '{0},{1}' -f (Get-StubLeafRdn -Dn $entity.Dn), $TargetPath
         Test-StubUnique -State $state -Sam '' -Upn '' -Dn $newDn -ExceptGuid $entity.Guid
+        # Child objects move with their parent.
+        foreach ($child in (Get-StubDescendants -State $state -Dn $entity.Dn)){
+            $child.Source.dn = $child.Dn.Substring(0, $child.Dn.Length - $entity.Dn.Length) + $newDn
+        }
+
         $entity.Source.dn = $newDn
         $call.result = 'ok'
     }
@@ -1374,5 +1478,5 @@ function Remove-ADGroupMember {
 Export-ModuleMember -Function @(
     'Get-ADRootDSE', 'Get-ADUser', 'Get-ADGroup', 'Get-ADObject',
     'New-ADUser', 'Set-ADUser', 'Disable-ADAccount', 'Enable-ADAccount', 'Remove-ADUser',
-    'Move-ADObject', 'Add-ADGroupMember', 'Remove-ADGroupMember'
+    'Remove-ADObject', 'Move-ADObject', 'Add-ADGroupMember', 'Remove-ADGroupMember'
 )

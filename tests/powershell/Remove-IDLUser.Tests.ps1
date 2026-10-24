@@ -29,7 +29,7 @@ Describe 'Remove-IDLUser.ps1' {
         $r.Json.results[0].objectGuid | Should Be $f.Off.objectGuid
         (Get-StubUser -Path $f.State -Sam 'old1') | Should BeNullOrEmpty
         (Get-StubUser -Path $f.State -Sam 'jdoe') | Should Not BeNullOrEmpty
-        (Get-StubCalls -Path $f.State -Cmdlet 'Remove-ADUser').Count | Should Be 1
+        (Get-StubCalls -Path $f.State -Cmdlet 'Remove-ADObject').Count | Should Be 1
     }
 
     It 'refuses to delete an enabled account' {
@@ -92,7 +92,7 @@ Describe 'Remove-IDLUser.ps1' {
         $first.Json.results[0].status | Should Be 'applied'
         $second.ExitCode | Should Be 0
         $second.Json.results[0].status | Should Be 'skipped'
-        (Get-StubCalls -Path $f.State -Cmdlet 'Remove-ADUser').Count | Should Be 1
+        (Get-StubCalls -Path $f.State -Cmdlet 'Remove-ADObject').Count | Should Be 1
     }
 
     It 'requires objectGuid: an item with only externalId fails and deletes nothing' {
@@ -125,7 +125,7 @@ Describe 'Remove-IDLUser.ps1' {
 
     It 'reports an AD error on delete as a per-item failure' {
         $f = New-Fixture
-        $state = New-StandardState -Users @($f.Off, $f.Off2) -Faults @(@{ cmdlet = 'Remove-ADUser'; match = $f.Off.objectGuid; message = 'Access is denied' })
+        $state = New-StandardState -Users @($f.Off, $f.Off2) -Faults @(@{ cmdlet = 'Remove-ADObject'; match = $f.Off.objectGuid; message = 'Access is denied' })
         $items = @(
             [ordered]@{ changeId = 'a'; externalId = 'E1003'; objectGuid = $f.Off.objectGuid },
             [ordered]@{ changeId = 'b'; externalId = 'E1004'; objectGuid = $f.Off2.objectGuid }
@@ -135,6 +135,73 @@ Describe 'Remove-IDLUser.ps1' {
         $r.Json.results[0].status | Should Be 'failed'
         $r.Json.results[0].error | Should Match 'Access is denied'
         $r.Json.results[1].status | Should Be 'applied'
+    }
+
+    It 'deletes an account that has an Exchange ActiveSync child container (recursive delete, children go too)' {
+        $f = New-Fixture
+        $userDn = $f.Off.dn
+        $objects = @(
+            @{ dn = "CN=ExchangeActiveSyncDevices,$userDn"; objectClass = 'msExchActiveSyncDevices' },
+            @{ dn = "CN=iPhone-ABC123,CN=ExchangeActiveSyncDevices,$userDn"; objectClass = 'msExchActiveSyncDevice' },
+            @{ dn = "CN=Unrelated,OU=Disabled,$script:Root"; objectClass = 'container' }
+        )
+        $state = New-StandardState -Users @($f.Off, $f.On) -Objects $objects
+        $item = [ordered]@{ changeId = 'c1'; externalId = 'E1003'; objectGuid = $f.Off.objectGuid }
+        $r = Invoke-IDLScript -Script 'Remove-IDLUser' -Request (New-RemoveRequest @($item)) -StatePath $state
+
+        $r.ExitCode | Should Be 0
+        $r.Json.results[0].status | Should Be 'applied'
+        $r.Json.results[0].message | Should Match '2 child object'
+        $r.LogText | Should Match 'has 2 child object'
+        (Get-StubUser -Path $state -Sam 'old1') | Should BeNullOrEmpty
+        $left = @((Read-StubStateFile -Path $state).objects)
+        $left.Count | Should Be 1
+        $left[0].dn | Should Be "CN=Unrelated,OU=Disabled,$script:Root"
+        $calls = @(Get-StubCalls -Path $state -Cmdlet 'Remove-ADObject')
+        $calls.Count | Should Be 1
+        $calls[0].args.Recursive | Should Be 'True'
+        (Get-StubCalls -Path $state -Cmdlet 'Remove-ADUser').Count | Should Be 0
+    }
+
+    It 'refuses to delete an account whose child objects include a user or computer' {
+        $f = New-Fixture
+        $userDn = $f.Off.dn
+        foreach ($cls in @('computer', 'user')){
+            $objects = @(@{ dn = "CN=ExchangeActiveSyncDevices,$userDn"; objectClass = 'msExchActiveSyncDevices' })
+            $users = @($f.Off)
+            if ($cls -eq 'computer'){
+                $objects += , @{ dn = "CN=PC99,$userDn"; objectClass = 'computer' }
+            }
+            else{
+                $users += , (New-StubUserEntry -Sam 'nested1' -ExternalId 'E3001' -Cn 'Nested One' -Ou $userDn)
+            }
+
+            $state = New-StandardState -Users $users -Objects $objects
+            $item = [ordered]@{ changeId = 'c1'; externalId = 'E1003'; objectGuid = $f.Off.objectGuid }
+            foreach ($dry in @($true, $false)){
+                $r = if ($dry) { Invoke-IDLScript -Script 'Remove-IDLUser' -Request (New-RemoveRequest @($item)) -StatePath $state -DryRun } else { Invoke-IDLScript -Script 'Remove-IDLUser' -Request (New-RemoveRequest @($item)) -StatePath $state }
+                $r.ExitCode | Should Be 1
+                $r.Json.results[0].status | Should Be 'failed'
+                $r.Json.results[0].error | Should Match "child security principal.*\($cls\)"
+            }
+
+            (Get-StubCalls -Path $state).Count | Should Be 0
+            (Get-StubUser -Path $state -Sam 'old1') | Should Not BeNullOrEmpty
+        }
+    }
+
+    It 'DryRun with child objects makes zero mutating calls and reports would' {
+        $f = New-Fixture
+        $objects = @(@{ dn = "CN=ExchangeActiveSyncDevices,$($f.Off.dn)"; objectClass = 'msExchActiveSyncDevices' })
+        $state = New-StandardState -Users @($f.Off) -Objects $objects
+        $item = [ordered]@{ changeId = 'c1'; externalId = 'E1003'; objectGuid = $f.Off.objectGuid }
+        $r = Invoke-IDLScript -Script 'Remove-IDLUser' -Request (New-RemoveRequest @($item)) -StatePath $state -DryRun
+        $r.ExitCode | Should Be 0
+        $r.Json.results[0].status | Should Be 'would'
+        $r.Json.results[0].message | Should Match '1 child object'
+        (Get-StubCalls -Path $state).Count | Should Be 0
+        (Get-StubUser -Path $state -Sam 'old1') | Should Not BeNullOrEmpty
+        @((Read-StubStateFile -Path $state).objects).Count | Should Be 1
     }
 
     It 'writes log + CSV report; rejects bad input (2); AD down (4); module missing (3)' {

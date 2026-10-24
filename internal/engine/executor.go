@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"time"
 
 	"idlifecycle/internal/ad"
 	"idlifecycle/internal/model"
@@ -55,49 +56,70 @@ func (e *Engine) decide(ctx context.Context, id, from, to, by, note, action stri
 
 var executionOrder = []string{model.ChangeCreate, model.ChangeUpdate, model.ChangeEnable, model.ChangeDisable, model.ChangeDelete}
 
-// Execute applies every approved change. It returns how many were applied and failed.
-func (e *Engine) Execute(ctx context.Context) (int, error) {
-	a, f, err := e.executeCounted(ctx)
-	return a + f, err
+// ExecuteChunk caps the items sent to one PowerShell invocation, so a large batch (the first load of a
+// whole HR population) never runs into the script timeout as a single all-or-nothing call.
+var ExecuteChunk = 50
+
+// execResult summarises one executor pass.
+type execResult struct {
+	applied, failed, deferred int
+	failures                  []string // "type display (external id): error" for notifications
 }
 
-func (e *Engine) executeCounted(ctx context.Context) (applied, failed int, err error) {
+// Execute applies every approved change. It returns how many were applied and failed.
+func (e *Engine) Execute(ctx context.Context) (int, error) {
+	r, err := e.executeCounted(ctx)
+	return r.applied + r.failed, err
+}
+
+func (e *Engine) executeCounted(ctx context.Context) (res execResult, err error) {
 	e.execMu.Lock()
 	defer e.execMu.Unlock()
+	defer func() { e.notifyExecution(ctx, res) }()
 
 	settings, err := e.Store.GetSettings(ctx)
 	if err != nil {
-		return 0, 0, err
+		return res, err
 	}
 	if settings.Engine.DryRun {
-		return 0, 0, nil // never write to AD while in dry-run, even if something was approved earlier
+		return res, nil // never write to AD while in dry-run, even if something was approved earlier
 	}
 
 	approved, err := e.Store.ListChangesWithStatus(ctx, model.StatusApproved)
 	if err != nil {
-		return 0, 0, err
+		return res, err
 	}
 	byType := map[string][]model.Change{}
 	for _, c := range approved {
 		byType[c.Type] = append(byType[c.Type], c)
 	}
 
-	for _, typ := range executionOrder {
-		batch := byType[typ]
-		if len(batch) == 0 {
-			continue
-		}
-		a, f, err := e.applyBatch(ctx, settings, typ, batch)
-		applied += a
-		failed += f
+	if dels := byType[model.ChangeDelete]; len(dels) > 0 && settings.Engine.MaxDeletesPerDay > 0 {
+		done, err := e.Store.CountAppliedSince(ctx, model.ChangeDelete, e.Now().Add(-24*time.Hour))
 		if err != nil {
-			return applied, failed, err
+			return res, err
+		}
+		allowed := max(settings.Engine.MaxDeletesPerDay-done, 0)
+		if len(dels) > allowed {
+			// Oldest approvals go first; the rest stay approved and are picked up when the window allows.
+			res.deferred = len(dels) - allowed
+			byType[model.ChangeDelete] = dels[:allowed]
 		}
 	}
-	return applied, failed, nil
+
+	for _, typ := range executionOrder {
+		batch := byType[typ]
+		for start := 0; start < len(batch); start += ExecuteChunk {
+			chunk := batch[start:min(start+ExecuteChunk, len(batch))]
+			if err := e.applyBatch(ctx, settings, typ, chunk, &res); err != nil {
+				return res, err
+			}
+		}
+	}
+	return res, nil
 }
 
-func (e *Engine) applyBatch(ctx context.Context, s model.Settings, typ string, batch []model.Change) (applied, failed int, err error) {
+func (e *Engine) applyBatch(ctx context.Context, s model.Settings, typ string, batch []model.Change, res *execResult) error {
 	// Claim each change (approved -> applying). Anyone who lost a race is skipped.
 	var claimed []model.Change
 	for _, c := range batch {
@@ -106,12 +128,12 @@ func (e *Engine) applyBatch(ctx context.Context, s model.Settings, typ string, b
 				continue
 			}
 			e.releaseClaimed(claimed, err)
-			return applied, failed, err
+			return err
 		}
 		claimed = append(claimed, c)
 	}
 	if len(claimed) == 0 {
-		return 0, 0, nil
+		return nil
 	}
 
 	opts := ad.ActionOpts{Server: s.AD.Server, IDAttribute: s.AD.IDAttribute}
@@ -129,7 +151,7 @@ func (e *Engine) applyBatch(ctx context.Context, s model.Settings, typ string, b
 			pw, perr := GeneratePassword(s.NewUser.PasswordLength)
 			if perr != nil {
 				e.releaseClaimed(claimed, perr)
-				return applied, failed, perr
+				return perr
 			}
 			items = append(items, ad.CreateItem{
 				ChangeID: c.ID, ExternalID: c.ExternalID, OU: c.Payload.OU, Candidates: c.Payload.Candidates,
@@ -191,16 +213,17 @@ func (e *Engine) applyBatch(ctx context.Context, s model.Settings, typ string, b
 		}
 		e.recordResult(ctx, c, r)
 		if r.OK() {
-			applied++
+			res.applied++
 		} else {
-			failed++
+			res.failed++
+			res.failures = append(res.failures, fmt.Sprintf("%s %s (%s): %s", c.Type, c.Display, c.ExternalID, firstNonEmpty(r.Error, r.Message, "failed")))
 		}
 	}
 
 	if callErr != nil {
 		e.Log.Error("AD action failed", "type", typ, "count", len(claimed), "error", callErr)
 	}
-	return applied, failed, nil
+	return nil
 }
 
 // releaseClaimed fails changes that were claimed but never sent to AD so they do not sit in
@@ -259,16 +282,16 @@ func (e *Engine) recordResult(ctx context.Context, c model.Change, r ad.Result) 
 		id.State = model.StateLinked
 		if r.OK() {
 			for k, v := range c.Payload.Attributes {
-				id.Applied[k] = v
+				setApplied(id.Applied, k, v)
 			}
 		}
 	case model.ChangeUpdate:
 		if r.OK() {
 			for k, d := range c.Payload.Set {
-				id.Applied[k] = d.To
+				setApplied(id.Applied, k, d.To)
 			}
 			for _, k := range c.Payload.Clear {
-				id.Applied[k] = ""
+				setApplied(id.Applied, k, "")
 			}
 		}
 	case model.ChangeDisable:

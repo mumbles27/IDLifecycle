@@ -2,12 +2,18 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"idlifecycle/internal/api"
+	"idlifecycle/internal/app"
+	"idlifecycle/internal/config"
+	"idlifecycle/internal/datadir"
 )
 
 func run(t *testing.T, args ...string) (int, string, string) {
@@ -60,6 +66,50 @@ func TestInitAndUserLifecycle(t *testing.T) {
 	code, out, _ = run(t, "user", "list", "-config", cfg)
 	if code != 0 || !strings.Contains(out, "root") || !strings.Contains(out, "admin") || strings.Contains(out, "another-long-password") {
 		t.Fatalf("list: %d %s", code, out)
+	}
+
+	// Entries written by the CLI must verify with the key the service uses (they once were unkeyed,
+	// which broke verification at seq 1 on every install and hid any later tampering).
+	c, err := config.Load(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	st, err := app.OpenStore(ctx, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	_ = st.AppendAudit(ctx, "system", "service.start", "service", "", nil) // as the service would, after the CLI
+	res, err := st.VerifyAudit(ctx)
+	if err != nil || !res.OK || res.Checked < 3 {
+		t.Fatalf("audit chain after CLI writes: %+v %v", res, err)
+	}
+}
+
+func TestInitLocksDownAndServiceRefusesOpenDataDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if code, _, errs := run(t, "init", "-dir", dir); code != 0 {
+		t.Fatalf("init: %d %s", code, errs)
+	}
+	if err := datadir.Check(dir); err != nil {
+		t.Fatalf("init must leave the data directory restricted: %v", err)
+	}
+	if runtime.GOOS != "windows" {
+		return
+	}
+	cfg := filepath.Join(dir, "config.json")
+	if out, err := exec.Command("icacls", dir, "/grant", "*S-1-5-32-545:(OI)(CI)(RX)").CombinedOutput(); err != nil {
+		t.Fatalf("icacls: %v %s", err, out)
+	}
+	if code, _, errs := run(t, "run", "-config", cfg); code == 0 || !strings.Contains(errs, "lockdown") {
+		t.Fatalf("run must refuse an open data dir and say how to fix it: %d %s", code, errs)
+	}
+	if code, out, errs := run(t, "lockdown", "-config", cfg); code != 0 || !strings.Contains(out, "Restricted") {
+		t.Fatalf("lockdown: %d %s %s", code, out, errs)
+	}
+	if err := datadir.Check(dir); err != nil {
+		t.Fatalf("after lockdown: %v", err)
 	}
 }
 

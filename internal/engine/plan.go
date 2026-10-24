@@ -61,6 +61,30 @@ func mergeMappings(base []model.Mapping, grants []model.AttrGrant) []effective {
 	return out
 }
 
+// appliedValue looks up the last value written for attr. LDAP names are case-insensitive, and a mapping
+// and a role grant may spell the same attribute differently ("Title" / "title").
+func appliedValue(applied map[string]string, attr string) (string, bool) {
+	if v, ok := applied[attr]; ok {
+		return v, true
+	}
+	for k, v := range applied {
+		if strings.EqualFold(k, attr) {
+			return v, true
+		}
+	}
+	return "", false
+}
+
+// setApplied records a written value under attr, dropping other spellings of the same attribute.
+func setApplied(applied map[string]string, attr, v string) {
+	for k := range applied {
+		if k != attr && strings.EqualFold(k, attr) {
+			delete(applied, k)
+		}
+	}
+	applied[attr] = v
+}
+
 func orStr(v, d string) string {
 	if v == "" {
 		return d
@@ -96,6 +120,20 @@ func PlanIdentity(pc *PlanContext, id model.Identity, acct *ad.User) (*Planned, 
 	var warnings []string
 	res := ResolveRoles(pc.Rules, id.Attrs)
 	maps := mergeMappings(pc.Mappings, res.Attrs)
+	// Rules saved before validation tightened may still target the link key or a protected attribute; the
+	// scripts would refuse the whole item, so drop just that attribute and say so.
+	kept := maps[:0]
+	for _, m := range maps {
+		switch {
+		case strings.EqualFold(m.Attr, pc.Settings.AD.IDAttribute):
+			warnings = append(warnings, fmt.Sprintf("%s is the link key (ad.id_attribute) and is set by the service; mapping ignored", m.Attr))
+		case IsProtectedAttribute(m.Attr):
+			warnings = append(warnings, fmt.Sprintf("%s is a protected attribute; mapping ignored", m.Attr))
+		default:
+			kept = append(kept, m)
+		}
+	}
+	maps = kept
 
 	desired, w, err := renderAll(pc, id, maps)
 	warnings = append(warnings, w...)
@@ -305,7 +343,7 @@ func planUpdate(pc *PlanContext, id model.Identity, acct *ad.User, maps []effect
 		}
 		current := acct.Attr(m.Attr)
 		if attrEqual(m.Attr, current, r.Value) {
-			if m.Mode == model.ModeSync && id.Applied[m.Attr] != r.Value {
+			if last, ok := appliedValue(id.Applied, m.Attr); m.Mode == model.ModeSync && (!ok || last != r.Value) {
 				if observed == nil {
 					observed = map[string]string{}
 				}
@@ -316,7 +354,7 @@ func planUpdate(pc *PlanContext, id model.Identity, acct *ad.User, maps []effect
 		if m.Mode == model.ModeSync {
 			// Only push when the *source-derived* value changed since we last wrote it, so a manual
 			// AD edit survives until HR data changes.
-			if last, ok := id.Applied[m.Attr]; ok && attrEqual(m.Attr, last, r.Value) {
+			if last, ok := appliedValue(id.Applied, m.Attr); ok && attrEqual(m.Attr, last, r.Value) {
 				continue
 			}
 		}

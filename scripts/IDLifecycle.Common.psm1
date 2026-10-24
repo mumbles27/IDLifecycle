@@ -28,16 +28,24 @@ $script:IDLContainerCache = [System.Collections.Generic.Dictionary[string, bool]
 $script:IDLUtf8NoBom = [System.Text.UTF8Encoding]::new($false)
 
 # Attributes that scripts must never write through the generic attribute plumbing.
+# Keep this a plain list of lower-case single-quoted literals: the Go side parses it with a regex to stay in sync.
 $script:IDLProtectedAttributes = @(
-    'objectguid', 'objectsid', 'distinguishedname', 'memberof', 'unicodepwd', 'userpassword',
-    'useraccountcontrol', 'primarygroupid', 'pwdlastset', 'ntsecuritydescriptor',
-    'samaccountname', 'userprincipalname', 'altsecurityidentities', 'serviceprincipalname', 'scriptpath',
-    'userworkstations', 'admincount', 'sidhistory'
+    'samaccountname', 'userprincipalname', 'cn', 'name', 'distinguishedname',
+    'objectguid', 'objectsid', 'objectclass', 'objectcategory',
+    'memberof', 'member',
+    'unicodepwd', 'userpassword', 'unixuserpassword',
+    'useraccountcontrol', 'primarygroupid', 'pwdlastset', 'lockouttime', 'accountexpires',
+    'logonhours', 'userworkstations', 'altsecurityidentities', 'serviceprincipalname',
+    'scriptpath', 'homedirectory', 'homedrive', 'profilepath',
+    'admincount', 'sidhistory', 'ntsecuritydescriptor',
+    'usercertificate', 'usersmimecertificate', 'proxyaddresses', 'msnpallowdialin'
 )
 
 # Attribute-name prefixes that are never writable through the generic attribute plumbing.
 # (msExch has no hyphen in real attribute names such as msExchHideFromAddressLists, so the prefix is 'msexch'.)
-$script:IDLProtectedAttributePrefixes = @('msds-', 'msexch')
+$script:IDLProtectedAttributePrefixes = @(
+    'msds-', 'ms-ds-', 'msexch', 'mspki-'
+)
 
 # Well-known RIDs of privileged groups: Domain Admins, Schema Admins, Enterprise Admins, Administrators,
 # Account Operators, Server Operators, Print Operators, Backup Operators.
@@ -1571,24 +1579,35 @@ function Test-IDLDnShape {
 function Get-IDLGroupDns {
     <#
     .SYNOPSIS
-        Maps group identities to DNs using a Resolve-IDLGroups map. Returns {Dns; Missing}.
+        Maps group identities to DNs using a Resolve-IDLGroups map. Returns {Dns; Missing; Skipped}.
     .DESCRIPTION
         Throws (so the item fails before any change) when a group is ambiguous or privileged. Missing groups are
         returned in .Missing for the caller to treat as it needs.
+        With -SkipPrivileged (used by Disable-IDLUser, which must never be blocked) ambiguous and privileged groups
+        are NOT thrown on but returned in .Skipped as {Identity; Kind ('privileged'|'ambiguous'); Reason}; they are
+        never part of .Dns, so their membership is left alone.
     #>
     [CmdletBinding()]
     param(
         [AllowNull()][string[]]$Identities,
-        [Parameter(Mandatory)]$GroupMap
+        [Parameter(Mandatory)]$GroupMap,
+        [switch]$SkipPrivileged
     )
 
     $dns = [System.Collections.Generic.List[string]]::new()
     $missing = [System.Collections.Generic.List[string]]::new()
+    $skipped = [System.Collections.Generic.List[object]]::new()
 
     foreach ($identity in @($Identities)){
         $entry = $GroupMap[$identity]
         if ($entry.Ambiguous){
-            throw "Group '$identity' is ambiguous: it matches $($entry.MatchCount) groups; refusing to guess."
+            $reason = "it matches $($entry.MatchCount) groups"
+            if ($SkipPrivileged){
+                $skipped.Add([pscustomobject]@{ Identity = $identity; Kind = 'ambiguous'; Reason = $reason })
+                continue
+            }
+
+            throw "Group '$identity' is ambiguous: $reason; refusing to guess."
         }
 
         if (-not $entry.Found){
@@ -1597,6 +1616,11 @@ function Get-IDLGroupDns {
         }
 
         if ($entry.Privileged){
+            if ($SkipPrivileged){
+                $skipped.Add([pscustomobject]@{ Identity = $identity; Kind = 'privileged'; Reason = [string]$entry.PrivilegedReason })
+                continue
+            }
+
             throw "Group '$identity' is privileged ($($entry.PrivilegedReason)); refusing to change its membership."
         }
 
@@ -1606,6 +1630,7 @@ function Get-IDLGroupDns {
     return [pscustomobject]@{
         Dns     = [string[]]$dns.ToArray()
         Missing = [string[]]$missing.ToArray()
+        Skipped = [object[]]$skipped.ToArray()
     }
 }
 
@@ -1767,6 +1792,62 @@ function Set-IDLDirectoryLockdown {
 
 #endregion
 
+#region Mark-of-the-Web (used by the installer)
+
+function Get-IDLBlockedFiles {
+    <#
+    .SYNOPSIS
+        Returns the full paths of .ps1/.psm1/.psd1 files under the directory (recursive, Logs folders skipped) that
+        carry a Zone.Identifier stream (Mark-of-the-Web). Under RemoteSigned such files refuse to load.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)){
+        return [string[]]@()
+    }
+
+    $blocked = [System.Collections.Generic.List[string]]::new()
+    $root = (Get-Item -LiteralPath $Path).FullName.TrimEnd('\')
+    $files = @(Get-ChildItem -LiteralPath $root -Recurse -File -Include '*.ps1', '*.psm1', '*.psd1' -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName.Substring($root.Length) -notmatch '\\Logs\\' })
+    foreach ($file in $files){
+        if ($null -ne (Get-Item -LiteralPath $file.FullName -Stream 'Zone.Identifier' -ErrorAction SilentlyContinue)){
+            $blocked.Add($file.FullName)
+        }
+    }
+
+    return [string[]]$blocked.ToArray()
+}
+
+function Unblock-IDLScriptFiles {
+    <#
+    .SYNOPSIS
+        Runs Unblock-File on every file Get-IDLBlockedFiles reports under the directory (logging each one) and
+        returns the paths that are STILL blocked afterwards (empty when everything worked).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    foreach ($file in (Get-IDLBlockedFiles -Path $Path)){
+        try{
+            Unblock-File -LiteralPath $file
+            Write-IDLLog "  Unblocked $file"
+        }
+        catch{
+            Write-IDLLog "  Could not unblock ${file}: $($_.Exception.Message)" 'WARN'
+        }
+    }
+
+    return [string[]]@(Get-IDLBlockedFiles -Path $Path)
+}
+
+#endregion
+
 #endregion
 
 Export-ModuleMember -Function @(
@@ -1782,5 +1863,6 @@ Export-ModuleMember -Function @(
     'Test-IDLAdConnection', 'Test-IDLContainerExists', 'Find-IDLUsersByGuid', 'Find-IDLUsersByAttribute',
     'Resolve-IDLTargetUsers', 'Resolve-IDLGroups', 'Update-IDLGroupMembership', 'Move-IDLUser',
     'Get-IDLProtectedAttributes', 'Get-IDLUserFields', 'Test-IDLProtectedAttribute', 'Test-IDLDnShape', 'Get-IDLGroupDns',
-    'Get-IDLPrivilegedReason', 'Test-IDLDirectoryLockedDown', 'Set-IDLDirectoryLockdown', 'Get-IDLDirectoryDacl'
+    'Get-IDLPrivilegedReason', 'Test-IDLDirectoryLockedDown', 'Set-IDLDirectoryLockdown', 'Get-IDLDirectoryDacl',
+    'Get-IDLBlockedFiles', 'Unblock-IDLScriptFiles'
 )

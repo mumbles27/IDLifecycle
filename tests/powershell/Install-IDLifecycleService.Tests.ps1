@@ -1,7 +1,10 @@
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $here 'TestHelpers.ps1')
 
-Describe 'Install-IDLifecycleService.ps1 (DryRun smoke test only; never registers a service)' {
+# Pure helpers (Get-IDLBlockedFiles / Unblock-IDLScriptFiles) are exercised in this process on temp files only.
+Import-Module (Join-Path $script:ScriptsDir 'IDLifecycle.Common.psm1') -Force
+
+Describe 'Install-IDLifecycleService.ps1 (DryRun only; never registers a service; unblock helpers on temp files)' {
 
     function New-InstallFixture {
         $dir = Join-Path $script:StateDir ('install_' + [guid]::NewGuid().ToString('N'))
@@ -56,6 +59,90 @@ Describe 'Install-IDLifecycleService.ps1 (DryRun smoke test only; never register
         $cfg = @('-BinaryPath', $fx.Exe, '-ConfigPath', $badCfg, '-ServiceAccount', 'TESTDOM\svc-idl$')
         (Invoke-IDLScript -Script 'Install-IDLifecycleService' -StatePath $state -ScriptArguments $cfg -DryRun).ExitCode | Should Be 2
 
+        Remove-Item -LiteralPath $fx.Dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    function New-BlockedScriptsDir {
+        # A throw-away scripts dir: three blocked script files, one clean script, one blocked non-script, one blocked file under Logs.
+        $dir = Join-Path $script:StateDir ('motw_' + [guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory -Force -Path (Join-Path $dir 'Logs')
+        $null = New-Item -ItemType Directory -Force -Path (Join-Path $dir 'Sub')
+        $blocked = @((Join-Path $dir 'A.ps1'), (Join-Path $dir 'B.psm1'), (Join-Path $dir 'Sub\C.psd1'))
+        $others = @((Join-Path $dir 'Clean.ps1'), (Join-Path $dir 'Notes.txt'), (Join-Path $dir 'Logs\Old.ps1'))
+        foreach ($f in ($blocked + $others)){
+            Set-Content -LiteralPath $f -Value '# test'
+        }
+
+        foreach ($f in ($blocked + @((Join-Path $dir 'Notes.txt'), (Join-Path $dir 'Logs\Old.ps1')))){
+            Set-Content -Path $f -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3"
+        }
+
+        return @{ Dir = $dir; Blocked = $blocked }
+    }
+
+    function Test-HasZoneId {
+        param([string]$Path)
+        return ($null -ne (Get-Item -LiteralPath $Path -Stream Zone.Identifier -ErrorAction SilentlyContinue))
+    }
+
+    It 'Get-IDLBlockedFiles lists only .ps1/.psm1/.psd1 files with a Zone.Identifier stream (Logs skipped)' {
+        $b = New-BlockedScriptsDir
+        $found = @(Get-IDLBlockedFiles -Path $b.Dir | Sort-Object)
+        ($found -join '|') | Should Be ((@($b.Blocked) | Sort-Object) -join '|')
+        @(Get-IDLBlockedFiles -Path (Join-Path $b.Dir 'missing')).Count | Should Be 0
+        Remove-Item -LiteralPath $b.Dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'Unblock-IDLScriptFiles (the installer apply step) removes the stream and returns nothing still blocked' {
+        $b = New-BlockedScriptsDir
+        $left = @(Unblock-IDLScriptFiles -Path $b.Dir)
+        $left.Count | Should Be 0
+        foreach ($f in $b.Blocked){
+            Test-HasZoneId -Path $f | Should Be $false
+        }
+
+        @(Get-IDLBlockedFiles -Path $b.Dir).Count | Should Be 0
+        # Files the step does not own are left alone.
+        Test-HasZoneId -Path (Join-Path $b.Dir 'Notes.txt') | Should Be $true
+        Test-HasZoneId -Path (Join-Path $b.Dir 'Logs\Old.ps1') | Should Be $true
+        Remove-Item -LiteralPath $b.Dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'DryRun reports WOULD: unblock for each blocked script in powershell.scripts_dir and unblocks nothing' {
+        $fx = New-InstallFixture
+        $b = New-BlockedScriptsDir
+        $json = ConvertTo-Json -InputObject @{ data_dir = $fx.Data; powershell = @{ scripts_dir = $b.Dir } } -Compress
+        [System.IO.File]::WriteAllText($fx.Cfg, $json, $script:Utf8NoBom)
+        $state = New-StubStateFile
+        $args1 = @('-BinaryPath', $fx.Exe, '-ConfigPath', $fx.Cfg, '-ServiceAccount', 'TESTDOM\svc-idl$', '-ServiceName', $serviceName)
+        $r = Invoke-IDLScript -Script 'Install-IDLifecycleService' -StatePath $state -ScriptArguments $args1 -DryRun
+
+        $r.ExitCode | Should Be 0
+        $r.LogText | Should Match '3 blocked file\(s\)'
+        foreach ($f in $b.Blocked){
+            $r.LogText | Should Match ('WOULD: unblock ' + [regex]::Escape($f))
+            Test-HasZoneId -Path $f | Should Be $true
+        }
+
+        $r.LogText | Should Match 'WOULD: UnblockScripts'
+        $r.LogText | Should Not Match 'Clean\.ps1'
+        $r.ReportText | Should Match 'UnblockScripts'
+        Remove-Item -LiteralPath $b.Dir -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $fx.Dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'DryRun skips the unblock step when nothing is blocked' {
+        $fx = New-InstallFixture
+        $b = New-BlockedScriptsDir
+        $null = Unblock-IDLScriptFiles -Path $b.Dir
+        $json = ConvertTo-Json -InputObject @{ data_dir = $fx.Data; powershell = @{ scripts_dir = $b.Dir } } -Compress
+        [System.IO.File]::WriteAllText($fx.Cfg, $json, $script:Utf8NoBom)
+        $state = New-StubStateFile
+        $args1 = @('-BinaryPath', $fx.Exe, '-ConfigPath', $fx.Cfg, '-ServiceAccount', 'TESTDOM\svc-idl$', '-ServiceName', $serviceName)
+        $r = Invoke-IDLScript -Script 'Install-IDLifecycleService' -StatePath $state -ScriptArguments $args1 -DryRun
+        $r.ExitCode | Should Be 0
+        $r.LogText | Should Match 'SKIP: UnblockScripts'
+        Remove-Item -LiteralPath $b.Dir -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $fx.Dir -Recurse -Force -ErrorAction SilentlyContinue
     }
 }

@@ -4,6 +4,9 @@
 
 .DESCRIPTION
     One-shot, idempotent installer. It:
+      0. unblocks (Unblock-File) every .ps1/.psm1/.psd1 in the scripts directory ("powershell.scripts_dir", else
+         this script's folder) that carries a Mark-of-the-Web Zone.Identifier stream - under RemoteSigned such files
+         refuse to load and every sync would fail - and fails the step if any is still blocked afterwards;
       1. creates the data directory (config "data_dir", holds the database and key material) and the scripts Logs
          directory (employee PII), then LOCKS BOTH DOWN: ACL inheritance is switched off WITHOUT copying inherited
          entries, every explicit entry is removed, and only SYSTEM and BUILTIN\Administrators (FullControl) and
@@ -274,6 +277,28 @@ try{
     }
 
     Write-IDLLog "Service '$ServiceName' as '$ServiceAccount'; data dir '$dataDir'; logs dir '$logsDir'"
+    Stop-IDLPhase -Phase $phase
+
+    # ---- Phase: Mark-of-the-Web ----
+    # Copied/downloaded scripts carry a Zone.Identifier stream; under RemoteSigned they refuse to load and every
+    # sync fails. Unblock them, then verify that none is left.
+    $phase = Start-IDLPhase -Name 'Unblock scripts'
+    $blockedFiles = @(Get-IDLBlockedFiles -Path $scriptsDir)
+    Write-IDLLog "Scripts dir '$scriptsDir': $($blockedFiles.Count) blocked file(s) (Zone.Identifier)"
+    foreach ($blockedFile in $blockedFiles){
+        Write-IDLLog (($DryRun) ? ("WOULD: unblock $blockedFile") : ("  blocked: $blockedFile"))
+    }
+
+    Invoke-InstallStep -Action 'UnblockScripts' -Identity $scriptsDir `
+        -Details "Unblock-File on $($blockedFiles.Count) .ps1/.psm1/.psd1 file(s)" `
+        -IsSatisfied { $blockedFiles.Count -eq 0 } `
+        -Apply {
+        $stillBlocked = @(Unblock-IDLScriptFiles -Path $scriptsDir)
+        if ($stillBlocked.Count -gt 0){
+            throw ("{0} script file(s) are still blocked (Zone.Identifier) and will not load under RemoteSigned: {1}. Unblock them manually (Unblock-File) and re-run." -f $stillBlocked.Count, ($stillBlocked -join ', '))
+        }
+    }
+
     Stop-IDLPhase -Phase $phase
 
     # ---- Phase: directories and ACLs ----

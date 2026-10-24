@@ -17,16 +17,20 @@ import (
 
 func (e *Engine) finish(ctx context.Context, run *model.Run) {
 	var fatal []string
+	var notes runNotes
 	e.execMu.Lock() // the executor also rewrites identity rows; never interleave with planning
-	err := e.sync(ctx, run)
+	err := e.sync(ctx, run, &notes)
 	e.execMu.Unlock()
 	if err != nil {
 		fatal = append(fatal, err.Error())
 	}
-	if applied, failed, err := e.executeCounted(ctx); err != nil {
+	if res, err := e.executeCounted(ctx); err != nil {
 		fatal = append(fatal, "execute: "+err.Error())
 	} else {
-		run.Counters["applied"], run.Counters["failed"] = applied, failed
+		run.Counters["applied"], run.Counters["failed"] = res.applied, res.failed
+		if res.deferred > 0 {
+			run.Counters["deferred_deletes"] = res.deferred
+		}
 	}
 
 	now := e.Now()
@@ -42,6 +46,7 @@ func (e *Engine) finish(ctx context.Context, run *model.Run) {
 	}
 	e.audit(ctx, "system", "sync.finish", "run", run.ID, map[string]any{"status": run.Status, "counters": run.Counters, "error": run.Error})
 	e.Log.Info("sync finished", "run", run.ID, "status", run.Status, "counters", run.Counters, "error", run.Error)
+	e.notifyRun(ctx, run, notes.pending, notes.thresholds)
 }
 
 const (

@@ -187,3 +187,22 @@ func TestFakeContract(t *testing.T) {
 		t.Fatalf("external id mismatch must fail: %+v", res[0])
 	}
 }
+
+func TestBlockedScriptsFindsMarkOfTheWeb(t *testing.T) {
+	dir := t.TempDir()
+	clean := filepath.Join(dir, "Clean.ps1")
+	blocked := filepath.Join(dir, "sub", "Blocked.psm1")
+	_ = os.MkdirAll(filepath.Dir(blocked), 0o700)
+	for _, p := range []string{clean, blocked, filepath.Join(dir, "notes.txt")} {
+		if err := os.WriteFile(p, []byte("#"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(blocked+":Zone.Identifier", []byte("[ZoneTransfer]\r\nZoneId=3\r\n"), 0o600); err != nil {
+		t.Skip("alternate data streams not supported here:", err)
+	}
+	got := BlockedScripts(dir)
+	if len(got) != 1 || got[0] != blocked {
+		t.Fatalf("BlockedScripts = %v, want [%s]", got, blocked)
+	}
+}

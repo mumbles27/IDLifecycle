@@ -55,6 +55,8 @@ separate process.
   "groups": [ { "dn": "CN=GG-AllStaff,OU=Groups,DC=stub,DC=test", "sam": "GG-AllStaff",
                 "adminCount": 1, "objectSid": "S-1-5-21-1-2-3-512" } ],
   "ous":    [ "OU=Staff,DC=stub,DC=test", "OU=Groups,DC=stub,DC=test" ],
+  "objects": [ { "dn": "CN=ExchangeActiveSyncDevices,CN=Jane Doe,OU=Staff,DC=stub,DC=test",
+                 "objectClass": "msExchActiveSyncDevices" } ],
   "calls":  [ { "cmdlet": "New-ADUser", "args": { "Name": "Jane Doe", "AccountPassword": "***" }, "result": "ok" } ],
   "faults": [ { "cmdlet": "Add-ADGroupMember", "match": "jdoe", "message": "boom {password}" } ],
   "failConnect": false
@@ -68,8 +70,14 @@ separate process.
 * A fault whose `cmdlet` is `Get-ADObject` also makes **reads** throw when `match` appears in the identity/filter/
   search base (used to test OU-verification failures).
 * `ous` lists valid OU/container DNs. Any DN made only of `DC=` parts is always valid.
+* `objects` (optional) are generic child objects (`dn`, `objectClass`, optional `objectGuid`). An entry whose DN ends
+  with `,<user DN>` is a child of that user: `Remove-ADUser` and `Remove-ADObject` without `-Recursive` then throw
+  "The directory service can perform the requested operation only on a leaf object", `Remove-ADObject -Recursive`
+  deletes the whole subtree (users, groups and objects below it), and `Move-ADObject` moves children along.
+  `Get-ADObject` returns them and accepts any existing object DN as `-SearchBase` (`Base`/`OneLevel`/`Subtree`).
+  A nested *user* is simply a `users[]` entry whose DN is below another user's DN.
 * `calls` is appended by every **mutating** cmdlet (`New-ADUser`, `Set-ADUser`, `Enable/Disable-ADAccount`,
-  `Remove-ADUser`, `Move-ADObject`, `Add/Remove-ADGroupMember`), including failed attempts (`result` starts with
+  `Remove-ADUser`, `Remove-ADObject`, `Move-ADObject`, `Add/Remove-ADGroupMember`), including failed attempts (`result` starts with
   `error`). Passwords are recorded as `***`. Tests use it to prove DryRun made **zero** mutating calls.
 * `faults` makes a matching mutating cmdlet throw. `match` is a case-insensitive substring of the call's JSON args
   (`""` = every call). `{password}` in `message` is replaced by the plaintext password so tests can prove the

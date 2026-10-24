@@ -308,6 +308,15 @@ func (s *Store) ListChangesWithStatus(ctx context.Context, statuses ...string) (
 	return out, rows.Err()
 }
 
+// CountAppliedSince counts changes of one type applied at or after since (used for rolling rate limits).
+func (s *Store) CountAppliedSince(ctx context.Context, changeType string, since time.Time) (int, error) {
+	w := &where{}
+	w.add("change_type = ?", changeType)
+	w.add("status = ?", model.StatusApplied)
+	w.add("applied_at >= ?", ts(since))
+	return s.count(ctx, "changes", w)
+}
+
 func (s *Store) CountChanges(ctx context.Context, status string) (int, error) {
 	w := &where{}
 	w.add("status = ?", status)

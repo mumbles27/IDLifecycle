@@ -13,6 +13,9 @@
         otherwise the item fails and nothing is deleted;
       * the object must be a user (a computer or anything else is refused);
       * the account must be DISABLED - an enabled account is refused ("account is enabled");
+      * if the account has child objects (e.g. CN=ExchangeActiveSyncDevices), none of them may be a user, computer,
+        group or inetOrgPerson; otherwise the item fails. The account is deleted with Remove-ADObject -Recursive
+        (Remove-ADUser cannot delete a non-leaf object), so leaf device/container children go with it;
       * an account that is already gone is "skipped" (idempotent).
     One failing item never stops the others.
 
@@ -31,7 +34,8 @@
     Get-Content .\remove-request.json -Raw | pwsh -NoProfile -File .\Remove-IDLUser.ps1 | ConvertFrom-Json
 
 .NOTES
-    Requires PowerShell 7+, the ActiveDirectory module and delegated delete rights on user objects.
+    Requires PowerShell 7+, the ActiveDirectory module and delegated delete rights on user objects (Delete subtree,
+    because accounts with child objects are deleted recursively).
     Exit codes: 0 ok, 1 some items failed, 2 invalid input, 3 module missing, 4 cannot reach AD, 5 unexpected error.
     Logs and the CSV report (Remove-IDLUser_Report_<ts>.csv) are written to $PSScriptRoot\Logs. DELETION IS PERMANENT
     unless the AD Recycle Bin is enabled - use -DryRun first.
@@ -78,6 +82,9 @@ try{
     Write-IDLLog "ActiveDirectory module loaded (version $((Get-Module ActiveDirectory).Version))"
     Test-IDLAdConnection -Server $server
     $serverParams = Get-IDLServerParams -Server $server
+
+    # Object classes that must never be deleted as a side effect of deleting a user (recursive delete).
+    $principalClasses = @('user', 'computer', 'group', 'inetOrgPerson')
 
     # ---- Phase: bulk resolution ----
     $phase = Start-IDLPhase -Name 'Resolve accounts'
@@ -135,16 +142,28 @@ try{
                         throw 'account is enabled; refusing to delete (disable it first)'
                     }
 
+                    # Child objects (e.g. CN=ExchangeActiveSyncDevices) make the user a non-leaf, which Remove-ADUser
+                    # cannot delete. Device/container children may go with it; a security principal below it may not.
+                    $children = @(Get-ADObject -LDAPFilter '(objectClass=*)' -SearchBase $userDn -SearchScope Subtree @serverParams | Where-Object { [string]$_.DistinguishedName -ine $userDn })
+                    Write-IDLLog "  $identity has $($children.Count) child object(s)"
+                    $principals = @($children | Where-Object { [string]$_.ObjectClass -in $principalClasses })
+                    if ($principals.Count -gt 0){
+                        $names = @($principals | ForEach-Object { '{0} ({1})' -f $_.DistinguishedName, $_.ObjectClass }) -join '; '
+                        throw "account has child security principal(s): $names; refusing to delete"
+                    }
+
+                    $childNote = (($children.Count -gt 0) ? (" with $($children.Count) child object(s)") : (''))
                     if ($DryRun){
-                        Write-IDLLog "  WOULD: delete $userDn"
-                        Add-IDLReportRow -Action 'RemoveUser' -Result 'Would' -Identity $identity -ObjectIdOrDN $userDn
-                        $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status would -Message 'would delete account' @userFields
+                        Write-IDLLog "  WOULD: delete $userDn$childNote"
+                        Add-IDLReportRow -Action 'RemoveUser' -Result 'Would' -Identity $identity -ObjectIdOrDN $userDn -Details $childNote.Trim()
+                        $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status would -Message ('would delete account' + $childNote) @userFields
                     }
                     else{
-                        Remove-ADUser -Identity ([guid]$user.ObjectGUID) -Confirm:$false @serverParams
-                        Write-IDLLog "  Deleted $userDn"
+                        # Remove-ADObject -Recursive also removes the leaf children; all checks above have passed.
+                        Remove-ADObject -Identity ([guid]$user.ObjectGUID) -Recursive -Confirm:$false @serverParams
+                        Write-IDLLog "  Deleted $userDn$childNote"
                         Add-IDLReportRow -Action 'RemoveUser' -Result 'Applied' -Identity $identity -ObjectIdOrDN $userDn
-                        $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status applied -Message 'account deleted' @userFields
+                        $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status applied -Message ('account deleted' + $childNote) @userFields
                     }
                 }
                 default {
