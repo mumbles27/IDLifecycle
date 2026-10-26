@@ -2,11 +2,13 @@ package api
 
 import (
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +23,10 @@ import (
 
 func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/auth/login", s.handleLogin)
+	mux.HandleFunc("GET /api/auth/providers", s.handleProviders)
+	mux.HandleFunc("GET /api/auth/oidc/start", s.handleOIDCStart)
+	mux.HandleFunc("GET /api/auth/oidc/callback", s.handleOIDCCallback)
+	s.route(mux, "POST /api/auth/oidc/test", model.RoleAdmin, s.handleOIDCTest)
 	s.route(mux, "POST /api/auth/logout", model.RoleViewer, s.handleLogout)
 	s.route(mux, "GET /api/auth/me", model.RoleViewer, s.handleMe)
 	s.route(mux, "POST /api/auth/password", model.RoleViewer, s.handleChangePassword)
@@ -41,6 +47,28 @@ func (s *Server) routes(mux *http.ServeMux) {
 	s.route(mux, "PUT /api/mappings/{id}", model.RoleAdmin, s.handleSaveMapping)
 	s.route(mux, "DELETE /api/mappings/{id}", model.RoleAdmin, s.handleDeleteMapping)
 	s.route(mux, "POST /api/templates/preview", model.RoleAdmin, s.handleTemplatePreview)
+	s.route(mux, "GET /api/ad/ous", model.RoleApprover, s.handleListOUs)
+	s.route(mux, "GET /api/placement/values", model.RoleViewer, s.handlePlacementValues)
+	s.route(mux, "POST /api/changes/{id}/ou", model.RoleApprover, s.handleSetChangeOU)
+	s.route(mux, "GET /api/changes/{id}/names", model.RoleApprover, s.handleChangeNames)
+	s.route(mux, "POST /api/changes/{id}/name", model.RoleApprover, s.handleSetChangeName)
+	s.route(mux, "POST /api/changes/{id}/link", model.RoleApprover, s.handleSetChangeLink)
+	s.route(mux, "POST /api/ad/check-names", model.RoleApprover, s.handleCheckNames)
+	s.route(mux, "POST /api/identities/{id}/link", model.RoleApprover, s.handleSetIdentityLink)
+	s.route(mux, "GET /api/correlation/report", model.RoleViewer, s.handleCorrelationReport)
+	s.route(mux, "GET /api/manual/sources", model.RoleViewer, s.handleListManualSources)
+	s.route(mux, "GET /api/manual/sources/{sid}/people", model.RoleViewer, s.handleListManualPeople)
+	s.route(mux, "POST /api/manual/sources/{sid}/preview", model.RoleApprover, s.handlePreviewManualPerson)
+	s.route(mux, "POST /api/manual/sources/{sid}/people", model.RoleApprover, s.handleCreateManualPerson)
+	s.route(mux, "PUT /api/manual/sources/{sid}/people/{pid}", model.RoleApprover, s.handleUpdateManualPerson)
+	s.route(mux, "POST /api/manual/sources/{sid}/people/{pid}/end", model.RoleApprover, s.handleEndManualPerson)
+	s.route(mux, "DELETE /api/manual/sources/{sid}/people/{pid}", model.RoleAdmin, s.handleDeleteManualPerson)
+	s.route(mux, "GET /api/backups", model.RoleAdmin, s.handleListBackups)
+	s.route(mux, "POST /api/backups", model.RoleAdmin, s.handleCreateBackup)
+	s.route(mux, "GET /api/backups/{name}", model.RoleAdmin, s.handleDownloadBackup)
+	s.route(mux, "GET /api/mapper/ad-attributes", model.RoleAdmin, s.handleADAttributes)
+	s.route(mux, "GET /api/mapper/references", model.RoleAdmin, s.handleFieldReferences)
+	s.route(mux, "POST /api/mapper/sources/{id}/fields", model.RoleAdmin, s.handleSourceFields)
 
 	s.route(mux, "GET /api/roles", model.RoleViewer, s.handleListRoles)
 	s.route(mux, "POST /api/roles", model.RoleAdmin, s.handleSaveRole)
@@ -178,6 +206,7 @@ func (s *Server) handleSaveSource(w http.ResponseWriter, r *http.Request) {
 	if in.Options.TerminatedValues == nil {
 		in.Options.TerminatedValues = []string{}
 	}
+	sources.NormalizeManual(&in)
 	if err := sources.Validate(in); err != nil {
 		badRequest(w, err.Error())
 		return
@@ -242,7 +271,7 @@ func (s *Server) handleTestSource(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	res := map[string]any{"ok": false, "count": 0, "attributes": []string{}, "sample": []map[string]string{}, "error": ""}
-	built, err := sources.Build(src, s.Cipher)
+	built, err := sources.BuildFor(src, s.Cipher, s.Store.ListManualPeople)
 	var rows []sources.Row
 	if err == nil {
 		rows, err = built.Fetch(ctx)
@@ -387,20 +416,36 @@ func (s *Server) handleDeleteMapping(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// handleTemplatePreview renders a template against a sample record the admin typed (never a real identity, so a
+// password preview shows nothing real). kind "password" uses the initial-password functions and adds "check":
+// why AD would refuse the result ("" = acceptable).
 func (s *Server) handleTemplatePreview(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Template string            `json:"template"`
 		Record   map[string]string `json:"record"`
+		Kind     string            `json:"kind"`
 	}
 	if !decode(w, r, &in) {
 		return
 	}
-	out, err := engine.Render(in.Template, in.Record)
+	render := engine.Render
+	if in.Kind == "password" {
+		render = engine.RenderPassword
+	}
+	out, err := render(in.Template, in.Record)
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "output": "", "error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "output": out, "error": ""})
+	resp := map[string]any{"ok": true, "output": out, "error": ""}
+	if in.Kind == "password" {
+		check := ""
+		if cerr := engine.CheckInitialPassword(out, ""); cerr != nil {
+			check = cerr.Error()
+		}
+		resp["check"] = check
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // ---- roles -------------------------------------------------------------------------
@@ -537,6 +582,8 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	st.Notify = notify.Mask(st.Notify)
+	st.Auth = maskAuth(st.Auth)
+	st.Backup = maskBackup(st.Backup)
 	writeJSON(w, http.StatusOK, st)
 }
 
@@ -579,17 +626,46 @@ func (s *Server) notifier() *notify.Service {
 }
 
 func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
-	var in model.Settings
-	if !decode(w, r, &in) {
+	// Auth is decoded separately so a client that does not send "auth" (an older GUI, a script) leaves
+	// sign-in as it is instead of resetting it to the defaults.
+	var body struct {
+		model.Settings
+		Auth *model.AuthSettings `json:"auth"`
+	}
+	if !decode(w, r, &body) {
 		return
+	}
+	in := body.Settings
+	old, err := s.Store.GetSettings(r.Context())
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	in.Auth = old.Auth
+	if body.Auth != nil {
+		a := *body.Auth
+		if err := a.Validate(); err != nil { // field formats first, so a typo is reported as such
+			badRequest(w, err.Error())
+			return
+		}
+		if in.Auth, err = prepareAuth(a, old.Auth, s.Cipher); err != nil {
+			badRequest(w, err.Error())
+			return
+		}
 	}
 	if err := in.Validate(); err != nil {
 		badRequest(w, err.Error())
 		return
 	}
-	for name, tpl := range map[string]string{"naming.sam_template": in.Naming.SamTemplate, "naming.upn_template": in.Naming.UPNTemplate, "naming.cn_template": in.Naming.CNTemplate} {
+	for name, tpl := range map[string]string{"naming.sam_template": in.Naming.SamTemplate, "naming.upn_template": in.Naming.UPNTemplate, "naming.cn_template": in.Naming.CNTemplate, "naming.mail_template": in.Naming.MailTemplate, "naming.conflict_suffix_template": in.Naming.ConflictSuffix} {
 		if err := engine.ValidateTemplate(tpl); err != nil {
 			badRequest(w, name+": "+err.Error())
+			return
+		}
+	}
+	if in.NewUser.PasswordMode == model.PasswordModeTemplate {
+		if err := engine.ValidatePasswordTemplate(in.NewUser.PasswordTemplate); err != nil {
+			badRequest(w, "new_user.password_template: "+err.Error())
 			return
 		}
 	}
@@ -598,11 +674,6 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 			badRequest(w, "cannot leave dry-run mode: "+msg)
 			return
 		}
-	}
-	old, err := s.Store.GetSettings(r.Context())
-	if err != nil {
-		s.fail(w, r, err)
-		return
 	}
 	if in.Notify.To == nil {
 		in.Notify.To = []string{}
@@ -615,15 +686,48 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "notifications: "+err.Error())
 		return
 	}
+	if in.Backup, err = prepareBackup(in.Backup, old.Backup, s.Cipher); err != nil {
+		badRequest(w, err.Error())
+		return
+	}
 	if err := s.Store.SaveSettings(r.Context(), in, principal(r).User.Username); err != nil {
 		s.fail(w, r, err)
 		return
 	}
 	s.Scheduler.Reload()
+	s.revokeForAuthChange(r, old.Auth, in.Auth)
 	// diffPaths sees ciphertext for secrets, so a changed secret shows up as a path - never as a value.
 	s.audit(r, "settings.update", "settings", "settings", map[string]any{"changed": diffPaths(old, in)})
 	in.Notify = notify.Mask(in.Notify)
+	in.Auth = maskAuth(in.Auth)
+	in.Backup = maskBackup(in.Backup)
 	writeJSON(w, http.StatusOK, in)
+}
+
+// revokeForAuthChange signs out the sessions a sign-in change no longer allows: Entra ID accounts when Entra
+// ID sign-in is turned off or moved to another app registration, local non-admins when password sign-in
+// becomes admins-only.
+func (s *Server) revokeForAuthChange(r *http.Request, prev, next model.AuthSettings) {
+	oidcGone := prev.OIDC.Enabled && (!next.OIDC.Enabled || normGUID(prev.OIDC.TenantID) != normGUID(next.OIDC.TenantID) ||
+		normGUID(prev.OIDC.ClientID) != normGUID(next.OIDC.ClientID))
+	localLimited := prev.LocalLogin != model.LocalLoginAdminsOnly && next.LocalLogin == model.LocalLoginAdminsOnly
+	if !oidcGone && !localLimited {
+		return
+	}
+	users, err := s.Store.ListUsers(r.Context())
+	if err != nil {
+		s.Log.Error("cannot list users to revoke sessions after a sign-in change", "error", err)
+		return
+	}
+	n := 0
+	for _, u := range users {
+		if (oidcGone && u.AuthSource == model.AuthOIDC) || (localLimited && u.AuthSource != model.AuthOIDC && u.Role != model.RoleAdmin) {
+			if s.Store.DeleteUserSessions(r.Context(), u.ID) == nil {
+				n++
+			}
+		}
+	}
+	s.audit(r, "auth.sessions_revoked", "settings", "auth", map[string]any{"users": n, "oidc_disabled": oidcGone, "local_admins_only": localLimited})
 }
 
 // diffPaths lists dotted JSON paths whose values differ (for the audit log).
@@ -807,16 +911,49 @@ func (s *Server) handleGetIdentity(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, x)
 }
 
+// handleListAudit searches the history: q is a search box query (store.AuditQueryHelp); actor, action,
+// entity_type and entity_id are exact filters on top. format=csv downloads up to 10,000 matching entries.
 func (s *Server) handleListAudit(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	items, total, err := s.Store.ListAudit(r.Context(), store.AuditFilter{
-		Actor: q.Get("actor"), Action: q.Get("action"), EntityType: q.Get("entity_type"), EntityID: q.Get("entity_id"),
-	}, pageOf(r))
+	f, err := store.ParseAuditQuery(q.Get("q"), time.Now(), time.Local)
+	if err != nil {
+		badRequest(w, "search: "+err.Error())
+		return
+	}
+	f.Actor, f.Action, f.EntityType = q.Get("actor"), q.Get("action"), firstNonEmptyStr(f.EntityType, q.Get("entity_type"))
+	f.EntityID = firstNonEmptyStr(f.EntityID, q.Get("entity_id"))
+	if q.Get("format") == "csv" {
+		items, _, err := s.Store.ListAudit(r.Context(), f, store.Page{Limit: 10000})
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		s.audit(r, "audit.export", "audit", "", map[string]any{"q": q.Get("q"), "rows": len(items)})
+		w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+		w.Header().Set("Content-Disposition", `attachment; filename="idlifecycle-history.csv"`)
+		cw := csv.NewWriter(w)
+		_ = cw.Write([]string{"seq", "time_utc", "actor", "action", "entity_type", "entity_id", "detail"})
+		for _, e := range items {
+			detail, _ := json.Marshal(e.Detail)
+			_ = cw.Write([]string{strconv.FormatInt(e.Seq, 10), e.TS.UTC().Format(time.RFC3339), csvSafe(e.Actor), csvSafe(e.Action), csvSafe(e.EntityType), csvSafe(e.EntityID), csvSafe(string(detail))})
+		}
+		cw.Flush()
+		return
+	}
+	items, total, err := s.Store.ListAudit(r.Context(), f, pageOf(r))
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
 	list(w, items, total)
+}
+
+// csvSafe stops a spreadsheet from treating a cell as a formula (=, +, -, @ at the start).
+func csvSafe(v string) string {
+	if v != "" && strings.ContainsRune("=+-@\t\r", rune(v[0])) {
+		return "'" + v
+	}
+	return v
 }
 
 func (s *Server) handleVerifyAudit(w http.ResponseWriter, r *http.Request) {

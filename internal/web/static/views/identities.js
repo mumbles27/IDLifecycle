@@ -3,14 +3,27 @@
 import { api } from '../api.js';
 import {
   h, replaceContent, pageHeader, card, pill, fmtTime, dataTable, pager, listItems, debounce,
-  errorBox, loading, field, dl, truncCell, isObject, cellText, relTime,
+  errorBox, loading, field, dl, truncCell, isObject, cellText, relTime, act, toast, confirmDialog,
 } from '../ui.js';
 
-const STATES = ['new', 'linked', 'disabled', 'deleted', 'error'];
+const STATES = ['new', 'linked', 'disabled', 'deleted', 'merged', 'error'];
+
+function decisionText(d) {
+  if (!d) {
+    return '';
+  }
+  if (d === 'new') {
+    return 'Create a new account (matching skipped)';
+  }
+  if (d.startsWith('guid:')) {
+    return `Link to the AD account ${d.slice(5)} (chosen by a person)`;
+  }
+  return d;
+}
 
 export async function render(root, ctx) {
   if (ctx.params[0]) {
-    return renderDetail(root, ctx.params[0]);
+    return renderDetail(root, ctx.params[0], ctx);
   }
   return renderList(root, ctx);
 }
@@ -60,7 +73,7 @@ async function renderList(root, ctx) {
   await load();
 }
 
-async function renderDetail(root, id) {
+async function renderDetail(root, id, ctx) {
   const body = h('div', { class: 'stack' }, loading());
   root.append(pageHeader('Identity', h('a', { href: '#/identities', class: 'btn' }, 'Back to identities')), body);
   let ident;
@@ -90,7 +103,37 @@ async function renderDetail(root, id) {
           ['Distinguished name', ident.ad_dn ? h('span', { class: 'mono wrap' }, ident.ad_dn) : ''],
           ['objectGUID', ident.ad_guid ? h('span', { class: 'mono' }, ident.ad_guid) : ''],
         ])
-        : h('p', { class: 'muted' }, 'Not linked to an AD account yet.'))),
+        : h('p', { class: 'muted' }, ident.state === 'merged' ? 'Not linked: the account was handed over to another person record.' : 'Not linked to an AD account yet.'),
+      ident.merged_into || ident.link_decision || (Array.isArray(ident.link_rejects) && ident.link_rejects.length > 0)
+        ? h('div', { class: 'stack', 'data-test': 'ident-matching' },
+          h('h3', null, 'Matching'),
+          dl([
+            ['Merged into', ident.merged_into ? h('a', { href: `#/identities/${encodeURIComponent(ident.merged_into)}`, 'data-test': 'ident-merged-into' }, 'the person record that now owns the account') : ''],
+            ['Decision', decisionText(ident.link_decision)],
+            ['Not this person', Array.isArray(ident.link_rejects) && ident.link_rejects.length > 0 ? h('span', { class: 'mono small wrap' }, ident.link_rejects.join(', ')) : ''],
+          ]),
+          ident.link_decision && !ident.ad_guid && ctx.can('approver')
+            ? h('div', { class: 'row-gap' }, h('button', {
+              type: 'button', class: 'btn btn-sm', 'data-mutating': '', 'data-test': 'ident-clear-decision',
+              onclick: async (e) => {
+                const ok = await confirmDialog({
+                  title: 'Clear the matching decision?',
+                  message: 'The next sync matches this person again with the matching rules (it may propose a link or a new account).',
+                  confirmLabel: 'Clear',
+                });
+                if (!ok) {
+                  return;
+                }
+                await act(e.currentTarget, async () => {
+                  await api.post(`/identities/${encodeURIComponent(ident.id)}/link`, { clear: true });
+                  toast('Decision cleared.', 'ok');
+                  replaceContent(root);
+                  await renderDetail(root, id, ctx);
+                });
+              },
+            }, 'Clear decision'))
+            : null)
+        : null)),
     card('Source attributes', dataTable([
       { label: 'Attribute', render: (r) => h('code', null, r[0]) },
       { label: 'Value', render: (r) => truncCell(cellText(r[1]), 120) },

@@ -107,12 +107,19 @@ func (l *ipLimiter) allow(ip string) bool {
 }
 
 type userView struct {
-	ID       string `json:"id"`
-	Username string `json:"username"`
-	Role     string `json:"role"`
+	ID         string `json:"id"`
+	Username   string `json:"username"`
+	Role       string `json:"role"`
+	AuthSource string `json:"auth_source"`
 }
 
-func view(u model.User) userView { return userView{u.ID, u.Username, u.Role} }
+func view(u model.User) userView {
+	src := u.AuthSource
+	if src == "" {
+		src = model.AuthLocal
+	}
+	return userView{u.ID, u.Username, u.Role, src}
+}
 
 func (s *Server) setCookie(w http.ResponseWriter, token string, exp time.Time) {
 	http.SetCookie(w, &http.Cookie{
@@ -158,6 +165,13 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		generic() // same answer as a bad password so lockout state does not reveal that the account exists
 		return
 	}
+	if u.AuthSource == model.AuthOIDC {
+		// Entra ID accounts have no password here. Same answer and cost as a bad password.
+		_ = bcrypt.CompareHashAndPassword(getDummyHash(), []byte(in.Password))
+		s.auditAnon(r, "auth.login_failed", u.Username, "Entra ID account used with a password")
+		generic()
+		return
+	}
 	if err := bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(in.Password)); err != nil || u.Disabled {
 		if err != nil {
 			_ = s.Store.RecordLoginFailure(ctx, u.ID, lockThreshold, lockDuration)
@@ -166,26 +180,22 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		generic()
 		return
 	}
+	// Checked after the password, so the answer does not reveal which accounts are administrators.
+	if settings, err := s.Store.GetSettings(ctx); err != nil {
+		s.fail(w, r, err)
+		return
+	} else if settings.Auth.LocalLogin == model.LocalLoginAdminsOnly && u.Role != model.RoleAdmin {
+		s.auditAnon(r, "auth.login_failed", u.Username, "password sign-in is limited to administrators")
+		writeErr(w, http.StatusForbidden, "local_login_restricted", "password sign-in is limited to administrators; use "+settings.Auth.OIDC.ButtonLabel)
+		return
+	}
 
-	token, err := randomToken(32)
+	csrf, err := s.startSession(ctx, w, u)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	csrf, err := randomToken(24)
-	if err != nil {
-		s.fail(w, r, err)
-		return
-	}
-	now := time.Now()
-	if err := s.Store.CreateSession(ctx, model.Session{TokenHash: hashToken(token), UserID: u.ID, CSRFToken: csrf, CreatedAt: now, ExpiresAt: now.Add(sessionIdle), LastSeenAt: now}); err != nil {
-		s.fail(w, r, err)
-		return
-	}
-	_ = s.Store.RecordLoginSuccess(ctx, u.ID)
-	_ = s.Store.DeleteExpiredSessions(ctx)
-	s.setCookie(w, token, now.Add(sessionIdle))
-	_ = s.Store.AppendAudit(ctx, u.Username, "auth.login", "user", u.ID, map[string]any{"remote": clientIP(r)})
+	_ = s.Store.AppendAudit(ctx, u.Username, "auth.login", "user", u.ID, map[string]any{"remote": clientIP(r), "method": "password"})
 	writeJSON(w, http.StatusOK, map[string]any{"user": view(u), "csrf_token": csrf})
 }
 
@@ -221,6 +231,10 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		New     string `json:"new"`
 	}
 	if !decode(w, r, &in) {
+		return
+	}
+	if p.User.AuthSource == model.AuthOIDC {
+		badRequest(w, "you sign in with Entra ID; change your password there")
 		return
 	}
 	if msg := ValidatePassword(in.New); msg != "" {
@@ -318,6 +332,20 @@ func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 	var in userInput
 	if !decode(w, r, &in) {
 		return
+	}
+	if cur.AuthSource == model.AuthOIDC {
+		// Name and role come from Entra ID on every sign-in; only enabling/disabling is local.
+		switch {
+		case in.Password != "":
+			badRequest(w, cur.Username+" signs in with Entra ID and has no password here")
+			return
+		case in.Role != "" && in.Role != cur.Role:
+			badRequest(w, "the role of an Entra ID account comes from its app roles or groups; change the assignment in Entra ID")
+			return
+		case strings.TrimSpace(in.Username) != "" && strings.TrimSpace(in.Username) != cur.Username:
+			badRequest(w, "the name of an Entra ID account comes from Entra ID")
+			return
+		}
 	}
 	next := cur
 	if n := strings.TrimSpace(in.Username); n != "" {

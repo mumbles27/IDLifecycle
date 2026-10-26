@@ -76,3 +76,54 @@ func TestCheckMissingDirIsFine(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestCheckNotWritableCatchesUsersWriteAndSkipsLogs(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "prog")
+	scripts := filepath.Join(dir, "scripts")
+	logs := filepath.Join(scripts, "Logs")
+	if err := os.MkdirAll(logs, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scripts, "New-IDLUser.ps1"), []byte("#"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := Lockdown(dir); err != nil { // protected ACL, like Program Files
+		t.Fatal(err)
+	}
+	if err := CheckNotWritable(dir, "Logs"); err != nil {
+		t.Fatalf("locked folder reported writable: %v", err)
+	}
+
+	// The service writes Logs; a writable Logs folder must not fail the program-files check.
+	icacls(t, logs, "/grant", "*S-1-5-32-545:(OI)(CI)(M)")
+	if err := CheckNotWritable(dir, "Logs"); err != nil {
+		t.Fatalf("Logs must be skipped: %v", err)
+	}
+
+	// Users able to modify one script = Users able to run code as the service account.
+	icacls(t, filepath.Join(scripts, "New-IDLUser.ps1"), "/grant", "*S-1-5-32-545:(M)")
+	err := CheckNotWritable(dir, "Logs")
+	var we *WritableError
+	if !errors.As(err, &we) || !strings.Contains(err.Error(), "New-IDLUser.ps1") || !strings.Contains(err.Error(), `BUILTIN\Users`) {
+		t.Fatalf("writable script not reported: %v", err)
+	}
+
+	// Create-files on the folder itself (what C:\ grants Users) is also caught.
+	icacls(t, filepath.Join(scripts, "New-IDLUser.ps1"), "/remove:g", "*S-1-5-32-545")
+	icacls(t, dir, "/grant", "*S-1-5-32-545:(CI)(AD,WD)")
+	if err := CheckNotWritable(dir, "Logs"); err == nil {
+		t.Fatal("create-files right for Users must be reported")
+	}
+}
+
+func TestTrustedOwnersAreAccepted(t *testing.T) {
+	f := filepath.Join(t.TempDir(), "mine.txt")
+	if err := os.WriteFile(f, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{f, os.Getenv("SystemRoot") + `\System32\kernel32.dll`} { // current user; TrustedInstaller
+		if o, err := untrustedOwner(p); err != nil || o != "" {
+			t.Errorf("%s: owner reported untrusted: %q %v", p, o, err)
+		}
+	}
+}

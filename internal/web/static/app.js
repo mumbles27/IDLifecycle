@@ -13,9 +13,12 @@ const ROUTES = [
   { name: 'approvals', label: 'Approvals', group: 'Operate', min: 'viewer', load: () => import('./views/approvals.js'), badge: true },
   { name: 'runs', label: 'Runs', group: 'Operate', min: 'viewer', load: () => import('./views/runs.js') },
   { name: 'identities', label: 'Identities', group: 'Operate', min: 'viewer', load: () => import('./views/identities.js') },
-  { name: 'audit', label: 'Audit log', group: 'Operate', min: 'viewer', load: () => import('./views/audit.js') },
+  { name: 'manual', label: 'Add person', group: 'Operate', min: 'viewer', load: () => import('./views/manual.js') },
+  { name: 'audit', label: 'History', group: 'Operate', min: 'viewer', load: () => import('./views/audit.js') },
   { name: 'mappings', label: 'Attribute mappings', group: 'Configure', min: 'viewer', load: () => import('./views/mappings.js') },
   { name: 'roles', label: 'Role rules', group: 'Configure', min: 'viewer', load: () => import('./views/roles.js') },
+  { name: 'placement', label: 'OU placement', group: 'Configure', min: 'viewer', load: () => import('./views/placement.js') },
+  { name: 'matching', label: 'Matching', group: 'Configure', min: 'viewer', load: () => import('./views/matching.js') },
   { name: 'sources', label: 'Sources', group: 'Configure', min: 'viewer', load: () => import('./views/sources.js') },
   { name: 'settings', label: 'Settings', group: 'Configure', min: 'viewer', load: () => import('./views/settings.js') },
   { name: 'tables', label: 'Data browser', group: 'Admin', min: 'viewer', load: () => import('./views/tables.js') },
@@ -159,7 +162,8 @@ function buildShell() {
     h('span', { class: 'whoami', 'data-test': 'whoami' },
       h('span', { class: 'who-name' }, user ? user.username : ''),
       user ? pill(user.role) : null),
-    h('button', { type: 'button', class: 'btn btn-sm', 'data-test': 'change-password', onclick: openChangePassword }, 'Change password'),
+    // Entra ID accounts have no password here.
+    user && user.auth_source === 'oidc' ? null : h('button', { type: 'button', class: 'btn btn-sm', 'data-test': 'change-password', onclick: openChangePassword }, 'Change password'),
     h('button', {
       type: 'button',
       class: 'btn btn-sm',

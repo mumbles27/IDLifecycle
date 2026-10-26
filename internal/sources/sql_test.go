@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"idlifecycle/internal/connstr"
 	"idlifecycle/internal/model"
 	"idlifecycle/internal/secrets"
 )
@@ -231,7 +232,7 @@ func TestSQLNewRejectsBadConfig(t *testing.T) {
 		t.Fatalf("valid sql source (masked dsn) rejected: %v", err)
 	}
 	for name, cfg := range map[string]map[string]any{
-		"bad driver": sqlCfg("x", "SELECT 1", map[string]any{"driver": "db2"}),
+		"bad driver": sqlCfg("x", "SELECT 1", map[string]any{"driver": "oracle"}),
 		"bad query":  sqlCfg("x", "SELECT 1; DROP TABLE people", nil),
 		"no dsn":     {"driver": "sqlite", "query": "SELECT 1"},
 		"no query":   {"driver": "sqlite", "dsn": "x"},
@@ -287,7 +288,7 @@ func TestSQLErrorsNeverLeakDSN(t *testing.T) {
 		"server=h;user id=u;password={hunter22};database=x",
 		"host=h user=u password='hunter22' dbname=x",
 	} {
-		err := scrubDSN(errors.New("cannot connect using "+dsn+" (password hunter22)"), dsn)
+		err := connstr.Scrub(errors.New("cannot connect using "+dsn+" (password hunter22)"), dsn)
 		if strings.Contains(err.Error(), "hunter22") {
 			t.Errorf("scrub %q: %s", dsn, err)
 		}

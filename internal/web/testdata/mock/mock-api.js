@@ -31,16 +31,25 @@ export const db = {
   ],
   settings: {
     schedule: { enabled: true, kind: 'interval', interval_minutes: 60, daily_time: '02:00', cron_expr: '0 */4 * * *', timezone: 'America/Chicago' },
-    approval: { create: 'manual', update: 'auto', disable: 'manual', enable: 'manual', delete: 'manual' },
+    approval: { create: 'manual', update: 'auto', disable: 'manual', enable: 'manual', delete: 'manual', link: 'auto' },
     engine: { dry_run: true, max_destructive_per_run: 10, delete_after_days: 30, remove_stale_groups: true, enforce_ou: false, max_deletes_per_run: 5, max_deletes_per_day: 20 },
     ad: { server: '', search_bases: ['OU=Staff,DC=corp,DC=example,DC=com'], default_ou: 'OU=Staff,DC=corp,DC=example,DC=com', disabled_ou: '', id_attribute: 'employeeID', upn_suffix: 'corp.example.com', strip_groups_on_disable: true },
-    naming: { sam_template: '{{ first .FirstName 1 | lower }}{{ .LastName | lower }}', upn_template: '{{ .FirstName | lower }}.{{ .LastName | lower }}', cn_template: '{{ .FirstName }} {{ .LastName }}', max_candidates: 9 },
-    new_user: { password_length: 20, change_password_at_logon: true, enabled: true },
+    naming: { sam_template: '{{ first .FirstName 1 | lower }}{{ .LastName | lower }}', upn_template: '{{ .FirstName | lower }}.{{ .LastName | lower }}', cn_template: '{{ .FirstName }} {{ .LastName }}', max_candidates: 9, mail_template: '', mail_domain: '', conflict_mode: 'manual', conflict_random_digits: 3, conflict_suffix_template: '{{ last .EmployeeID 4 }}' },
+    correlation: {
+      enabled: true, rename: 'transitions', max_auto_links_per_run: 25, report_uncorrelated: true, ignore_accounts: ['svc_*'],
+      rules: [
+        { field: 'FirstName', ad_attr: 'givenName', compare: 'name', required: true },
+        { field: 'LastName', ad_attr: 'sn', compare: 'name', required: true },
+        { field: 'Department', ad_attr: 'department', compare: 'ci', required: false },
+      ],
+    },
+    backup: { enabled: false, interval_hours: 24, keep: 14, folder: '', passphrase: '' },
+    new_user: { password_mode: 'random', password_length: 20, password_template: '{{ upper (first .LastName 1) }}{{ last .EmployeeId 4 }}!{{ random 6 }}', change_password_at_logon: true, enabled: true },
     notifications: {
       enabled: false, provider: 'm365_smtp', from: 'idlifecycle@corp.example.com', to: ['ops@corp.example.com'], subject_prefix: '[IDLifecycle]', gui_base_url: '',
       smtp: { host: 'smtp.office365.com', port: 587, security: 'starttls', auth: 'oauth2', username: '', password: '' },
       oauth: { tenant_id: 'corp.onmicrosoft.com', client_id: '00000000-0000-0000-0000-000000000001', client_secret: '********' },
-      events: { run_failed: true, approvals_pending: true, changes_failed: true, threshold: true, run_summary: false },
+      events: { run_failed: true, approvals_pending: true, changes_failed: true, threshold: true, run_summary: false, identity_issues: true },
     },
   },
   changes: [],
@@ -79,6 +88,275 @@ function audit(actor, action, entity_type, entity_id, detail) {
 }
 
 seedChanges();
+
+// ---- naming conflicts, matching and manual people
+const MANUAL_FIELDS = [
+  { name: 'FirstName', label: 'First name', required: true, kind: 'text' },
+  { name: 'LastName', label: 'Last name', required: true, kind: 'text' },
+  { name: 'Department', label: 'Department', required: true, kind: 'select', options: ['Finance', 'IT', 'Sales'] },
+  { name: 'Title', label: 'Job title', required: false, kind: 'text' },
+  { name: 'Company', label: 'Company', required: false, kind: 'text', default: 'Contoso Staffing' },
+  { name: 'Email', label: 'Contact e-mail', required: false, kind: 'email' },
+  { name: 'StartDate', label: 'Start date', required: false, kind: 'date' },
+  { name: 'EndDate', label: 'End date', required: false, kind: 'date' },
+];
+const TAKEN = {
+  sam: { akim: 'CN=Alan Kim,OU=Staff,DC=corp,DC=example,DC=com', jdoe: 'CN=Jane Doe,OU=Staff,DC=corp,DC=example,DC=com' },
+  upn: { 'alex.kim@corp.example.com': 'CN=Alan Kim,OU=Staff,DC=corp,DC=example,DC=com' },
+  mail: { 'alex.kim@corp.example.com': 'CN=Alex Kim (Shared),OU=Shared,DC=corp,DC=example,DC=com' },
+  cn: {},
+};
+function takenNames(names) {
+  return (names || []).filter((n) => TAKEN[n.field] && TAKEN[n.field][String(n.value).toLowerCase()])
+    .map((n) => ({ field: n.field, value: n.value, dn: TAKEN[n.field][String(n.value).toLowerCase()] }));
+}
+function seedIdentityFeatures() {
+  const base = db.changes[0];
+  db.changes.push({
+    ...base, id: 'c7', identity_id: 'i7', external_id: 'E1007', display: 'Alex Kim', type: 'create', status: 'pending', created_at: ago(30),
+    payload: {
+      ou: 'OU=Staff,DC=corp,DC=example,DC=com', candidates: [], attributes: { givenName: 'Alex', sn: 'Kim' }, needs_name: true,
+      name_conflicts: [
+        { field: 'sam', value: 'akim', dn: 'CN=Alan Kim,OU=Staff,DC=corp,DC=example,DC=com' },
+        { field: 'mail', value: 'alex.kim@corp.example.com', dn: 'CN=Alex Kim (Shared),OU=Shared,DC=corp,DC=example,DC=com' },
+      ],
+    },
+    summary: ['WAITING for a username: choose one with Set name, then approve', 'Create account "akim" (Alex Kim) in OU=Staff,DC=corp,DC=example,DC=com'],
+  }, {
+    ...base, id: 'c8', identity_id: 'i8', external_id: 'E1008', display: 'Maria Lopez', type: 'link', status: 'pending', created_at: ago(29),
+    payload: {
+      object_guid: '', dn: '',
+      link: {
+        chosen: '', verify: true, rename: null, rename_note: '',
+        candidates: [
+          {
+            object_guid: 'g-ml1', dn: 'CN=Maria Lopez,OU=Contractors,DC=corp,DC=example,DC=com', sam: 'c-mlopez', upn: 'c-mlopez@corp.example.com', enabled: true,
+            external_id: 'C-7Q2K9A', identity_id: 'i9', identity_display: 'Maria Lopez', source_name: 'Contractors', full: false,
+            fields: [
+              { field: 'FirstName', ad_attr: 'givenName', value: 'Maria', ad_value: 'Maria', matched: true },
+              { field: 'LastName', ad_attr: 'sn', value: 'Lopez', ad_value: 'López', matched: true },
+              { field: 'Department', ad_attr: 'department', value: 'Finance', ad_value: 'Accounting', matched: false },
+            ],
+          },
+          {
+            object_guid: 'g-ml2', dn: 'CN=Maria Lopez 2,OU=Staff,DC=corp,DC=example,DC=com', sam: 'mlopez', upn: 'maria.lopez@corp.example.com', enabled: false,
+            external_id: '', full: false,
+            fields: [
+              { field: 'FirstName', ad_attr: 'givenName', value: 'Maria', ad_value: 'Maria', matched: true },
+              { field: 'LastName', ad_attr: 'sn', value: 'Lopez', ad_value: 'Lopez', matched: true },
+              { field: 'Department', ad_attr: 'department', value: 'Finance', ad_value: '', matched: false },
+            ],
+          },
+        ],
+      },
+    },
+    summary: ['VERIFY the match: 2 AD accounts could be Maria Lopez', 'Link an existing account to Maria Lopez (E1008)'],
+  });
+  for (const c of db.changes.slice(-2)) {
+    db.identities.push({
+      id: c.identity_id, source_id: 's1', source_name: 'HR export', external_id: c.external_id, display: c.display, active: true, state: 'new',
+      ad_guid: '', ad_dn: '', ad_sam: '', first_seen: ago(40), last_seen: ago(30), disabled_at: null,
+      attrs: { FirstName: c.display.split(' ')[0], LastName: c.display.split(' ')[1], EmployeeId: c.external_id, Department: 'Finance', Status: 'A' },
+    });
+  }
+  db.identities.push({
+    id: 'i9', source_id: 's2', source_name: 'Contractors', external_id: 'C-7Q2K9A', display: 'Maria Lopez', active: true, state: 'merged', merged_into: 'i8',
+    ad_guid: '', ad_dn: '', ad_sam: '', first_seen: ago(9000), last_seen: ago(30), disabled_at: null,
+    attrs: { FirstName: 'Maria', LastName: 'Lopez', Department: 'Accounting', ExternalID: 'C-7Q2K9A', Status: 'Active', Source: 'manual' },
+  });
+  db.sources.push({
+    id: 's2', name: 'Contractors', type: 'manual', enabled: true,
+    options: { external_id_field: 'ExternalID', status_field: 'Status', terminated_values: ['Terminated'], missing_means_terminated: false, missing_grace_runs: 0 },
+    config: { id_prefix: 'C-', end_date_field: 'EndDate', form_fields: 'FirstName | First name | required\nLastName | Last name | required' },
+    last_sync_at: ago(60), last_status: 'ok', last_error: '',
+  });
+  db.manual = [
+    { id: 'mp1', source_id: 's2', external_id: 'C-7Q2K9A', attrs: { FirstName: 'Maria', LastName: 'Lopez', Department: 'Finance', Company: 'Contoso Staffing' }, ended: false, created_by: 'approver1', created_at: ago(9000), updated_by: 'approver1', updated_at: ago(9000), state: 'linked', ad_sam: 'c-mlopez' },
+    { id: 'mp2', source_id: 's2', external_id: 'C-3HD81Z', attrs: { FirstName: 'Sam', LastName: 'Patel', Department: 'IT', EndDate: '2026-12-31' }, ended: false, created_by: 'admin', created_at: ago(300), updated_by: 'admin', updated_at: ago(300), state: 'new', ad_sam: '' },
+  ];
+  db.report = {
+    run_id: 'run1', generated_at: ago(61), enabled: true, unmatched_people: 1,
+    uncorrelated: [
+      { object_guid: 'g-u1', dn: 'CN=Old Contractor,OU=Staff,DC=corp,DC=example,DC=com', sam: 'ocontractor', upn: 'ocontractor@corp.example.com', display: 'Old Contractor', enabled: true, external_id: '' },
+      { object_guid: 'g-u2', dn: 'CN=Print Kiosk,OU=Staff,DC=corp,DC=example,DC=com', sam: 'kiosk01', upn: '', display: 'Print Kiosk', enabled: true, external_id: '' },
+      { object_guid: 'g-u3', dn: 'CN=Ex Employee,OU=Staff,DC=corp,DC=example,DC=com', sam: 'xemployee', upn: '', display: 'Ex Employee', enabled: false, external_id: 'E0099' },
+    ],
+    verify: [{ change_id: 'c8', identity_id: 'i8', display: 'Maria Lopez', external_id: 'E1008', candidates: 2 }],
+    needs_name: [{ change_id: 'c7', display: 'Alex Kim', external_id: 'E1007' }],
+  };
+}
+seedIdentityFeatures();
+
+function namesFor(rec) {
+  const first = String(rec.FirstName || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const last = String(rec.LastName || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const suffix = db.settings.ad.upn_suffix || 'corp.example.com';
+  return { sam: `${first.slice(0, 1)}${last}`.slice(0, 20), upn: `${first}.${last}@${suffix}`, cn: `${rec.FirstName || ''} ${rec.LastName || ''}`.trim(), mail: `${first}.${last}@${suffix}` };
+}
+
+function identityRoutes(method, path, body) {
+  let m;
+  if ((m = path.match(/^\/changes\/([^/]+)\/names$/)) && method === 'GET') {
+    need('approver');
+    const c = db.changes.find((x) => x.id === m[1]);
+    if (!c) {
+      throw new HttpError(404, 'not_found', 'Change not found.');
+    }
+    const id = db.identities.find((i) => i.id === c.identity_id) || { attrs: {} };
+    const n = namesFor(id.attrs);
+    const sfx = (s) => ({ sam: `${n.sam}${s}`.slice(0, 20), upn: n.upn.replace('@', `${s}@`), cn: `${n.cn} ${s}`, mail: n.mail.replace('@', `${s}@`) });
+    return {
+      current: (c.payload.candidates || [])[0] || n,
+      conflicts: c.payload.name_conflicts || [],
+      suggestions: [{ mode: 'number', candidate: sfx('2') }, { mode: 'random', candidate: sfx('417') }, { mode: 'template', candidate: sfx('1007') }],
+    };
+  }
+  if ((m = path.match(/^\/changes\/([^/]+)\/name$/)) && method === 'POST') {
+    need('approver');
+    const c = db.changes.find((x) => x.id === m[1]);
+    if (!c || c.status !== 'pending') {
+      throw new HttpError(409, 'conflict', 'Only a pending change can get a name.');
+    }
+    if (!/^[A-Za-z0-9._-]{1,20}$/.test(body.sam || '') || !/^[^@\s]+@[^@\s]+$/.test(body.upn || '') || !body.cn) {
+      throw new HttpError(400, 'bad_request', 'sam, upn and cn are required (sam: 1-20 letters, digits, . _ -).');
+    }
+    const taken = takenNames([{ field: 'sam', value: body.sam }, { field: 'upn', value: body.upn }, { field: 'mail', value: body.mail || '' }, { field: 'cn', value: body.cn }]);
+    if (taken.length > 0) {
+      throw new HttpError(409, 'conflict', 'These names are already taken.', { conflicts: taken });
+    }
+    c.payload.candidates = [{ sam: body.sam, upn: body.upn, cn: body.cn, mail: body.mail || '' }];
+    c.payload.needs_name = false;
+    c.payload.name_conflicts = [];
+    c.summary = c.summary.filter((s) => !s.startsWith('WAITING for a username'));
+    audit(db.session.user.username, 'change.set_name', 'change', c.id, { sam: body.sam });
+    return c;
+  }
+  if (method === 'POST' && path === '/ad/check-names') {
+    need('approver');
+    return { taken: takenNames(body.names) };
+  }
+  if ((m = path.match(/^\/changes\/([^/]+)\/link$/)) && method === 'POST') {
+    need('approver');
+    const c = db.changes.find((x) => x.id === m[1]);
+    if (!c || c.type !== 'link' || c.status !== 'pending') {
+      throw new HttpError(409, 'conflict', 'Only a pending link change can be changed.');
+    }
+    if (body.create_new) {
+      decide(c, 'rejected', db.session.user.username, 'create a new account instead');
+      const id = db.identities.find((i) => i.id === c.identity_id);
+      if (id) {
+        id.link_decision = 'new';
+      }
+      return c;
+    }
+    const cand = c.payload.link.candidates.find((x) => x.object_guid === body.object_guid);
+    if (!cand) {
+      throw new HttpError(400, 'bad_request', 'object_guid is not one of the candidates.');
+    }
+    c.payload.link.chosen = cand.object_guid;
+    c.payload.object_guid = cand.object_guid;
+    c.payload.dn = cand.dn;
+    audit(db.session.user.username, 'change.set_link', 'change', c.id, { object_guid: cand.object_guid });
+    return c;
+  }
+  if ((m = path.match(/^\/identities\/([^/]+)\/link$/)) && method === 'POST') {
+    need('approver');
+    const id = db.identities.find((x) => x.id === m[1]);
+    if (!id) {
+      throw new HttpError(404, 'not_found', 'Identity not found.');
+    }
+    if (id.ad_guid) {
+      throw new HttpError(409, 'conflict', 'This person is already linked to an AD account.');
+    }
+    id.link_decision = body.clear ? '' : `guid:${body.object_guid}`;
+    audit(db.session.user.username, 'identity.link_decision', 'identity', id.id, { decision: id.link_decision });
+    return id;
+  }
+  if (method === 'GET' && path === '/placement/values') {
+    need('viewer');
+    return { field: 'Department', values: [{ value: 'Finance', people: 4, ou: 'OU=Finance,OU=Staff,DC=corp,DC=example,DC=com' }, { value: 'Sales', people: 2, ou: '' }] };
+  }
+  if (method === 'GET' && path === '/correlation/report') {
+    need('viewer');
+    const ignore = (db.settings.correlation && db.settings.correlation.ignore_accounts) || [];
+    const ignored = (sam) => ignore.some((p) => new RegExp(`^${String(p).replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*')}$`, 'i').test(sam));
+    return { ...db.report, enabled: !!(db.settings.correlation && db.settings.correlation.enabled), uncorrelated: db.report.uncorrelated.filter((a) => !ignored(a.sam)) };
+  }
+  if (method === 'GET' && path === '/manual/sources') {
+    need('viewer');
+    return db.sources.filter((s) => s.type === 'manual').map((s) => ({ id: s.id, name: s.name, enabled: s.enabled, id_prefix: s.config.id_prefix || 'C-', fields: MANUAL_FIELDS }));
+  }
+  if ((m = path.match(/^\/manual\/sources\/([^/]+)(\/.*)?$/))) {
+    const src = db.sources.find((s) => s.id === m[1] && s.type === 'manual');
+    if (!src) {
+      throw new HttpError(404, 'not_found', 'Manual source not found.');
+    }
+    const rest = m[2] || '';
+    const checkAttrs = (attrs) => {
+      for (const f of MANUAL_FIELDS) {
+        const v = String((attrs || {})[f.name] || '').trim();
+        if (f.required && !v) {
+          throw new HttpError(400, 'bad_request', `${f.label} is required.`);
+        }
+        if (v && f.kind === 'date' && !/^\d{4}-\d{2}-\d{2}$/.test(v)) {
+          throw new HttpError(400, 'bad_request', `${f.label} must be a date (YYYY-MM-DD).`);
+        }
+      }
+    };
+    if (rest === '/people' && method === 'GET') {
+      need('viewer');
+      return db.manual.filter((p) => p.source_id === src.id).slice().sort((a, b) => b.created_at.localeCompare(a.created_at));
+    }
+    if (rest === '/preview' && method === 'POST') {
+      need('approver');
+      checkAttrs(body.attrs);
+      const n = namesFor(body.attrs);
+      const dept = body.attrs.Department;
+      return {
+        names: n, ou: dept === 'Sales' ? '' : `OU=${dept},OU=Staff,DC=corp,DC=example,DC=com`,
+        ou_reason: dept === 'Sales' ? 'no OU placement rule for "Sales"' : `OU placement rule for "${dept}"`,
+        conflicts: takenNames([{ field: 'sam', value: n.sam }, { field: 'upn', value: n.upn }, { field: 'mail', value: n.mail }]), warnings: [],
+      };
+    }
+    if (rest === '/people' && method === 'POST') {
+      need('approver');
+      checkAttrs(body.attrs);
+      const p = {
+        id: newId('mp'), source_id: src.id, external_id: `${src.config.id_prefix || 'C-'}${Math.random().toString(36).slice(2, 8).toUpperCase()}`,
+        attrs: body.attrs, ended: false, created_by: db.session.user.username, created_at: now(), updated_by: db.session.user.username, updated_at: now(), state: 'new', ad_sam: '',
+      };
+      db.manual.push(p);
+      audit(db.session.user.username, 'manual.create', 'manual_person', p.id, { external_id: p.external_id });
+      return body.sync ? { ...p, run_id: 'run-mock-sync' } : p;
+    }
+    const pm = rest.match(/^\/people\/([^/]+)(\/end)?$/);
+    const person = pm ? db.manual.find((p) => p.id === pm[1] && p.source_id === src.id) : null;
+    if (pm && !person) {
+      throw new HttpError(404, 'not_found', 'Person not found.');
+    }
+    if (pm && !pm[2] && method === 'PUT') {
+      need('approver');
+      checkAttrs(body.attrs);
+      Object.assign(person, { attrs: body.attrs, updated_by: db.session.user.username, updated_at: now() });
+      return person;
+    }
+    if (pm && pm[2] && method === 'POST') {
+      need('approver');
+      person.ended = true;
+      audit(db.session.user.username, 'manual.end', 'manual_person', person.id, { note: body.note || '' });
+      return person;
+    }
+    if (pm && !pm[2] && method === 'DELETE') {
+      need('admin');
+      if (person.ad_sam) {
+        throw new HttpError(409, 'conflict', 'This person has an AD account; end them instead.');
+      }
+      db.manual.splice(db.manual.indexOf(person), 1);
+      return null;
+    }
+  }
+  return undefined;
+}
 for (let i = 0; i < 30; i += 1) {
   audit(i % 3 === 0 ? 'system' : 'admin', i % 2 ? 'change.approve' : 'run.finish', i % 2 ? 'change' : 'run', `x${i}`, { note: `entry ${i}`, long: 'x'.repeat(i * 5) });
 }
@@ -86,10 +364,11 @@ for (let i = 0; i < 30; i += 1) {
 // ------------------------------------------------------------------ helpers
 
 class HttpError extends Error {
-  constructor(status, code, message) {
+  constructor(status, code, message, extra) {
     super(message);
     this.status = status;
     this.code = code;
+    this.extra = extra || null; // extra top-level fields of the error body (e.g. conflicts)
   }
 }
 
@@ -110,6 +389,14 @@ const SOURCE_TYPES = [
     fields: [
       { name: 'company_id', label: 'Company ID', type: 'string', required: true },
       { name: 'client_secret', label: 'Client secret', type: 'password', required: true },
+    ],
+  },
+  {
+    type: 'manual', label: 'Manual entry (Add person)',
+    fields: [
+      { name: 'id_prefix', label: 'Employee ID prefix', type: 'string', default: 'C-' },
+      { name: 'form_fields', label: 'Form fields', type: 'text', default: 'FirstName | First name | required\nLastName | Last name | required' },
+      { name: 'end_date_field', label: 'End date field', type: 'string', default: 'EndDate' },
     ],
   },
 ];
@@ -358,9 +645,53 @@ function route(method, path, params, body) {
   if (r !== undefined) {
     return r;
   }
+  if (path.startsWith('/mapper/')) {
+    need('admin');
+    // Rough stand-in for engine.TemplateFields: .Name and index . "key".
+    const tplFields = (t) => [...new Set([...String(t || '').matchAll(/\.([A-Za-z_][A-Za-z0-9_]*)|index \. "([^"]+)"/g)].map((m) => m[1] || m[2]))].sort();
+    const refs = () => [
+      ...db.mappings.map((m) => ({ kind: 'mapping', id: m.id, name: m.name, target_attr: m.target_attr, enabled: m.enabled, fields: tplFields(m.template), dynamic: false })),
+      ...db.roles.map((r) => ({ kind: 'role', id: r.id, name: r.name, enabled: r.enabled, dynamic: false,
+        fields: [...new Set([...(r.conditions || []).map((c) => c.attr), ...((r.grants && r.grants.attributes) || []).flatMap((g) => tplFields(g.template))])].sort() })),
+    ];
+    if (method === 'GET' && path === '/mapper/references') {
+      return { references: refs() };
+    }
+    if (method === 'GET' && path === '/mapper/ad-attributes') {
+      const s = (name, description, extra = {}) => ({ name, description, syntax: 'string', single_valued: true, mappable: true, ...extra });
+      return {
+        source: 'builtin', live_error: 'mock: no AD here', fetched_at: now(),
+        attributes: [
+          s('department', 'Department'), s('displayName', 'Display name shown in address lists'), s('givenName', 'First name'),
+          s('manager', 'Manager (use value type user_ref)', { syntax: 'dn', hint: 'holds a reference to another object: use value type user_ref' }),
+          s('sAMAccountName', 'Logon name', { mappable: false, reason: 'managed by IDLifecycle or security-sensitive' }),
+          s('sn', 'Last name (surname)'), s('title', 'Job title'),
+        ],
+      };
+    }
+    const m = /^\/mapper\/sources\/([^/]+)\/fields$/.exec(path);
+    if (method === 'POST' && m) {
+      const rows = [
+        { EmployeeId: 'E1001', FirstName: 'Jane', LastName: 'Doe', Department: 'Finance', Status: 'A', ManagerID: 'E1002' },
+        { EmployeeId: 'E1002', FirstName: 'John', LastName: 'Smith', Department: 'IT', Status: 'A', ManagerID: '' },
+        { EmployeeId: 'E1003', FirstName: 'Terry', LastName: 'Left', Department: 'HR', Status: 'T', ManagerID: 'E1002' },
+      ];
+      const names = Object.keys(rows[0]).sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+      const fields = names.map((n) => ({
+        name: n, filled: rows.filter((r) => r[n]).length, samples: [...new Set(rows.map((r) => r[n]).filter(Boolean))].slice(0, 3), used_by: [],
+        role: n === 'EmployeeId' ? 'external_id' : (n === 'Status' ? 'status' : undefined),
+      }));
+      return { ok: true, error: '', count: rows.length, id_field: 'EmployeeId', status_field: 'Status', fields, references: refs().map((r) => ({ ...r, missing: [], suggestions: {} })) };
+    }
+  }
   if (method === 'POST' && path === '/templates/preview') {
     need('admin');
     try {
+      // The mock has no random(): a password preview strips it and reports the check like the server would.
+      if (body.kind === 'password') {
+        const out = applyTemplate(String(body.template || '').replace(/\{\{\s*random\w*\s+\d+\s*\}\}/g, 'Xy7#'), body.record || {});
+        return { ok: true, output: out, error: '', check: out.length < 8 ? `the initial password is ${out.length} characters; at least 8 are needed` : '' };
+      }
       return { ok: true, output: applyTemplate(body.template, body.record || {}), error: '' };
     }
     catch (e) {
@@ -465,13 +796,40 @@ function route(method, path, params, body) {
     }
     return i;
   }
+  if (path === '/backups') {
+    need('admin');
+    db.backups = db.backups || [];
+    if (method === 'POST') {
+      if (!db.settings.backup || !db.settings.backup.passphrase) {
+        throw new HttpError(400, 'bad_request', 'set a backup passphrase in Settings -> Backups first');
+      }
+      const f = { name: `IDLifecycle_MOCK_${Date.now()}.idlbak`, size: 24576, created: now() };
+      db.backups.unshift(f);
+      audit(db.session.user.username, 'backup.create', 'backup', f.name, { size: f.size });
+      return f;
+    }
+    const b = db.settings.backup || {};
+    return { folder: 'C:\\ProgramData\\IDLifecycle\\backups', files: db.backups, enabled: !!b.enabled, interval_hours: b.interval_hours || 24, keep: b.keep || 14, passphrase_set: !!b.passphrase, next_due: b.enabled ? now() : null };
+  }
   if (method === 'GET' && path === '/audit/verify') {
     need('viewer');
     return { ok: true, checked: db.audit.length, first_bad_seq: 0 };
   }
   if (method === 'GET' && path === '/audit') {
     need('viewer');
-    const items = db.audit.filter((a) => (!params.get('actor') || a.actor.includes(params.get('actor')))
+    // A small subset of the server's q syntax: plain words, actor:, action:(prefix*), level:error; since:/before: are ignored.
+    const terms = (params.get('q') || '').match(/"[^"]*"|\S+/g) || [];
+    const match = (a) => terms.every((raw) => {
+      const t = raw.replace(/"/g, '');
+      const [k, ...rest] = t.split(':');
+      const v = rest.join(':');
+      if (k === 'actor') { return a.actor === v; }
+      if (k === 'action') { return v.endsWith('*') ? a.action.startsWith(v.slice(0, -1)) : a.action === v; }
+      if (k === 'level') { return /(failed|denied|rejected|blocked)$/.test(a.action); }
+      if (['since', 'before', 'after', 'until'].includes(k)) { return true; }
+      return JSON.stringify(a).toLowerCase().includes(t.toLowerCase());
+    });
+    const items = db.audit.filter((a) => match(a) && (!params.get('actor') || a.actor.includes(params.get('actor')))
       && (!params.get('action') || a.action.includes(params.get('action'))) && (!params.get('entity_type') || a.entity_type === params.get('entity_type')))
       .slice().reverse();
     return paginate(items, params);
@@ -490,6 +848,10 @@ function route(method, path, params, body) {
     const rows = src.filter((o) => matchQ(o, params.get('q'))).map((o) => columns.map((c) => o[c]));
     const p = paginate(rows, params);
     return { name: m[1], columns, rows: p.items, total: p.total };
+  }
+  r = identityRoutes(method, path, body);
+  if (r !== undefined) {
+    return r;
   }
   r = crud('users', () => db.users, 'admin', (b) => {
     const base = { username: b.username, role: b.role, disabled: Boolean(b.disabled) };
@@ -542,7 +904,7 @@ window.fetch = async (input, init = {}) => {
   }
   catch (e) {
     if (e instanceof HttpError) {
-      return respond(e.status, { error: { code: e.code, message: e.message } });
+      return respond(e.status, { ...(e.extra || {}), error: { code: e.code, message: e.message } });
     }
     return respond(500, { error: { code: 'internal', message: `mock failure: ${e.message}` } });
   }

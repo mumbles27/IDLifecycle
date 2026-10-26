@@ -18,6 +18,16 @@ import (
 
 // Approve moves a pending change to approved and wakes the executor.
 func (e *Engine) Approve(ctx context.Context, id, by, note string) (model.Change, error) {
+	if c, err := e.Store.GetChange(ctx, id); err == nil {
+		switch {
+		case c.Payload.NeedsOU:
+			return c, fmt.Errorf("%w: choose an OU for this change first (%s)", ErrInvalid, c.Payload.OUReason)
+		case c.Payload.NeedsName:
+			return c, fmt.Errorf("%w: choose a username for this change first (%s)", ErrInvalid, conflictText(c.Payload.NameConflicts))
+		case c.Type == model.ChangeLink && (c.Payload.Link == nil || c.Payload.Link.Chosen == ""):
+			return c, fmt.Errorf("%w: choose the matching account first, or create a new account instead", ErrInvalid)
+		}
+	}
 	return e.decide(ctx, id, model.StatusPending, model.StatusApproved, by, note, "change.approve")
 }
 
@@ -26,7 +36,22 @@ func (e *Engine) Reject(ctx context.Context, id, by, note string) (model.Change,
 	if strings.TrimSpace(note) == "" {
 		return model.Change{}, fmt.Errorf("%w: a note is required when rejecting", ErrInvalid)
 	}
-	return e.decide(ctx, id, model.StatusPending, model.StatusRejected, by, note, "change.reject")
+	c, err := e.decide(ctx, id, model.StatusPending, model.StatusRejected, by, note, "change.reject")
+	if err == nil && c.Type == model.ChangeLink && c.Payload.Link != nil {
+		// "Not this person": never propose these accounts for this identity again.
+		var guids []string
+		for _, cand := range c.Payload.Link.Candidates {
+			if c.Payload.Link.Chosen == "" || strings.EqualFold(cand.ObjectGUID, c.Payload.Link.Chosen) {
+				guids = append(guids, cand.ObjectGUID)
+			}
+		}
+		if rerr := e.Store.AddIdentityLinkRejects(ctx, c.IdentityID, guids...); rerr != nil {
+			e.Log.Error("record rejected link", "change", c.ID, "error", rerr)
+		} else {
+			e.audit(ctx, by, "identity.link_reject", "identity", c.IdentityID, map[string]any{"change": c.ID, "accounts": guids})
+		}
+	}
+	return c, err
 }
 
 // Retry re-queues a failed change.
@@ -54,7 +79,7 @@ func (e *Engine) decide(ctx context.Context, id, from, to, by, note, action stri
 
 // ---- execution -------------------------------------------------------------------
 
-var executionOrder = []string{model.ChangeCreate, model.ChangeUpdate, model.ChangeEnable, model.ChangeDisable, model.ChangeDelete}
+var executionOrder = []string{model.ChangeLink, model.ChangeCreate, model.ChangeUpdate, model.ChangeEnable, model.ChangeDisable, model.ChangeDelete}
 
 // ExecuteChunk caps the items sent to one PowerShell invocation, so a large batch (the first load of a
 // whole HR population) never runs into the script timeout as a single all-or-nothing call.
@@ -144,22 +169,29 @@ func (e *Engine) applyBatch(ctx context.Context, s model.Settings, typ string, b
 
 	var results []ad.Result
 	var callErr error
+	refused := map[string]ad.Result{} // changes failed before the AD call (their own reason wins over callErr)
 	switch typ {
 	case model.ChangeCreate:
 		items := make([]ad.CreateItem, 0, len(claimed))
 		for _, c := range claimed {
-			pw, perr := GeneratePassword(s.NewUser.PasswordLength)
+			pw, mustChange, msg, perr := e.initialPassword(ctx, s, c)
 			if perr != nil {
 				e.releaseClaimed(claimed, perr)
 				return perr
 			}
+			if msg != "" {
+				refused[c.ID] = ad.Result{ChangeID: c.ID, Status: ad.StatusFailed, Error: msg}
+				continue
+			}
 			items = append(items, ad.CreateItem{
 				ChangeID: c.ID, ExternalID: c.ExternalID, OU: c.Payload.OU, Candidates: c.Payload.Candidates,
 				Attributes: c.Payload.Attributes, Groups: c.Payload.Groups, Password: pw,
-				Enabled: s.NewUser.Enabled, ChangePasswordAtLogon: s.NewUser.ChangePasswordAtLogon,
+				Enabled: s.NewUser.Enabled, ChangePasswordAtLogon: mustChange,
 			})
 		}
-		results, callErr = e.AD.Create(ctx, opts, items)
+		if len(items) > 0 {
+			results, callErr = e.AD.Create(ctx, opts, items)
+		}
 	case model.ChangeUpdate:
 		items := make([]ad.UpdateItem, 0, len(claimed))
 		for _, c := range claimed {
@@ -191,6 +223,19 @@ func (e *Engine) applyBatch(ctx context.Context, s model.Settings, typ string, b
 			items = append(items, ad.RemoveItem{ChangeID: c.ID, ExternalID: c.ExternalID, ObjectGUID: c.Payload.ObjectGUID})
 		}
 		results, callErr = e.AD.Remove(ctx, opts, items)
+	case model.ChangeLink:
+		items := make([]ad.LinkItem, 0, len(claimed))
+		for _, c := range claimed {
+			ch, ok := c.Payload.Link.ChosenCandidate()
+			if !ok {
+				refused[c.ID] = ad.Result{ChangeID: c.ID, Status: ad.StatusFailed, Error: "no account chosen"}
+				continue
+			}
+			items = append(items, ad.LinkItem{ChangeID: c.ID, ObjectGUID: ch.ObjectGUID, ExternalID: c.ExternalID, ExpectedExternalID: ch.ExternalID, Rename: c.Payload.Link.Rename})
+		}
+		if len(items) > 0 {
+			results, callErr = e.AD.Link(ctx, opts, items)
+		}
 	default:
 		callErr = fmt.Errorf("unknown change type %q", typ)
 	}
@@ -201,8 +246,9 @@ func (e *Engine) applyBatch(ctx context.Context, s model.Settings, typ string, b
 	}
 
 	for _, c := range claimed {
-		var r ad.Result
+		r, pre := refused[c.ID]
 		switch {
+		case pre:
 		case callErr != nil:
 			r = ad.Result{ChangeID: c.ID, Status: ad.StatusFailed, Error: callErr.Error()}
 		default:
@@ -224,6 +270,33 @@ func (e *Engine) applyBatch(ctx context.Context, s model.Settings, typ string, b
 		e.Log.Error("AD action failed", "type", typ, "count", len(claimed), "error", callErr)
 	}
 	return nil
+}
+
+// initialPassword makes the password for one create: random, or new_user.password_template rendered from the
+// identity's source record (then change-at-logon is forced). A template that fails or produces a password AD would
+// refuse returns msg (the change fails on its own; the reason never contains the password); err is returned only
+// for failures that should stop the batch (no randomness).
+func (e *Engine) initialPassword(ctx context.Context, s model.Settings, c model.Change) (pw string, mustChange bool, msg string, err error) {
+	if s.NewUser.PasswordMode != model.PasswordModeTemplate {
+		pw, err = GeneratePassword(s.NewUser.PasswordLength)
+		return pw, s.NewUser.ChangePasswordAtLogon, "", err
+	}
+	id, err := e.Store.GetIdentity(ctx, c.IdentityID)
+	if err != nil {
+		return "", true, "initial password: cannot load the identity record: " + err.Error(), nil
+	}
+	pw, err = RenderPassword(s.NewUser.PasswordTemplate, id.Attrs)
+	if err != nil {
+		return "", true, "initial password: new_user.password_template: " + strings.TrimPrefix(err.Error(), "template: "), nil
+	}
+	sam := ""
+	if len(c.Payload.Candidates) > 0 {
+		sam = c.Payload.Candidates[0].Sam
+	}
+	if cerr := CheckInitialPassword(pw, sam); cerr != nil {
+		return "", true, cerr.Error() + " (fix new_user.password_template)", nil
+	}
+	return pw, true, "", nil
 }
 
 // releaseClaimed fails changes that were claimed but never sent to AD so they do not sit in
@@ -258,6 +331,9 @@ func (e *Engine) recordResult(ctx context.Context, c model.Change, r ad.Result) 
 	if r.ObjectGUID == "" && !(r.OK() && c.Type == model.ChangeDelete) {
 		return
 	}
+	if c.Type == model.ChangeLink && !r.OK() {
+		return // the account was not handed over (wrong id attribute, name taken...): leave both records as they are
+	}
 	id, err := e.Store.GetIdentity(ctx, c.IdentityID)
 	if err != nil {
 		e.Log.Error("load identity after apply", "identity", c.IdentityID, "error", err)
@@ -284,8 +360,14 @@ func (e *Engine) recordResult(ctx context.Context, c model.Change, r ad.Result) 
 			for k, v := range c.Payload.Attributes {
 				setApplied(id.Applied, k, v)
 			}
+			if c.Payload.Placement != "" {
+				setApplied(id.Applied, placementKey, c.Payload.Placement)
+			}
 		}
 	case model.ChangeUpdate:
+		if r.OK() && c.Payload.MoveTo != "" && (c.Payload.Placement != "" || c.Payload.NeedsOU) {
+			setApplied(id.Applied, placementKey, c.Payload.Placement)
+		}
 		if r.OK() {
 			for k, d := range c.Payload.Set {
 				setApplied(id.Applied, k, d.To)
@@ -308,6 +390,20 @@ func (e *Engine) recordResult(ctx context.Context, c model.Change, r ad.Result) 
 			id.Applied = map[string]string{}
 		}
 	}
+	if c.Type == model.ChangeLink {
+		ch, _ := c.Payload.Link.ChosenCandidate()
+		id.State, id.DisabledAt = model.StateLinked, nil
+		if !ch.Enabled {
+			id.State = model.StateDisabled
+		}
+		id.Applied = map[string]string{} // nothing was written by this service for this record yet
+		if err := e.Store.SetIdentityLinkDecision(ctx, id.ID, ""); err != nil {
+			e.Log.Error("clear link decision", "identity", id.ID, "error", err)
+		}
+		if ch.IdentityID != "" {
+			e.retire(ctx, ch.IdentityID, id)
+		}
+	}
 	if err := e.Store.UpdateIdentity(ctx, id); err != nil {
 		e.Log.Error("update identity after apply", "identity", id.ID, "error", err)
 	}
@@ -322,37 +418,56 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
+// Character sets for generated passwords (no visually ambiguous characters).
+const (
+	pwUpper  = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+	pwLower  = "abcdefghijkmnopqrstuvwxyz"
+	pwDigits = "23456789"
+	pwSymbol = "!@#$%^&*-_=+?"
+)
+
+func pickChar(set string) (byte, error) {
+	i, err := rand.Int(rand.Reader, big.NewInt(int64(len(set))))
+	if err != nil {
+		return 0, err
+	}
+	return set[i.Int64()], nil
+}
+
+// randomChars returns n characters from set (crypto/rand); n must be 1-64 (password templates call it).
+func randomChars(set string, n int) (string, error) {
+	if n < 1 || n > 64 {
+		return "", fmt.Errorf("random length must be between 1 and 64, got %d", n)
+	}
+	out := make([]byte, n)
+	for i := range out {
+		c, err := pickChar(set)
+		if err != nil {
+			return "", err
+		}
+		out[i] = c
+	}
+	return string(out), nil
+}
+
 // GeneratePassword returns a random password that satisfies typical AD complexity rules
 // (upper, lower, digit, symbol) using crypto/rand. It avoids visually ambiguous characters.
 func GeneratePassword(n int) (string, error) {
-	const (
-		upper  = "ABCDEFGHJKLMNPQRSTUVWXYZ"
-		lower  = "abcdefghijkmnopqrstuvwxyz"
-		digits = "23456789"
-		symbol = "!@#$%^&*-_=+?"
-	)
 	if n < 14 {
 		n = 14
 	}
-	all := upper + lower + digits + symbol
-	pick := func(set string) (byte, error) {
-		i, err := rand.Int(rand.Reader, big.NewInt(int64(len(set))))
-		if err != nil {
-			return 0, err
-		}
-		return set[i.Int64()], nil
-	}
+	all := pwUpper + pwLower + pwDigits + pwSymbol
 
 	out := make([]byte, 0, n)
-	for _, set := range []string{upper, lower, digits, symbol} {
-		c, err := pick(set)
+	for _, set := range []string{pwUpper, pwLower, pwDigits, pwSymbol} {
+		c, err := pickChar(set)
 		if err != nil {
 			return "", err
 		}
 		out = append(out, c)
 	}
 	for len(out) < n {
-		c, err := pick(all)
+		c, err := pickChar(all)
 		if err != nil {
 			return "", err
 		}
@@ -367,4 +482,24 @@ func GeneratePassword(n int) (string, error) {
 		out[i], out[j.Int64()] = out[j.Int64()], out[i]
 	}
 	return string(out), nil
+}
+
+// retire marks the record whose account was handed to newOwner as merged: the planner skips it from now on, so
+// the old record (a contractor entry, a former employee id) can never disable or delete the account.
+func (e *Engine) retire(ctx context.Context, oldID string, newOwner model.Identity) {
+	old, err := e.Store.GetIdentity(ctx, oldID)
+	if err != nil {
+		e.Log.Error("load the record that gave up its account", "identity", oldID, "error", err)
+		return
+	}
+	old.State, old.MergedInto = model.StateMerged, newOwner.ID
+	old.ADGUID, old.ADDN, old.ADSam, old.DisabledAt = "", "", "", nil
+	old.Applied = map[string]string{}
+	if err := e.Store.UpdateIdentity(ctx, old); err != nil {
+		e.Log.Error("retire merged record", "identity", oldID, "error", err)
+		return
+	}
+	e.audit(ctx, "system", "identity.merge", "identity", old.ID, map[string]any{
+		"external_id": old.ExternalID, "source": old.SourceName, "merged_into": newOwner.ID, "new_external_id": newOwner.ExternalID,
+	})
 }

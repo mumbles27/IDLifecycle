@@ -25,6 +25,7 @@ func dialects(t *testing.T) map[string]func(t *testing.T) *Store {
 		DriverPostgres: "IDL_TEST_POSTGRES_DSN",
 		DriverMSSQL:    "IDL_TEST_MSSQL_DSN",
 		DriverMySQL:    "IDL_TEST_MYSQL_DSN",
+		DriverDB2:      "IDL_TEST_DB2_DSN", // full ODBC connection string; needs the IBM ODBC/CLI driver
 	} {
 		if dsn := os.Getenv(env); dsn != "" {
 			drv, dsn := drv, dsn

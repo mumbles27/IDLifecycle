@@ -1343,3 +1343,172 @@ fieldset.plain {
   white-space: pre-wrap;
   min-width: 20rem;
 }
+
+/* ------------------------------------------------------------ field mapper (Attribute mappings) */
+
+.mapper-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 1.25rem;
+  margin-top: 0.6rem;
+}
+
+.mapper-pane {
+  min-width: 0;
+}
+
+.mapper-pane > h3 {
+  margin: 0 0 0.4rem;
+  font-size: 1rem;
+}
+
+.mapper-list {
+  max-height: 30rem;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+
+.mapper-list > p {
+  margin: 0;
+  padding: 0.8rem;
+}
+
+.mapper-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas: "main act" "samples act" "used act";
+  column-gap: 0.75rem;
+  row-gap: 0.15rem;
+  padding: 0.55rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.mapper-row:last-child {
+  border-bottom: 0;
+}
+
+.mapper-row > .mapper-main {
+  grid-area: main;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.4rem 0.6rem;
+}
+
+.mapper-row > .mapper-samples,
+.mapper-row > .muted {
+  grid-area: samples;
+  overflow-wrap: anywhere;
+}
+
+.mapper-row > .mapper-used {
+  grid-area: used;
+}
+
+.mapper-row > .mapper-act {
+  grid-area: act;
+  align-self: center;
+}
+
+.mapper-row .chip {
+  margin: 0.15rem 0.3rem 0 0;
+}
+
+.mapper-name {
+  font-weight: 600;
+}
+
+.mapper-off {
+  background: var(--surface-2);
+}
+
+.mapper-off .mapper-name {
+  color: var(--muted);
+}
+
+.mapper-mapped {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  margin-right: 0.5rem;
+}
+
+.mapper-fallback {
+  color: var(--warn-text);
+}
+
+.field-title {
+  font-weight: 600;
+  font-size: 0.88rem;
+}
+
+.field-warn {
+  margin: 0;
+  color: var(--warn-text);
+  background: var(--warn-bg);
+  border-radius: 6px;
+  padding: 0.25rem 0.5rem;
+}
+
+.chip-btn {
+  border: 1px solid transparent;
+  cursor: pointer;
+}
+
+.chip-btn:hover {
+  border-color: var(--accent);
+}
+
+@media (max-width: 62rem) {
+  .mapper-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ------------------------------------------------------------ sign-in with Entra ID */
+
+.login-sso {
+  margin-top: 1rem;
+}
+
+.login-sso a.btn {
+  display: flex;
+  justify-content: center;
+  box-sizing: border-box;
+  text-decoration: none;
+}
+
+.login-divider {
+  text-align: center;
+  margin: 0.8rem 0 0;
+}
+
+/* History page */
+.linklike { background: none; border: 0; padding: 0; color: inherit; font: inherit; cursor: pointer; text-align: left; }
+.linklike:hover, .linklike:focus-visible { text-decoration: underline; }
+table.data tr.row-error td:first-child { box-shadow: inset 3px 0 0 var(--danger); }
+pre.detail-json { max-height: 22rem; overflow: auto; margin: 0.4rem 0 0; padding: 0.5rem; background: var(--surface-2); border: 1px solid var(--border); border-radius: 4px; font-size: 0.8rem; white-space: pre-wrap; word-break: break-word; }
+table.data.compact td { padding: 0.2rem 0.6rem; }
+
+/* OU picker */
+.ou-list { max-height: 18rem; overflow: auto; border: 1px solid var(--border); border-radius: 4px; margin: 0.5rem 0; padding: 0.25rem 0; }
+.ou-item { display: block; width: 100%; text-align: left; background: none; border: 0; padding: 0.2rem 0.5rem; cursor: pointer; color: inherit; font: inherit; }
+.ou-item:hover, .ou-item:focus-visible { background: var(--surface-2); }
+.ou-item.selected { background: var(--surface-2); font-weight: 600; box-shadow: inset 3px 0 0 currentColor; }
+
+/* ---- naming conflicts, matching, manual people ---- */
+.conflict-list { margin: 0.25rem 0; padding-left: 1.2rem; }
+.conflict-list li { margin: 0.15rem 0; }
+.match-fields { list-style: none; margin: 0.35rem 0 0; padding: 0; font-size: 0.9em; }
+.match-fields li { margin: 0.1rem 0; }
+.match-mark { display: inline-block; width: 1.1em; font-weight: 700; }
+.match-yes .match-mark { color: var(--ok-text); }
+.match-no .match-mark { color: var(--danger); }
+.match-no { color: var(--err-text); }
+table.data tr.row-chosen td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+.rule-row { display: grid; grid-template-columns: 1fr 1fr 1.4fr auto auto; gap: 0.5rem; align-items: end; }
+@media (max-width: 760px) { .rule-row { grid-template-columns: 1fr; } }
+.preview-box { border: 1px solid var(--border); border-radius: 6px; padding: 0.6rem 0.8rem; background: var(--surface); }

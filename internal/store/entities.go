@@ -44,13 +44,13 @@ func (s *Store) SaveSettings(ctx context.Context, st model.Settings, by string) 
 
 // ---- users -----------------------------------------------------------------
 
-const userCols = `id, username, password_hash, role, disabled, failed_logins, locked_until, created_at, last_login_at`
+const userCols = `id, username, password_hash, role, disabled, failed_logins, locked_until, created_at, last_login_at, auth_source, external_id`
 
 func scanUser(sc interface{ Scan(...any) error }) (model.User, error) {
 	var u model.User
 	var disabled int
 	var locked, created, last string
-	err := sc.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &disabled, &u.FailedLogins, &locked, &created, &last)
+	err := sc.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &disabled, &u.FailedLogins, &locked, &created, &last, &u.AuthSource, &u.ExternalID)
 	u.Disabled = disabled != 0
 	u.LockedUntil = parseTSP(locked)
 	u.CreatedAt = parseTS(created)
@@ -59,8 +59,11 @@ func scanUser(sc interface{ Scan(...any) error }) (model.User, error) {
 }
 
 func (s *Store) CreateUser(ctx context.Context, u model.User) error {
-	_, err := s.exec(ctx, `INSERT INTO users (`+userCols+`) VALUES (?,?,?,?,?,?,?,?,?)`,
-		u.ID, u.Username, u.PasswordHash, u.Role, b2i(u.Disabled), 0, "", ts(u.CreatedAt), tsp(u.LastLoginAt))
+	if u.AuthSource == "" {
+		u.AuthSource = model.AuthLocal
+	}
+	_, err := s.exec(ctx, `INSERT INTO users (`+userCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+		u.ID, u.Username, u.PasswordHash, u.Role, b2i(u.Disabled), 0, "", ts(u.CreatedAt), tsp(u.LastLoginAt), u.AuthSource, u.ExternalID)
 	if IsUniqueViolation(err) {
 		return ErrConflict
 	}
@@ -81,6 +84,14 @@ func (s *Store) GetUser(ctx context.Context, id string) (model.User, error) {
 
 func (s *Store) GetUserByName(ctx context.Context, name string) (model.User, error) {
 	return s.getUser(ctx, "username", name)
+}
+
+// GetUserByExternalID finds an Entra ID (OIDC) account by "<tenant id>:<object id>".
+func (s *Store) GetUserByExternalID(ctx context.Context, externalID string) (model.User, error) {
+	if externalID == "" {
+		return model.User{}, ErrNotFound
+	}
+	return s.getUser(ctx, "external_id", externalID)
 }
 
 func (s *Store) ListUsers(ctx context.Context) ([]model.User, error) {
@@ -283,13 +294,18 @@ func (s *Store) SetSourceStatus(ctx context.Context, id, status, errMsg string) 
 	return err
 }
 
-// DeleteSource refuses while identities still reference the source.
+// DeleteSource refuses while identities (or manual people) still reference the source.
 func (s *Store) DeleteSource(ctx context.Context, id string) error {
 	w := &where{}
 	w.add("source_id = ?", id)
 	n, err := s.count(ctx, "identities", w)
 	if err != nil {
 		return err
+	}
+	if n == 0 {
+		if n, err = s.count(ctx, "manual_people", w); err != nil {
+			return err
+		}
 	}
 	if n > 0 {
 		return ErrConflict

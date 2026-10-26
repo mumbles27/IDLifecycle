@@ -18,7 +18,9 @@ type TLS struct {
 
 type Database struct {
 	Driver string `json:"driver"`
-	DSN    string `json:"dsn"` // may be "env:VAR_NAME" to keep credentials out of the file
+	// DSN may be "env:VAR_NAME" to keep credentials out of the file. For db2 it is an ODBC connection string
+	// ("DSN=IDLDB;UID=..;PWD=.." or "Driver={IBM DB2 ODBC DRIVER};Hostname=..;Port=50000;Database=..;...").
+	DSN string `json:"dsn"`
 }
 
 type PowerShell struct {
@@ -95,9 +97,9 @@ func (c Config) ResolvedDSN() (string, error) {
 
 func (c Config) Validate() error {
 	switch c.Database.Driver {
-	case "sqlite", "postgres", "mssql", "mysql":
+	case "sqlite", "postgres", "mssql", "mysql", "db2":
 	default:
-		return fmt.Errorf("database.driver must be sqlite, postgres, mssql or mysql (got %q)", c.Database.Driver)
+		return fmt.Errorf("database.driver must be sqlite, postgres, mssql, mysql or db2 (got %q)", c.Database.Driver)
 	}
 	if c.Database.DSN == "" {
 		return fmt.Errorf("database.dsn is required")

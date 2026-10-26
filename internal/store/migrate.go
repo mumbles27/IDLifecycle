@@ -2,10 +2,45 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
+
+var (
+	textColsOnce sync.Once
+	textCols     map[string]bool
+)
+
+// textColumns returns the names of every {TEXT} column across all migrations (CLOB on
+// Db2). Names are matched without the table, which is conservative: a name that is TEXT
+// in any table is treated as TEXT everywhere.
+func textColumns() map[string]bool {
+	textColsOnce.Do(func() {
+		textCols = map[string]bool{}
+		re := regexp.MustCompile(`(?m)^\s*(\w+)\s+\{TEXT\}`)
+		for _, m := range migrations {
+			for _, st := range m.stmts {
+				for _, g := range re.FindAllStringSubmatch(st, -1) {
+					textCols[strings.ToLower(g[1])] = true
+				}
+			}
+		}
+	})
+	return textCols
+}
+
+// isTextColumn reports whether col (optionally alias-qualified, e.g. "i.ad_dn") is a TEXT column.
+func isTextColumn(col string) bool {
+	if i := strings.LastIndexByte(col, '.'); i >= 0 {
+		col = col[i+1:]
+	}
+	return textColumns()[strings.ToLower(strings.TrimSpace(col))]
+}
 
 // Column type tokens expanded per dialect.
 func (s *Store) ddl(stmt string) string {
@@ -17,10 +52,21 @@ func (s *Store) ddl(stmt string) string {
 		str, text, opts = "VARCHAR(255)", "LONGTEXT", " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
 	case DriverPostgres:
 		str, text, opts = "VARCHAR(255)", "TEXT", ""
+	case DriverDB2:
+		// CLOB, not VARCHAR(32672): JSON/payload/error values have no hard upper bound, and
+		// several 32K VARCHARs in one table need a 32K-page tablespace or extended row size.
+		// CLOB columns must never appear in =, <>, ORDER BY, GROUP BY, DISTINCT or an index
+		// (TestDB2StatementAudit enforces this). Db2 VARCHAR lengths are bytes, not characters.
+		str, text, opts = "VARCHAR(255)", "CLOB(16M)", ""
 	default:
 		str, text, opts = "VARCHAR(255)", "TEXT", ""
 	}
+	addCol := "ADD COLUMN"
+	if s.driver == DriverMSSQL {
+		addCol = "ADD" // T-SQL has no COLUMN keyword here
+	}
 	r := strings.NewReplacer(
+		"{ADDCOL}", addCol,
 		"{ID}", "VARCHAR(64)",
 		"{STR}", str,
 		"{TS}", "VARCHAR(40)",
@@ -162,17 +208,69 @@ var migrations = []struct {
 			prev_hash VARCHAR(64) NOT NULL,
 			hash VARCHAR(64) NOT NULL){OPTS}`,
 	}},
+	// Entra ID (OIDC) sign-in: where an account comes from and its stable directory identity.
+	{2, []string{
+		`ALTER TABLE users {ADDCOL} auth_source VARCHAR(20) NOT NULL DEFAULT 'local'`,
+		`ALTER TABLE users {ADDCOL} external_id {STR} NOT NULL DEFAULT ''`,
+		`CREATE INDEX ix_users_external ON users (external_id)`,
+	}},
+	// OU placement: an OU a person chose for one identity, and the placement field value it was chosen for.
+	{3, []string{
+		`ALTER TABLE identities {ADDCOL} ou_override {STR} NOT NULL DEFAULT ''`,
+		`ALTER TABLE identities {ADDCOL} ou_override_value {STR} NOT NULL DEFAULT ''`,
+	}},
+	// Correlation and manual people: the identity an account was handed to, a person's link decision, names and
+	// rejected accounts chosen by a person (side table: TEXT columns cannot have a default on every database), and
+	// people typed into the console.
+	{4, []string{
+		`ALTER TABLE identities {ADDCOL} merged_into {ID} NOT NULL DEFAULT ''`,
+		`ALTER TABLE identities {ADDCOL} link_decision {STR} NOT NULL DEFAULT ''`,
+		`CREATE TABLE identity_choices (
+			identity_id {ID} NOT NULL PRIMARY KEY,
+			name_override {TEXT} NOT NULL,
+			link_rejects {TEXT} NOT NULL,
+			updated_at {TS} NOT NULL){OPTS}`,
+		`CREATE TABLE manual_people (
+			id {ID} NOT NULL PRIMARY KEY,
+			source_id {ID} NOT NULL,
+			external_id {STR} NOT NULL,
+			attrs_json {TEXT} NOT NULL,
+			ended {INT} NOT NULL,
+			created_by {STR} NOT NULL,
+			created_at {TS} NOT NULL,
+			updated_by {STR} NOT NULL,
+			updated_at {TS} NOT NULL){OPTS}`,
+		`CREATE UNIQUE INDEX ux_manual_src_ext ON manual_people (source_id, external_id)`,
+	}},
 }
 
+// db2MigrationsExists checks the catalog: CREATE TABLE IF NOT EXISTS is not available on
+// every Db2 11.5 fix pack. Unquoted identifiers are stored upper case in SYSCAT.
+const db2MigrationsExists = `SELECT 1 FROM SYSCAT.TABLES WHERE TABSCHEMA = CURRENT SCHEMA AND TABNAME = 'SCHEMA_MIGRATIONS'`
+
+const createMigrations = `CREATE TABLE schema_migrations (version {INT} NOT NULL PRIMARY KEY, applied_at {TS} NOT NULL){OPTS}`
+
 func (s *Store) migrate(ctx context.Context) error {
-	var create string
-	if s.driver == DriverMSSQL {
+	create := ""
+	switch s.driver {
+	case DriverMSSQL:
 		create = `IF OBJECT_ID('schema_migrations','U') IS NULL CREATE TABLE schema_migrations (version {INT} NOT NULL PRIMARY KEY, applied_at {TS} NOT NULL)`
-	} else {
+	case DriverDB2:
+		var one int
+		err := s.db.QueryRowContext(ctx, db2MigrationsExists).Scan(&one)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			create = createMigrations
+		case err != nil:
+			return fmt.Errorf("check schema_migrations: %w", err)
+		}
+	default:
 		create = `CREATE TABLE IF NOT EXISTS schema_migrations (version {INT} NOT NULL PRIMARY KEY, applied_at {TS} NOT NULL){OPTS}`
 	}
-	if _, err := s.db.ExecContext(ctx, s.ddl(create)); err != nil {
-		return fmt.Errorf("create schema_migrations: %w", err)
+	if create != "" {
+		if _, err := s.db.ExecContext(ctx, s.ddl(create)); err != nil {
+			return fmt.Errorf("create schema_migrations: %w", err)
+		}
 	}
 
 	applied := map[int]bool{}

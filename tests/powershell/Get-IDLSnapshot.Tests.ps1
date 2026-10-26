@@ -60,6 +60,36 @@ Describe 'Get-IDLSnapshot.ps1' {
         $nested.parentOu | Should Be "OU=Deep,OU=Staff,$script:Root"
     }
 
+    It 'includeUnlinked also returns users without idAttribute (externalId ""), never computers; a non-boolean is exit 2' {
+        $users = @(
+            (New-StubUserEntry -Sam 'jdoe' -ExternalId 'E1001' -Attributes @{ givenName = 'Jane' }),
+            (New-StubUserEntry -Sam 'old.jane' -ExternalId '' -Attributes @{ givenName = 'Jane'; sn = 'Doe' } -Enabled $false),
+            (New-StubUserEntry -Sam 'PC01$' -ExternalId '' -ObjectClass 'computer'),
+            (New-StubUserEntry -Sam 'outside' -ExternalId '' -Ou "OU=Sales,$script:Root")
+        )
+        $state = New-StubStateFile -Users $users -Ous @("OU=Staff,$script:Root", "OU=Sales,$script:Root")
+        $request = @{ searchBases = @("OU=Staff,$script:Root"); idAttribute = 'employeeID'; properties = @('givenName', 'sn'); groups = @(); includeUnlinked = $true }
+        $r = Invoke-IDLScript -Script 'Get-IDLSnapshot' -Request $request -StatePath $state
+
+        $r.ExitCode | Should Be 0
+        (@($r.Json.users | ForEach-Object { $_.sam } | Sort-Object) -join ',') | Should Be 'jdoe,old.jane'
+        $old = @($r.Json.users | Where-Object { $_.sam -eq 'old.jane' })[0]
+        $old.externalId | Should Be ''
+        $old.enabled | Should Be $false
+        $old.attributes.sn | Should Be 'Doe'
+        @($r.Json.users | Where-Object { $_.sam -eq 'jdoe' })[0].externalId | Should Be 'E1001'
+        $r.LogText | Should Match '1 user\(s\) without employeeID included'
+
+        $request.includeUnlinked = $false
+        $r = Invoke-IDLScript -Script 'Get-IDLSnapshot' -Request $request -StatePath $state
+        (@($r.Json.users | ForEach-Object { $_.sam }) -join ',') | Should Be 'jdoe'
+
+        $request.includeUnlinked = 'yes'
+        $r = Invoke-IDLScript -Script 'Get-IDLSnapshot' -Request $request -StatePath $state
+        $r.ExitCode | Should Be 2
+        $r.Json.ok | Should Be $false
+    }
+
     It 'resolves groups (sAMAccountName and DN), reporting found and not found' {
         $state = New-SnapshotState
         $request = @{

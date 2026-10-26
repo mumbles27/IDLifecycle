@@ -61,6 +61,86 @@ func TestRenderRejectsDangerousTemplates(t *testing.T) {
 	}
 }
 
+func TestRegexFunctions(t *testing.T) {
+	data := map[string]string{"Phone": "(555) 010-9999", "Email": "Jane.Doe@Contoso.com", "Code": "DEPT-042-X"}
+	cases := map[string]string{
+		`{{ .Phone | regexReplace "[^0-9]" "" }}`:                        "5550109999",
+		`{{ regexReplace "^(\\w+)\\.(\\w+)@.*$" "$2, $1" .Email }}`:      "Doe, Jane",
+		`{{ regexFind "[0-9]+" .Code }}`:                                 "042",
+		`{{ regexFind "^([A-Z]+)-" .Code }}`:                             "DEPT", // first capture group
+		`{{ regexFind "zzz" .Code }}`:                                    "",
+		`{{ if regexMatch "^DEPT-" .Code }}dept{{ else }}other{{ end }}`: "dept",
+		`{{ if regexMatch "(?i)contoso\\.com$" .Email }}ours{{ end }}`:   "ours",
+		`{{ .Missing | regexReplace "x" "y" }}`:                          "",
+	}
+	for src, want := range cases {
+		got, err := Render(src, data)
+		if err != nil {
+			t.Errorf("%s: %v", src, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("%s: got %q want %q", src, got, want)
+		}
+	}
+	for _, bad := range []string{`{{ regexMatch "(" .Code }}`, `{{ regexFind "` + strings.Repeat("a", 300) + `" .Code }}`} {
+		if _, err := Render(bad, data); err == nil {
+			t.Errorf("%.40s: an invalid or oversized regex must fail the template", bad)
+		}
+	}
+}
+
+func TestPasswordTemplates(t *testing.T) {
+	data := map[string]string{"FirstName": "Jane", "LastName": "Doe", "EmployeeID": "100427"}
+	// random* exist only for passwords: account names and attributes must be stable between runs.
+	if _, err := Render(`{{ random 4 }}`, data); err == nil {
+		t.Error("random must not be available in ordinary templates")
+	}
+	if err := ValidateTemplate(`{{ random 4 }}`); err == nil {
+		t.Error("ValidateTemplate must refuse random")
+	}
+	if err := ValidatePasswordTemplate(`{{ random 4 }}{{ .X | upper }}`); err != nil {
+		t.Error(err)
+	}
+	src := `{{ upper (first .LastName 1) }}{{ lower (first .FirstName 1) }}{{ last .EmployeeID 4 }}!{{ random 6 }}{{ randomDigits 2 }}{{ randomSymbols 1 }}`
+	a, err := RenderPassword(src, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := RenderPassword(src, data)
+	if !strings.HasPrefix(a, "Dj0427!") || len(a) != 16 || a == b {
+		t.Errorf("password template: %q / %q", a, b)
+	}
+	if err := CheckInitialPassword(a, "jdoe"); err != nil {
+		t.Error(err)
+	}
+	for _, n := range []string{"0", "65"} {
+		if _, err := RenderPassword(`{{ random `+n+` }}`, data); err == nil {
+			t.Errorf("random %s must be refused", n)
+		}
+	}
+
+	checks := map[string]string{
+		"Ab1!":                     "at least 8",
+		"abcdefgh1":                "2 of the 4",
+		"Welcome-jdoe-2026":        "account name",
+		strings.Repeat("Aa1!", 33): "longer than 128",
+	}
+	for pw, want := range checks {
+		err := CheckInitialPassword(pw, "JDoe")
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%.20s: got %v, want %q", pw, err, want)
+			continue
+		}
+		if strings.Contains(err.Error(), pw) {
+			t.Errorf("the check message must never contain the password: %v", err)
+		}
+	}
+	if err := CheckInitialPassword("Welcome-2026", "ab"); err != nil {
+		t.Errorf("a two-letter account name is not checked (AD ignores it too): %v", err)
+	}
+}
+
 func TestSanitizers(t *testing.T) {
 	if got := SanitizeSam(`Jé"ane.Do/e [x]@y .`, 20); got != "Jeane.Doexy" {
 		t.Errorf("sam: %q", got)
@@ -215,7 +295,8 @@ func TestNamingCandidates(t *testing.T) {
 	s := model.DefaultSettings()
 	s.AD.UPNSuffix = "corp.example.com"
 	s.Naming.MaxCandidates = 3
-	c, err := namingCandidates(s, map[string]string{"FirstName": "Jane", "LastName": "Doe"})
+	s.Naming.ConflictMode = model.ConflictNumber
+	c, err := namingCandidates(s, map[string]string{"FirstName": "Jane", "LastName": "Doe"}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +307,7 @@ func TestNamingCandidates(t *testing.T) {
 		t.Errorf("collision candidates: %+v", c)
 	}
 
-	long, _ := namingCandidates(s, map[string]string{"FirstName": "Jane", "LastName": "Wolfeschlegelsteinhausenbergerdorff"})
+	long, _ := namingCandidates(s, map[string]string{"FirstName": "Jane", "LastName": "Wolfeschlegelsteinhausenbergerdorff"}, true)
 	for _, x := range long {
 		if len(x.Sam) > 20 {
 			t.Errorf("sam too long: %q", x.Sam)
@@ -236,8 +317,41 @@ func TestNamingCandidates(t *testing.T) {
 		t.Errorf("suffix must survive truncation: %q", long[1].Sam)
 	}
 
-	if _, err := namingCandidates(s, map[string]string{"FirstName": "Jane"}); err == nil {
+	if _, err := namingCandidates(s, map[string]string{"FirstName": "Jane"}, true); err == nil {
 		t.Error("missing last name must produce a clear error rather than the account 'j'")
+	}
+	if c[0].Mail != "" {
+		t.Errorf("no mail template, no mail: %+v", c[0])
+	}
+}
+
+func TestNamingCandidatesMail(t *testing.T) {
+	s := model.DefaultSettings()
+	s.AD.UPNSuffix = "corp.example.com"
+	s.Naming.MaxCandidates = 2
+	s.Naming.ConflictMode = model.ConflictNumber
+	s.Naming.MailTemplate = `{{ .FirstName | lower | ascii }}.{{ .LastName | lower | regexReplace "[^a-z]" "" }}`
+	src := map[string]string{"FirstName": "José", "LastName": "O'Neil"}
+	c, err := namingCandidates(s, src, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Same collision number as sAMAccountName/UPN; the domain defaults to the UPN suffix.
+	if c[0].Mail != "jose.oneil@corp.example.com" || c[1].Mail != "jose.oneil2@corp.example.com" {
+		t.Errorf("mail candidates: %+v", c)
+	}
+	s.Naming.MailDomain = "mail.example.org"
+	c, _ = namingCandidates(s, src, true)
+	if c[0].Mail != "jose.oneil@mail.example.org" {
+		t.Errorf("mail domain: %q", c[0].Mail)
+	}
+	// A mapping that writes mail owns it.
+	if c, _ = namingCandidates(s, src, false); c[0].Mail != "" {
+		t.Errorf("mail must be left to the mapping: %q", c[0].Mail)
+	}
+	s.Naming.MailTemplate = `{{ .Nope }}`
+	if _, err := namingCandidates(s, src, true); err == nil || !strings.Contains(err.Error(), "mail_template rendered empty") {
+		t.Errorf("empty mail must be a clear error: %v", err)
 	}
 }
 
@@ -258,6 +372,14 @@ func TestSettingsValidation(t *testing.T) {
 		"pwlen":     func(s *model.Settings) { s.NewUser.PasswordLength = 8 },
 		"tmpl":      func(s *model.Settings) { s.Naming.SamTemplate = "" },
 		"delete":    func(s *model.Settings) { s.Engine.DeleteAfterDays = -1 },
+		"pwmode":    func(s *model.Settings) { s.NewUser.PasswordMode = "fixed" },
+		"pwtmpl": func(s *model.Settings) {
+			s.NewUser.PasswordMode, s.NewUser.PasswordTemplate = model.PasswordModeTemplate, " "
+		},
+		"maildom": func(s *model.Settings) { s.Naming.MailTemplate, s.AD.UPNSuffix = "{{ .FirstName }}", "" },
+		"maildom2": func(s *model.Settings) {
+			s.Naming.MailTemplate, s.Naming.MailDomain = "{{ .FirstName }}", "not a domain"
+		},
 	}
 	for name, mut := range muts {
 		c := model.DefaultSettings()
@@ -265,6 +387,19 @@ func TestSettingsValidation(t *testing.T) {
 		if err := c.Validate(); err == nil {
 			t.Errorf("%s: expected validation error", name)
 		}
+	}
+	// A template password must be changed at first sign-in, whatever the checkbox says; an old document without a
+	// mode is random.
+	tm := model.DefaultSettings()
+	tm.NewUser.PasswordMode, tm.NewUser.ChangePasswordAtLogon = model.PasswordModeTemplate, false
+	if err := tm.Validate(); err != nil || !tm.NewUser.ChangePasswordAtLogon {
+		t.Errorf("template mode must force change at logon: %v %v", err, tm.NewUser.ChangePasswordAtLogon)
+	}
+	old := model.DefaultSettings()
+	old.NewUser.PasswordMode = ""
+	old.Naming.MailTemplate, old.Naming.MailDomain = "{{ .FirstName }}", "@corp.example.com"
+	if err := old.Validate(); err != nil || old.NewUser.PasswordMode != model.PasswordModeRandom || old.Naming.MailDomain != "corp.example.com" {
+		t.Errorf("defaults filled in: %v %+v %+v", err, old.NewUser, old.Naming)
 	}
 	if model.DefaultSettings().ReadyForLive() == "" {
 		t.Error("defaults must not be ready for live mode until AD settings are filled in")

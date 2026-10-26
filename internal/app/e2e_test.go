@@ -62,14 +62,24 @@ func TestGUIEndToEndInHeadlessBrowser(t *testing.T) {
 	s.AD.SearchBases = []string{"OU=Staff,DC=corp,DC=test"}
 	s.AD.DefaultOU = "OU=Staff,DC=corp,DC=test"
 	s.AD.UPNSuffix = "corp.test"
+	s.Correlate.Enabled = true // default rules: first + last name required
 	_ = st.SaveSettings(ctx, s, "e2e")
+
+	// Fixtures for the identity scenarios: a taken username (Carl Name -> cname), a person with two possible accounts
+	// (Maria Lopez) and an account nobody matches (kiosk01).
+	fake.AddUser(ad.FakeUser{DN: "CN=Carl Other,OU=Elsewhere,DC=corp,DC=test", Sam: "cname", UPN: "carl.other@corp.test", Enabled: true})
+	for _, sam := range []string{"mlopez", "mlopez2"} {
+		fake.AddUser(ad.FakeUser{DN: "CN=Maria Lopez " + sam + ",OU=Staff,DC=corp,DC=test", Sam: sam, UPN: sam + "@corp.test", Enabled: true,
+			Attrs: map[string]string{"givenName": "Maria", "sn": "Lopez"}})
+	}
+	fake.AddUser(ad.FakeUser{DN: "CN=kiosk01,OU=Staff,DC=corp,DC=test", Sam: "kiosk01", UPN: "kiosk01@corp.test", Enabled: true})
 
 	dir := t.TempDir()
 	seedCSV := filepath.Join(dir, "seed.csv")
-	_ = os.WriteFile(seedCSV, []byte("EmployeeID,FirstName,LastName\nE1,Jane,Doe\nE2,Bob,Smith\n"), 0o600)
+	_ = os.WriteFile(seedCSV, []byte("EmployeeID,FirstName,LastName\nE1,Jane,Doe\nE2,Bob,Smith\nE3,Carl,Name\nE5,Maria,Lopez\n"), 0o600)
 	_ = st.CreateSource(ctx, model.Source{ID: "seed", Name: "seed", Type: "csv", Enabled: true, CreatedAt: time.Now(), UpdatedAt: time.Now(),
 		Options: model.SourceOptions{ExternalIDField: "EmployeeID"}, Config: map[string]any{"path": seedCSV}})
-	if run, err := eng.RunNow(ctx, "e2e", "e2e"); err != nil || run.Counters["pending"] != 2 {
+	if run, err := eng.RunNow(ctx, "e2e", "e2e"); err != nil || run.Counters["pending"] != 4 {
 		t.Fatalf("seed run: %v %+v", err, run)
 	}
 	uiCSV := filepath.Join(dir, "selftest.csv")

@@ -1,5 +1,5 @@
 // Package store implements persistence on top of database/sql for SQLite,
-// PostgreSQL, SQL Server and MySQL/MariaDB using one set of portable SQL.
+// PostgreSQL, SQL Server, MySQL/MariaDB and IBM Db2 (via ODBC) using one set of portable SQL.
 package store
 
 import (
@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"idlifecycle/internal/connstr"
+
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "github.com/microsoft/go-mssqldb"
@@ -25,6 +27,7 @@ const (
 	DriverPostgres = "postgres"
 	DriverMSSQL    = "mssql"
 	DriverMySQL    = "mysql"
+	DriverDB2      = "db2" // IBM Db2 LUW 11.5+ through ODBC; the DSN is an ODBC connection string
 )
 
 var (
@@ -41,8 +44,21 @@ type Store struct {
 	auditKey []byte
 }
 
-// Open connects to the database and applies pending migrations.
-func Open(ctx context.Context, driver, dsn string) (*Store, error) {
+// openDB is sql.Open; tests replace it to inject driver errors.
+var openDB = sql.Open
+
+// connectLimit bounds the first connection (and, for db2, is the driver's ConnectTimeout).
+const connectLimit = connstr.DB2ConnectTimeout * time.Second
+
+// Open connects to the database and applies pending migrations. Errors are scrubbed of the
+// DSN and any password in it, so neither the check command nor the service log can echo one.
+func Open(ctx context.Context, driver, dsn string) (st *Store, err error) {
+	orig := dsn
+	defer func() {
+		if err != nil {
+			err = connstr.Scrub(connstr.Scrub(err, dsn), orig)
+		}
+	}()
 	sqlName, err := sqlDriverName(driver)
 	if err != nil {
 		return nil, err
@@ -58,9 +74,13 @@ func Open(ctx context.Context, driver, dsn string) (*Store, error) {
 			}
 			dsn += sep + "clientFoundRows=true&parseTime=false"
 		}
+	case DriverDB2:
+		if dsn, err = db2DSN(dsn); err != nil {
+			return nil, fmt.Errorf("db2: %w", err)
+		}
 	}
 
-	db, err := sql.Open(sqlName, dsn)
+	db, err := openDB(sqlName, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", driver, err)
 	}
@@ -73,9 +93,15 @@ func Open(ctx context.Context, driver, dsn string) (*Store, error) {
 		db.SetConnMaxLifetime(30 * time.Minute)
 	}
 
-	pingCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-	if err := db.PingContext(pingCtx); err != nil {
+	if driver == DriverDB2 {
+		// PingContext does not bound an ODBC connect (see connstr.BoundedPing).
+		err = connstr.BoundedPing(ctx, db, connstr.Key(dsn), connectLimit, "check Hostname/Port and that the Db2 server is up")
+	} else {
+		pingCtx, cancel := context.WithTimeout(ctx, connectLimit)
+		err = db.PingContext(pingCtx)
+		cancel()
+	}
+	if err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("connect %s: %w", driver, err)
 	}
@@ -98,8 +124,21 @@ func sqlDriverName(driver string) (string, error) {
 		return "sqlserver", nil
 	case DriverMySQL:
 		return "mysql", nil
+	case DriverDB2:
+		if !odbcAvailable {
+			return "", fmt.Errorf("database driver %q needs the ODBC driver, which this build only links on Windows (cgo is disabled)", driver)
+		}
+		return "odbc", nil
 	}
-	return "", fmt.Errorf("unsupported database driver %q (use sqlite, postgres, mssql or mysql)", driver)
+	return "", fmt.Errorf("unsupported database driver %q (use sqlite, postgres, mssql, mysql or db2)", driver)
+}
+
+// db2DSN appends the IBM CLI keywords the ODBC driver package needs (LongDataCompat=1,
+// MapCharToWChar=1, ConnectTimeout=20) unless the operator already set them, and refuses
+// MapCharToWChar=0: non-ASCII text would be garbled and break the audit hashes. See
+// connstr.AugmentDB2.
+func db2DSN(dsn string) (string, error) {
+	return connstr.AugmentDB2(dsn, connstr.DB2ConnectTimeout)
 }
 
 func sqliteDSN(dsn string) string {
@@ -109,6 +148,9 @@ func sqliteDSN(dsn string) string {
 	}
 	return dsn + sep + "_pragma=busy_timeout(10000)&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)"
 }
+
+// AuditKeyLabel derives the audit-chain HMAC key from the master key (secrets.Cipher.Derive).
+const AuditKeyLabel = "audit-chain-v1"
 
 // SetAuditKey makes the audit hash chain an HMAC, so editing history needs the key as well as DB write access.
 // Set it once at startup, before any audit entry is written.
@@ -120,7 +162,7 @@ func (s *Store) Close() error   { return s.db.Close() }
 // Ping verifies the database is reachable.
 func (s *Store) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
 
-// rebind converts ? placeholders to the driver's style.
+// rebind converts ? placeholders to the driver's style (sqlite, mysql and db2/ODBC use ? natively).
 func (s *Store) rebind(q string) string {
 	var prefix string
 	switch s.driver {
@@ -149,8 +191,13 @@ func (s *Store) rebind(q string) string {
 // The caller must have an ORDER BY (required by SQL Server).
 func (s *Store) pageClause(p Page) (string, []any) {
 	p = p.normalized()
-	if s.driver == DriverMSSQL {
+	switch s.driver {
+	case DriverMSSQL:
 		return " OFFSET ? ROWS FETCH NEXT ? ROWS ONLY", []any{p.Offset, p.Limit}
+	case DriverDB2:
+		// Integer literals (bounded by normalized(), never user text): IBM documents the row
+		// counts as expressions but not whether an untyped ? is accepted there; literals always are.
+		return " OFFSET " + strconv.Itoa(p.Offset) + " ROWS FETCH FIRST " + strconv.Itoa(p.Limit) + " ROWS ONLY", nil
 	}
 	return " LIMIT ? OFFSET ?", []any{p.Limit, p.Offset}
 }
@@ -198,7 +245,10 @@ func IsUniqueViolation(err error) bool {
 		strings.Contains(m, "duplicate key") || // postgres, mssql
 		strings.Contains(m, "duplicate entry") || // mysql
 		strings.Contains(m, "violation of primary key") ||
-		strings.Contains(m, "constraint failed: unique")
+		strings.Contains(m, "constraint failed: unique") ||
+		strings.Contains(m, "sql0803n") || // db2: "SQL0803N ... SQLSTATE=23505"
+		strings.Contains(m, "{23505}") || // db2 via ODBC diag record "{23505} [IBM][CLI Driver]..."
+		strings.Contains(m, "sqlstate=23505")
 }
 
 // ---- time + json helpers -------------------------------------------------
@@ -292,22 +342,58 @@ func (w *where) sql() string {
 	return " WHERE " + strings.Join(w.parts, " AND ")
 }
 
+// db2LikeMax caps search text on Db2 so the escaped, %-wrapped pattern stays under
+// the 32672-byte LIKE pattern limit (<=4 bytes per char in UTF-8, x2 for escapes).
+const db2LikeMax = 4000
+
+// notLike adds the negation of like: none of cols contains q.
+func (w *where) notLike(driver, q string, cols ...string) {
+	inner := &where{}
+	inner.like(driver, q, cols...)
+	if len(inner.parts) == 0 {
+		return
+	}
+	w.parts = append(w.parts, "NOT "+inner.parts[0])
+	w.args = append(w.args, inner.args...)
+}
+
 // like adds a case-insensitive substring match across columns (escape char is '!').
-func (w *where) like(q string, cols ...string) {
+func (w *where) like(driver, q string, cols ...string) {
 	q = strings.TrimSpace(q)
 	if q == "" || len(cols) == 0 {
 		return
 	}
-	pat := "%" + likeEscape(strings.ToLower(q)) + "%"
+	if driver == DriverDB2 {
+		if r := []rune(q); len(r) > db2LikeMax {
+			q = string(r[:db2LikeMax])
+		}
+	}
+	pat := "%" + likeEscape(driver, strings.ToLower(q)) + "%"
 	ors := make([]string, len(cols))
 	for i, c := range cols {
-		ors[i] = "LOWER(" + c + ") LIKE ? ESCAPE '!'"
+		if driver == DriverDB2 {
+			// SYSIBM.LOWER is not documented for CLOB and a LIKE pattern may not be a CLOB,
+			// so CLOB columns are cast to VARCHAR and the pattern marker is typed explicitly.
+			col := c
+			if isTextColumn(c) {
+				col = "CAST(" + c + " AS VARCHAR(32672))"
+			}
+			ors[i] = "LOWER(" + col + ") LIKE CAST(? AS VARCHAR(32672)) ESCAPE '!'"
+		} else {
+			ors[i] = "LOWER(" + c + ") LIKE ? ESCAPE '!'"
+		}
 		w.args = append(w.args, pat)
 	}
 	w.parts = append(w.parts, "("+strings.Join(ors, " OR ")+")")
 }
 
-func likeEscape(s string) string {
+// likeEscape escapes LIKE wildcards with '!'. '[' is a wildcard only on SQL Server. Db2
+// rejects an escape character followed by anything other than %, _ or itself
+// (SQLSTATE 22025), so it must never see "![". The other dialects read "![" as a literal '['.
+func likeEscape(driver, s string) string {
+	if driver == DriverDB2 {
+		return strings.NewReplacer("!", "!!", "%", "!%", "_", "!_").Replace(s)
+	}
 	r := strings.NewReplacer("!", "!!", "%", "!%", "_", "!_", "[", "![")
 	return r.Replace(s)
 }

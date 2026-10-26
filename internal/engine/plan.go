@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -102,6 +101,8 @@ type PlanContext struct {
 	UserDNByExt  map[string]string // external id -> DN (for user_ref attributes)
 	Now          time.Time
 	MappingProps []string // properties to fetch from AD
+	// Links are correlation proposals by identity id (people without an account by id attribute).
+	Links map[string]*model.LinkPayload
 }
 
 // Planned is the planner's output for one identity.
@@ -113,6 +114,10 @@ type Planned struct {
 	Payload  model.ChangePayload
 	Summary  []string
 	Warnings []string
+
+	place   Placement         // create: where the OU came from (for the summary)
+	tail    []string          // create: summary lines after the "Create account" line
+	renames []model.Candidate // link: names to try when the account is renamed (the name check picks the first free one)
 }
 
 // PlanIdentity decides what (if anything) must change for one person. acct is nil when no AD account is linked.
@@ -143,13 +148,20 @@ func PlanIdentity(pc *PlanContext, id model.Identity, acct *ad.User) (*Planned, 
 
 	groupDNs, w := resolveGroups(pc, res.Groups)
 	warnings = append(warnings, w...)
-	targetOU := orStr(res.OU, pc.Settings.AD.DefaultOU)
+	place := ResolvePlacement(pc.Settings, id, res.OU)
+	if place.Reason != "" && !place.Needs && (acct == nil || !acct.Enabled) {
+		warnings = append(warnings, place.Reason)
+	}
 
 	if acct == nil {
 		if !id.Active {
 			return nil, warnings, nil
 		}
-		p, err := planCreate(pc, id, maps, desired, groupDNs, targetOU)
+		if lp := pc.Links[id.ID]; lp != nil {
+			p, err := planLink(pc, id, maps, lp)
+			return p, warnings, err
+		}
+		p, err := planCreate(pc, id, maps, desired, groupDNs, place)
 		return p, warnings, err
 	}
 
@@ -157,9 +169,9 @@ func PlanIdentity(pc *PlanContext, id model.Identity, acct *ad.User) (*Planned, 
 		return planDeactivate(pc, id, acct), warnings, nil
 	}
 	if !acct.Enabled {
-		return planEnable(pc, acct, groupDNs, targetOU), warnings, nil
+		return planEnable(pc, acct, groupDNs, place.OU), warnings, nil
 	}
-	return planUpdate(pc, id, acct, maps, desired, groupDNs, targetOU), warnings, nil
+	return planUpdate(pc, id, acct, maps, desired, groupDNs, place), warnings, nil
 }
 
 type rendered struct {
@@ -218,69 +230,98 @@ func parentDN(dn string) string {
 	return ""
 }
 
-func planCreate(pc *PlanContext, id model.Identity, maps []effective, desired map[string]rendered, groupDNs []string, ou string) (*Planned, error) {
-	if ou == "" {
-		return nil, fmt.Errorf("no target OU: set ad.default_ou or a role rule OU")
+func planCreate(pc *PlanContext, id model.Identity, maps []effective, desired map[string]rendered, groupDNs []string, place Placement) (*Planned, error) {
+	ou := place.OU
+	if ou == "" && !place.Needs {
+		return nil, fmt.Errorf("no target OU: set ad.default_ou, a role rule OU or an OU placement rule")
 	}
 	attrs := map[string]string{}
+	mailMapped := false
 	for _, m := range maps {
 		r := desired[strings.ToLower(m.Attr)]
 		if r.OK && r.Value != "" {
 			attrs[m.Attr] = r.Value
 		}
+		if strings.EqualFold(m.Attr, "mail") {
+			mailMapped = true // a mapping owns mail (and keeps it in sync); the naming template is not used
+		}
 	}
 
-	cands, err := namingCandidates(pc.Settings, id.Attrs)
+	cands, err := identityCandidates(pc.Settings, id, !mailMapped)
 	if err != nil {
 		return nil, err
 	}
 
-	p := &Planned{Type: model.ChangeCreate, Payload: model.ChangePayload{OU: ou, Candidates: cands, Attributes: attrs, Groups: groupDNs}}
-	p.Summary = append(p.Summary, fmt.Sprintf("Create account %q (%s) in %s", cands[0].Sam, cands[0].CN, ou))
+	p := &Planned{Type: model.ChangeCreate, Payload: model.ChangePayload{OU: ou, Candidates: cands, Attributes: attrs, Groups: groupDNs}, place: place}
+	if pc.Settings.Placement.Enabled {
+		p.Payload.Placement = place.Value
+	}
+	if place.Needs {
+		p.Payload.NeedsOU, p.Payload.OUReason = true, place.Reason
+	}
 	for _, k := range sortedKeys(attrs) {
-		p.Summary = append(p.Summary, fmt.Sprintf("Set %s = %q", k, attrs[k]))
+		p.tail = append(p.tail, fmt.Sprintf("Set %s = %q", k, attrs[k]))
 	}
 	for _, g := range groupDNs {
-		p.Summary = append(p.Summary, "Add to group "+shortCN(g))
+		p.tail = append(p.tail, "Add to group "+shortCN(g))
 	}
+	p.summarizeCreate()
 	return p, nil
 }
 
-func namingCandidates(s model.Settings, attrs map[string]string) ([]model.Candidate, error) {
-	n := s.Naming
-	sam, err := Render(n.SamTemplate, attrs)
-	if err != nil {
-		return nil, fmt.Errorf("naming.sam_template: %w", err)
+// summarizeCreate (re)builds a create's summary; the name check calls it again after dropping taken names.
+func (p *Planned) summarizeCreate() {
+	pl := p.Payload
+	var s []string
+	if pl.NeedsName {
+		s = append(s, "Choose a username: "+conflictText(pl.NameConflicts))
 	}
-	upn, err := Render(n.UPNTemplate, attrs)
-	if err != nil {
-		return nil, fmt.Errorf("naming.upn_template: %w", err)
+	if pl.NeedsOU {
+		s = append(s, "Choose an OU: "+pl.OUReason)
 	}
-	cn, err := Render(n.CNTemplate, attrs)
-	if err != nil {
-		return nil, fmt.Errorf("naming.cn_template: %w", err)
-	}
-	sam = SanitizeSam(sam, 64)
-	upn = SanitizeUPNLocal(upn)
-	cn = SanitizeCN(cn)
-	if sam == "" || upn == "" || cn == "" {
-		return nil, fmt.Errorf("cannot generate account names (sam=%q upn=%q cn=%q): the naming templates rendered empty; check the source has the attributes they use", sam, upn, cn)
-	}
-
-	var out []model.Candidate
-	for i := 0; i < n.MaxCandidates; i++ {
-		suffix, cnSuffix := "", ""
-		if i > 0 {
-			suffix = strconv.Itoa(i + 1)
-			cnSuffix = " " + suffix
+	who := "account (username chosen at approval)"
+	if !pl.NeedsName && len(pl.Candidates) > 0 {
+		who = fmt.Sprintf("account %q (%s)", pl.Candidates[0].Sam, pl.Candidates[0].CN)
+		if pl.Candidates[0].Mail != "" {
+			who += ", mail " + pl.Candidates[0].Mail
 		}
-		out = append(out, model.Candidate{
-			Sam: headRunes(sam, 20-len(suffix)) + suffix,
-			UPN: upn + suffix + "@" + s.AD.UPNSuffix,
-			CN:  headRunes(cn, 64-len(cnSuffix)) + cnSuffix,
-		})
 	}
-	return out, nil
+	if pl.NeedsOU {
+		s = append(s, "Create "+who+" in the OU chosen at approval")
+	} else {
+		s = append(s, fmt.Sprintf("Create %s in %s%s", who, pl.OU, placementNote(p.place)))
+	}
+	p.Summary = append(s, p.tail...)
+}
+
+// conflictText describes taken names for a summary line.
+func conflictText(cs []model.NameConflict) string {
+	parts := make([]string, 0, len(cs))
+	for _, c := range cs {
+		by := c.DN
+		if c.With != "" {
+			by = "also planned for " + c.With
+		}
+		parts = append(parts, fmt.Sprintf("%s %q is taken (%s)", nameFieldLabel(c.Field), c.Value, by))
+	}
+	if len(parts) == 0 {
+		return "every generated name is taken"
+	}
+	return strings.Join(parts, "; ")
+}
+
+func nameFieldLabel(f string) string {
+	switch f {
+	case "sam":
+		return "sAMAccountName"
+	case "upn":
+		return "UPN"
+	case "mail":
+		return "mail"
+	case "cn":
+		return "name (CN)"
+	}
+	return f
 }
 
 func planDeactivate(pc *PlanContext, id model.Identity, acct *ad.User) *Planned {
@@ -329,7 +370,8 @@ func planEnable(pc *PlanContext, acct *ad.User, groupDNs []string, ou string) *P
 	return p
 }
 
-func planUpdate(pc *PlanContext, id model.Identity, acct *ad.User, maps []effective, desired map[string]rendered, groupDNs []string, ou string) *Planned {
+func planUpdate(pc *PlanContext, id model.Identity, acct *ad.User, maps []effective, desired map[string]rendered, groupDNs []string, place Placement) *Planned {
+	ou := place.OU
 	p := &Planned{Type: model.ChangeUpdate, Payload: model.ChangePayload{ObjectGUID: acct.ObjectGUID, DN: acct.DN, Set: map[string]model.AttrDiff{}}}
 	var observed map[string]string
 
@@ -403,6 +445,27 @@ func planUpdate(pc *PlanContext, id model.Identity, acct *ad.User, maps []effect
 		p.Summary = append(p.Summary, fmt.Sprintf("Move %s -> %s", parentDN(acct.DN), ou))
 	}
 
+	// OU placement: move the account when the placement field (department) changed - and only then, so an OU
+	// someone set by hand in AD is left alone otherwise. The first time an account is seen, its value is recorded.
+	if pl := pc.Settings.Placement; pl.Enabled && pl.MoveOnChange {
+		last, seen := appliedValue(id.Applied, placementKey)
+		switch {
+		case !seen:
+			observed = withObserved(observed, placementKey, place.Value)
+		case strings.EqualFold(strings.TrimSpace(last), place.Value):
+		case place.Needs:
+			p.Payload.NeedsOU, p.Payload.OUReason, p.Payload.Placement = true, place.Reason, place.Value
+			p.Summary = append(p.Summary, fmt.Sprintf("Choose an OU: %s changed from %q to %q and %s", pl.Field, last, place.Value, place.Reason))
+		case !strings.EqualFold(parentDN(acct.DN), ou):
+			if p.Payload.MoveTo == "" { // enforce_ou may already have planned this move
+				p.Summary = append(p.Summary, fmt.Sprintf("Move %s -> %s (%s changed from %q to %q)%s", parentDN(acct.DN), ou, pl.Field, last, place.Value, placementNote(place)))
+			}
+			p.Payload.MoveTo, p.Payload.Placement = ou, place.Value
+		default:
+			observed = withObserved(observed, placementKey, place.Value) // already in the right OU
+		}
+	}
+
 	if len(p.Summary) == 0 {
 		if len(observed) == 0 {
 			return nil
@@ -431,4 +494,27 @@ func sortedKeys[V any](m map[string]V) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+func withObserved(m map[string]string, k, v string) map[string]string {
+	if m == nil {
+		m = map[string]string{}
+	}
+	m[k] = v
+	return m
+}
+
+// placementNote says where an OU came from, for the change summary.
+func placementNote(p Placement) string {
+	switch p.Source {
+	case "override":
+		return " (OU chosen for this person)"
+	case "rule":
+		return fmt.Sprintf(" (OU placement rule for %q)", p.Value)
+	case "default":
+		if p.Reason != "" {
+			return " (" + p.Reason + ")"
+		}
+	}
+	return ""
 }

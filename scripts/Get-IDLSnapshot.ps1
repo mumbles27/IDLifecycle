@@ -8,7 +8,8 @@
 
     Request:
       {"server":"", "searchBases":["OU=Staff,DC=corp,DC=example,DC=com"], "idAttribute":"employeeID",
-       "properties":["givenName","sn","title"], "groups":["GG-AllStaff","CN=Marketing,OU=Groups,DC=..."]}
+       "properties":["givenName","sn","title"], "groups":["GG-AllStaff","CN=Marketing,OU=Groups,DC=..."],
+       "includeUnlinked":false}
 
     Response (ok:true):
       {"ok":true,
@@ -16,7 +17,10 @@
        "groups":[{"identity","dn","found"}]}
 
     Users are every user under the search bases whose idAttribute is populated (enabled or not), fetched with
-    one LDAP query per search base and only the properties that are needed. Groups may be given as
+    one LDAP query per search base and only the properties that are needed. With "includeUnlinked": true the
+    users whose idAttribute is empty are returned as well, with "externalId": "" (computer and managed service
+    account objects are left out);
+    the service uses them to correlate people with accounts that existed before it. Groups may be given as
     sAMAccountName or DN and are resolved in bulk. Attribute values are strings (null when unset).
 
     On failure the response is {"ok":false,"error":"..."} with a non-zero exit code.
@@ -69,7 +73,17 @@ try{
     }
 
     $groupIdentities = Get-IDLStringList -Value (Get-IDLField -Object $request -Name 'groups')
-    Write-IDLLog ("Request: server='{0}' idAttribute={1} searchBases={2} properties={3} groups={4}" -f $server, $idAttribute, $searchBases.Count, $properties.Count, $groupIdentities.Count)
+
+    $includeUnlinked = Get-IDLField -Object $request -Name 'includeUnlinked'
+    if (
+        ($null -ne $includeUnlinked) -and
+        ($includeUnlinked -isnot [bool])
+    ){
+        throw (New-IDLException -Kind Input -Message 'includeUnlinked must be true or false.')
+    }
+
+    $includeUnlinked = [bool]$includeUnlinked
+    Write-IDLLog ("Request: server='{0}' idAttribute={1} searchBases={2} properties={3} groups={4} includeUnlinked={5}" -f $server, $idAttribute, $searchBases.Count, $properties.Count, $groupIdentities.Count, $includeUnlinked)
 
     # ---- Phase: dependencies and connection ----
     try{
@@ -89,13 +103,15 @@ try{
     # ---- Phase: users ----
     $phase = Start-IDLPhase -Name 'Query users'
     $fetchProperties = [string[]]@(@($idAttribute) + $properties + @('memberOf') | Select-Object -Unique)
-    $filter = '({0}=*)' -f $idAttribute
+    # includeUnlinked: every user (for correlation with existing accounts), otherwise only linked ones.
+    $filter = (($includeUnlinked) ? ('(sAMAccountName=*)') : ('({0}=*)' -f $idAttribute))
     $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $users = [System.Collections.Generic.List[object]]::new()
+    $unlinked = 0
 
     foreach ($base in $searchBases){
         $found = @(Get-ADUser -LDAPFilter $filter -SearchBase $base -SearchScope Subtree -Properties $fetchProperties -ResultPageSize 1000 @serverParams)
-        Write-IDLLog "Search base '$base': $($found.Count) user(s) with $idAttribute populated"
+        Write-IDLLog "Search base '$base': $($found.Count) user(s)$((($includeUnlinked)) ? ('') : (" with $idAttribute populated"))"
 
         foreach ($user in $found){
             $guid = ([guid]$user.ObjectGUID).ToString()
@@ -105,7 +121,17 @@ try{
 
             $externalId = Get-IDLAdValue -Object $user -Name $idAttribute
             if ($null -eq $externalId){
-                continue
+                # Only person accounts are offered for correlation (a computer object is a "user" in LDAP terms).
+                $class = $user.PSObject.Properties['ObjectClass']
+                if (
+                    (-not $includeUnlinked) -or
+                    (($null -ne $class) -and ([string]$class.Value -match '^(?i)(computer|msDS-.*)$'))
+                ){
+                    continue
+                }
+
+                $externalId = ''
+                $unlinked++
             }
 
             $attributes = [ordered]@{}
@@ -128,6 +154,10 @@ try{
     }
 
     Add-IDLCounter -Name 'Total' -By $users.Count
+    if ($includeUnlinked){
+        Write-IDLLog "$unlinked user(s) without $idAttribute included"
+    }
+
     Stop-IDLPhase -Phase $phase
 
     # ---- Phase: groups ----

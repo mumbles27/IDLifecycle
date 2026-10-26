@@ -29,9 +29,15 @@ type Fake struct {
 	// FailExternal makes every action for that external id fail with the given message.
 	FailExternal map[string]string
 	SnapshotErr  error
+	SchemaAttrs  []SchemaAttribute // returned by Schema (BuiltinUserAttributes when nil)
+	SchemaErr    error
 	ActionErr    error // returned for every action call (simulates exit 4 etc.)
 	Calls        []string
-	Passwords    []string // passwords received by Create, for assertions
+	Passwords    []string          // passwords received by Create, for assertions
+	MustChange   []bool            // ChangePasswordAtLogon received by Create, in the same order
+	OUList       []string          // OUs reported by OUs (AddOU)
+	MailObjects  map[string]string // lower(mail) -> DN of contacts/groups holding the address (AddMailObject)
+	NamesErr     error             // returned by CheckNames
 	guid         int
 }
 
@@ -137,7 +143,7 @@ func (f *Fake) Snapshot(_ context.Context, req SnapshotRequest) (*Snapshot, erro
 	sort.Strings(guids)
 	for _, g := range guids {
 		u := f.Users[g]
-		if u.External == "" {
+		if u.External == "" && !req.IncludeUnlinked {
 			continue
 		}
 		in := len(req.SearchBases) == 0
@@ -245,6 +251,7 @@ func (f *Fake) Create(_ context.Context, o ActionOpts, items []CreateItem) ([]Re
 	var out []Result
 	for _, it := range items {
 		f.Passwords = append(f.Passwords, it.Password)
+		f.MustChange = append(f.MustChange, it.ChangePasswordAtLogon)
 		if r, bad := f.failFor(it.ExternalID, it.ChangeID); bad {
 			out = append(out, r)
 			continue
@@ -256,15 +263,15 @@ func (f *Fake) Create(_ context.Context, o ActionOpts, items []CreateItem) ([]Re
 			}
 		}
 		{
-			var chosen *struct{ sam, upn, cn string }
+			var chosen *struct{ sam, upn, cn, mail string }
 			for _, c := range it.Candidates {
-				if !f.samTaken(c.Sam) && !f.upnTaken(c.UPN) && !f.cnTaken(it.OU, c.CN) {
-					chosen = &struct{ sam, upn, cn string }{c.Sam, c.UPN, c.CN}
+				if mailDN, _ := f.mailOwner(c.Mail, nil); !f.samTaken(c.Sam) && !f.upnTaken(c.UPN) && !f.cnTaken(it.OU, c.CN) && mailDN == "" {
+					chosen = &struct{ sam, upn, cn, mail string }{c.Sam, c.UPN, c.CN, c.Mail}
 					break
 				}
 			}
 			if chosen == nil {
-				out = append(out, Result{ChangeID: it.ChangeID, Status: StatusFailed, Error: "no free sAMAccountName/UPN/CN among the candidates"})
+				out = append(out, Result{ChangeID: it.ChangeID, Status: StatusFailed, Error: "no free sAMAccountName/UPN/CN/mail among the candidates"})
 				continue
 			}
 			dn := "CN=" + chosen.cn + "," + it.OU
@@ -276,6 +283,9 @@ func (f *Fake) Create(_ context.Context, o ActionOpts, items []CreateItem) ([]Re
 			u := &FakeUser{GUID: fmt.Sprintf("guid-%04d", f.guid), DN: dn, Sam: chosen.sam, UPN: chosen.upn, Enabled: it.Enabled, External: it.ExternalID, Attrs: map[string]string{}}
 			for k, v := range it.Attributes {
 				u.Attrs[k] = v
+			}
+			if chosen.mail != "" { // like New-IDLUser.ps1: the chosen candidate's mail is set at creation
+				u.Attrs["mail"] = chosen.mail
 			}
 			f.Users[u.GUID] = u
 			var missing []string

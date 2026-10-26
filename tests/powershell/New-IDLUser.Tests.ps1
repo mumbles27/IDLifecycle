@@ -155,6 +155,28 @@ Describe 'New-IDLUser.ps1' {
         $r.Json.results[0].dn | Should Be "CN=Jane Doe (2),OU=Staff,$script:Root"
     }
 
+    It 'sets the chosen candidate''s mail (it replaces a mail attribute); a malformed candidate mail fails the item' {
+        $other = New-StubUserEntry -Sam 'jdoe' -ExternalId 'E0001' -Cn 'Somebody Else'
+        $state = New-StandardState -Users @($other)
+        $item = New-Item1 -Candidates @(
+            @{ sam = 'jdoe'; upn = 'jdoe@stub.test'; cn = 'Jane Doe'; mail = 'jane.doe@mail.stub.test' },
+            @{ sam = 'jdoe2'; upn = 'jdoe2@stub.test'; cn = 'Jane Doe (2)'; mail = 'jane.doe2@mail.stub.test' }
+        )
+        $item['attributes']['mail'] = 'from-mapping@stub.test'
+        $r = Invoke-IDLScript -Script 'New-IDLUser' -Request (New-Request @($item)) -StatePath $state
+        $r.ExitCode | Should Be 0
+        $r.Json.results[0].sam | Should Be 'jdoe2'
+        (Get-StubUser -Path $state -Sam 'jdoe2').attributes.mail | Should Be 'jane.doe2@mail.stub.test'
+        $r.LogText | Should Match "attribute 'mail' replaced by the candidate's mail address"
+
+        $state2 = New-StandardState
+        $bad = New-Item1 -Candidates @(@{ sam = 'jdoe'; upn = 'jdoe@stub.test'; cn = 'Jane Doe'; mail = 'not-an-address' })
+        $r = Invoke-IDLScript -Script 'New-IDLUser' -Request (New-Request @($bad)) -StatePath $state2
+        $r.ExitCode | Should Be 1
+        $r.Json.results[0].error | Should Match 'is not an e-mail address'
+        (Read-StubStateFile -Path $state2).users.Count | Should Be 0
+    }
+
     It 'picks the 2nd candidate when the 1st UPN is taken (even though sam is free)' {
         $other = New-StubUserEntry -Sam 'zzz' -ExternalId 'E0002' -Cn 'Zed'
         $other.upn = 'jdoe@stub.test'
@@ -185,6 +207,50 @@ Describe 'New-IDLUser.ps1' {
         $r2 = Invoke-IDLScript -Script 'New-IDLUser' -Request (New-Request @(New-Item1)) -StatePath $state2
         $r2.Json.results[0].sam | Should Be 'jdoe'
         $r2.Json.results[0].dn | Should Be "CN=Jane Doe,OU=Staff,$script:Root"
+    }
+
+    $mailCandidates = @(
+        @{ sam = 'jdoe'; upn = 'jdoe@stub.test'; cn = 'Jane Doe'; mail = 'jane.doe@stub.test' },
+        @{ sam = 'jdoe2'; upn = 'jdoe2@stub.test'; cn = 'Jane Doe (2)'; mail = 'jane.doe2@stub.test' }
+    )
+
+    It 'treats a candidate whose mail is used by another user (mail attribute, any case) as taken' {
+        $other = New-StubUserEntry -Sam 'jdoe.old' -ExternalId 'E0001' -Cn 'Other Jane' -Attributes @{ mail = 'Jane.Doe@STUB.test' }
+        $state = New-StandardState -Users @($other)
+        $r = Invoke-IDLScript -Script 'New-IDLUser' -Request (New-Request @(New-Item1 -Candidates $mailCandidates -Groups @())) -StatePath $state
+        $r.ExitCode | Should Be 0
+        $r.Json.results[0].sam | Should Be 'jdoe2'
+        (Get-StubUser -Path $state -Sam 'jdoe2').attributes.mail | Should Be 'jane.doe2@stub.test'
+        $r.LogText | Should Match "mail='jane.doe@stub.test' is taken"
+    }
+
+    It 'treats a mail held as an smtp: proxyAddresses entry by a contact (not a user) as taken' {
+        $contact = @{
+            dn          = "CN=Jane Doe (vendor),OU=Sales,$script:Root"
+            objectClass = 'contact'
+            attributes  = @{ mail = 'jane@vendor.example'; proxyAddresses = @('SMTP:jane@vendor.example', 'smtp:jane.doe@stub.test') }
+        }
+        $state = New-StandardState -Objects @($contact)
+        $r = Invoke-IDLScript -Script 'New-IDLUser' -Request (New-Request @(New-Item1 -Candidates $mailCandidates -Groups @())) -StatePath $state
+        $r.ExitCode | Should Be 0
+        $r.Json.results[0].sam | Should Be 'jdoe2'
+    }
+
+    It 'treats a mail consumed earlier in the same batch as taken; fails when every candidate mail is taken' {
+        $state = New-StandardState
+        $first = New-Item1 -ExternalId 'E3001' -ChangeId 'a' -Groups @() -Candidates @(@{ sam = 'jdoe'; upn = 'jdoe@stub.test'; cn = 'Jane Doe'; mail = 'jane.doe@stub.test' })
+        $second = New-Item1 -ExternalId 'E3002' -ChangeId 'b' -Groups @() -Candidates @(
+            @{ sam = 'jdoe9'; upn = 'jdoe9@stub.test'; cn = 'Jane Doe (9)'; mail = 'jane.doe@stub.test' },
+            @{ sam = 'jdoe8'; upn = 'jdoe8@stub.test'; cn = 'Jane Doe (8)'; mail = 'jane.doe8@stub.test' }
+        )
+        $third = New-Item1 -ExternalId 'E3003' -ChangeId 'c' -Groups @() -Candidates @(@{ sam = 'jdoe7'; upn = 'jdoe7@stub.test'; cn = 'Jane Doe (7)'; mail = 'JANE.DOE8@stub.test' })
+        $r = Invoke-IDLScript -Script 'New-IDLUser' -Request (New-Request @($first, $second, $third)) -StatePath $state
+        $r.ExitCode | Should Be 1
+        $r.Json.results[0].sam | Should Be 'jdoe'
+        $r.Json.results[1].sam | Should Be 'jdoe8'
+        $r.Json.results[2].status | Should Be 'failed'
+        $r.Json.results[2].error | Should Match 'no free candidate.*mail'
+        (Get-StubCalls -Path $state -Cmdlet 'New-ADUser').Count | Should Be 2
     }
 
     It 'fails an item when no candidate is free, without stopping the batch (exit 1)' {

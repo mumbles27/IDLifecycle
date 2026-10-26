@@ -9,6 +9,7 @@ import {
   selectWithHelp, previewPanel, MODE_OPTIONS, MODE_INFO, ON_EMPTY_OPTIONS, ON_EMPTY_INFO,
   VALUE_TYPE_OPTIONS, VALUE_TYPE_INFO,
 } from '../components.js';
+import { fieldMapper, templateFor } from './mapper.js';
 
 export async function render(root, ctx) {
   const isAdmin = ctx.can('admin');
@@ -16,7 +17,18 @@ export async function render(root, ctx) {
   const header = pageHeader('Attribute mappings',
     isAdmin ? mutBtn('New mapping', { class: 'btn-primary', 'data-test': 'new-mapping', onclick: () => openEditor(null) }) : null);
 
-  root.append(header, explainer(), listEl);
+  // The field mapper fetches live HR data and reads the AD schema, so only admins get it.
+  const mapper = isAdmin ? fieldMapper({
+    getMappings: () => load.items || [],
+    onMapField: (f) => openEditor(null, { name: f.name, template: templateFor(f.name) }),
+    onMapAttribute: (a) => openEditor(null, {
+      name: a.description || a.name,
+      target_attr: a.name,
+      value_type: a.syntax === 'dn' ? 'user_ref' : 'string',
+    }),
+  }) : null;
+
+  root.append(header, explainer(), mapper ? mapper.el : null, listEl);
 
   function explainer() {
     return h('details', { class: 'card explain', open: true },
@@ -60,6 +72,9 @@ export async function render(root, ctx) {
       empty: 'No mappings yet. Add one to start populating AD attributes.',
     }));
     load.items = items;
+    if (mapper) {
+      mapper.refresh();
+    }
   }
 
   async function remove(m, button) {
@@ -79,7 +94,8 @@ export async function render(root, ctx) {
     });
   }
 
-  function openEditor(existing) {
+  /** preset pre-fills a new mapping (from the field mapper's Map… buttons). */
+  function openEditor(existing, preset) {
     const items = load.items || [];
     const nextOrder = items.reduce((mx, m) => Math.max(mx, Number(m.sort_order) || 0), 0) + 10;
     const model = {
@@ -92,8 +108,11 @@ export async function render(root, ctx) {
       enabled: true,
       sort_order: nextOrder,
       description: '',
+      ...(preset || {}),
       ...(existing || {}),
     };
+    const adAttrs = mapper ? mapper.attributes() : [];
+    const srcFields = mapper ? mapper.fields() : [];
     const preview = previewPanel({
       getTemplates: () => [{ label: model.target_attr || 'Result', template: model.template }],
     });
@@ -106,14 +125,68 @@ export async function render(root, ctx) {
       'data-test': 'map-template',
       oninput: () => preview.run(),
     });
-    const target = inputText(model, 'target_attr', { required: true, placeholder: 'displayName', 'data-test': 'map-target', oninput: () => preview.run() });
+    const listId = adAttrs.length > 0 ? `ad-attrs-${Date.now()}` : null;
+    const targetWarn = h('p', { class: 'field-warn small', 'data-test': 'map-target-warn', hidden: true });
+    const checkTarget = () => {
+      const want = String(model.target_attr || '').trim().toLowerCase();
+      const a = adAttrs.find((x) => x.name.toLowerCase() === want);
+      let msg = '';
+      if (want && a && !a.mappable) {
+        msg = `${a.name} cannot be mapped: ${a.reason}.`;
+      }
+      else if (want && a && a.hint) {
+        msg = `${a.name}: ${a.hint}.`;
+      }
+      else if (want && !a && mapper && mapper.adLive()) {
+        msg = `The AD schema has no user attribute named "${model.target_attr.trim()}".`;
+      }
+      targetWarn.textContent = msg;
+      targetWarn.hidden = msg === '';
+    };
+    const target = inputText(model, 'target_attr', {
+      required: true,
+      placeholder: 'displayName',
+      list: listId,
+      autocomplete: 'off',
+      'data-test': 'map-target',
+      oninput: () => { checkTarget(); preview.run(); },
+    });
+    const datalist = listId
+      ? h('datalist', { id: listId }, adAttrs.filter((a) => a.mappable).map((a) => h('option', { value: a.name }, a.description || a.name)))
+      : null;
     const name = inputText(model, 'name', { required: true, placeholder: 'Display name', 'data-test': 'map-name' });
+
+    // Insert a source field at the cursor (fields come from the field mapper's last load).
+    const insertField = (f) => {
+      const text = templateFor(f.name);
+      const start = tpl.selectionStart ?? tpl.value.length;
+      const end = tpl.selectionEnd ?? tpl.value.length;
+      tpl.setRangeText(text, start, end, 'end');
+      tpl.dispatchEvent(new Event('input', { bubbles: true }));
+      tpl.focus();
+    };
+    const fieldButtons = srcFields.length > 0
+      ? h('div', { class: 'field' },
+        h('span', { class: 'field-title' }, 'Insert a source field'),
+        h('div', { class: 'chips', 'data-test': 'insert-fields' },
+          srcFields.map((f) => h('button', { type: 'button', class: 'chip chip-btn', 'data-test': 'insert-field', 'data-name': f.name, onclick: () => insertField(f) }, f.name))),
+        h('p', { class: 'help' }, 'Adds the field to the template at the cursor.'))
+      : null;
+
+    const targetField = field('Target attribute (LDAP name)', target, {
+      required: true,
+      help: adAttrs.length > 0
+        ? 'Start typing to pick from the AD user attributes that can be mapped.'
+        : 'The AD attribute to write, e.g. displayName, title, department, manager.',
+    });
+    targetField.append(...[datalist, targetWarn].filter(Boolean));
 
     const form = h('div', { class: 'editor-cols' },
       h('div', { class: 'editor-main' },
         field('Name', name, { required: true }),
-        field('Target attribute (LDAP name)', target, { required: true, help: 'The AD attribute to write, e.g. displayName, title, department, manager.' }),
+        targetField,
         field('Template', tpl, { required: true, help: 'Go template evaluated against the source record.' }),
+        fieldButtons,
         selectWithHelp('Mode', model, 'mode', MODE_OPTIONS, MODE_INFO, { 'data-test': 'map-mode' }),
         selectWithHelp('When the result is empty', model, 'on_empty', ON_EMPTY_OPTIONS, ON_EMPTY_INFO),
         selectWithHelp('Value type', model, 'value_type', VALUE_TYPE_OPTIONS, VALUE_TYPE_INFO),
@@ -152,6 +225,7 @@ export async function render(root, ctx) {
         return true;
       },
     });
+    checkTarget();
     preview.run();
   }
 

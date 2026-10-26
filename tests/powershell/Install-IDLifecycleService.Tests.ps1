@@ -48,8 +48,10 @@ Describe 'Install-IDLifecycleService.ps1 (DryRun only; never registers a service
         $bin = @('-BinaryPath', (Join-Path $fx.Dir 'missing.exe'), '-ConfigPath', $fx.Cfg, '-ServiceAccount', 'TESTDOM\svc-idl$')
         (Invoke-IDLScript -Script 'Install-IDLifecycleService' -StatePath $state -ScriptArguments $bin -DryRun).ExitCode | Should Be 2
 
-        $acct = @('-BinaryPath', $fx.Exe, '-ConfigPath', $fx.Cfg, '-ServiceAccount', 'TESTDOM\regular.user')
-        (Invoke-IDLScript -Script 'Install-IDLifecycleService' -StatePath $state -ScriptArguments $acct -DryRun).ExitCode | Should Be 2
+        foreach ($bad in @('TESTDOM\a\b', 'not an account', 'nodomain')){
+            $acct = @('-BinaryPath', $fx.Exe, '-ConfigPath', $fx.Cfg, '-ServiceAccount', $bad)
+            (Invoke-IDLScript -Script 'Install-IDLifecycleService' -StatePath $state -ScriptArguments $acct -DryRun).ExitCode | Should Be 2
+        }
 
         $name = @('-BinaryPath', $fx.Exe, '-ConfigPath', $fx.Cfg, '-ServiceAccount', 'TESTDOM\svc-idl$', '-ServiceName', 'bad name!')
         (Invoke-IDLScript -Script 'Install-IDLifecycleService' -StatePath $state -ScriptArguments $name -DryRun).ExitCode | Should Be 2
@@ -60,6 +62,68 @@ Describe 'Install-IDLifecycleService.ps1 (DryRun only; never registers a service
         (Invoke-IDLScript -Script 'Install-IDLifecycleService' -StatePath $state -ScriptArguments $cfg -DryRun).ExitCode | Should Be 2
 
         Remove-Item -LiteralPath $fx.Dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'accepts a user account: DryRun plans the logon right and the credential; a live run without a password is refused' {
+        $fx = New-InstallFixture
+        $state = New-StubStateFile
+        $user = @('-BinaryPath', $fx.Exe, '-ConfigPath', $fx.Cfg, '-ServiceAccount', 'TESTDOM\svc-user', '-ServiceName', $serviceName)
+        $r = Invoke-IDLScript -Script 'Install-IDLifecycleService' -StatePath $state -ScriptArguments $user -DryRun
+        $r.ExitCode | Should Be 0
+        $r.LogText | Should Match 'WOULD: GrantServiceLogonRight TESTDOM\\svc-user'
+        $r.LogText | Should Match 'WOULD: CreateService'
+        $r.LogText | Should Match 'WOULD: SetServiceCredential'
+        $r.LogText | Should Match 'is a user account with a password'
+
+        # Not a dry run: refused at validation (exit 2) before the elevation check or any change.
+        $r = Invoke-IDLScript -Script 'Install-IDLifecycleService' -StatePath $state -ScriptArguments $user
+        $r.ExitCode | Should Be 2
+        $r.LogText | Should Match 'pass -ServiceAccountPassword'
+        (Test-Path -LiteralPath $fx.Data) | Should Be $false
+        @(Get-Service -Name $serviceName -ErrorAction SilentlyContinue).Count | Should Be 0
+        Remove-Item -LiteralPath $fx.Dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'gMSA/MSA: logon right planned, no credential step; a password for one is refused and never logged' {
+        $fx = New-InstallFixture
+        $state = New-StubStateFile
+        $gmsa = @('-BinaryPath', $fx.Exe, '-ConfigPath', $fx.Cfg, '-ServiceAccount', 'TESTDOM\svc-idl$', '-ServiceName', $serviceName)
+        $r = Invoke-IDLScript -Script 'Install-IDLifecycleService' -StatePath $state -ScriptArguments $gmsa -DryRun
+        $r.ExitCode | Should Be 0
+        $r.LogText | Should Match 'WOULD: GrantServiceLogonRight'
+        $r.LogText | Should Not Match 'SetServiceCredential'
+
+        $pw = 'Sentinel-Svc-Pw-4Kq8'
+        $r = Invoke-IDLScript -Script 'Install-IDLifecycleService' -StatePath $state -ScriptArguments $gmsa -DryRun -ExtraEnv @{ IDL_SERVICE_PASSWORD = $pw }
+        $r.ExitCode | Should Be 2
+        $r.LogText | Should Match 'only for a user account'
+        ($r.LogText + $r.StdOut + $r.StdErr) | Should Not Match ([regex]::Escape($pw))
+
+        # Built-in accounts need no logon right step.
+        $builtIn = @('-BinaryPath', $fx.Exe, '-ConfigPath', $fx.Cfg, '-ServiceAccount', 'NT AUTHORITY\NetworkService', '-ServiceName', $serviceName)
+        $r = Invoke-IDLScript -Script 'Install-IDLifecycleService' -StatePath $state -ScriptArguments $builtIn -DryRun
+        $r.ExitCode | Should Be 0
+        $r.LogText | Should Not Match 'GrantServiceLogonRight'
+        Remove-Item -LiteralPath $fx.Dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'Get-IDLServiceAccountKind / ConvertTo-IDLServiceAccountName classify account names' {
+        $kinds = @{
+            'LocalSystem' = 'BuiltIn'; 'NT AUTHORITY\NetworkService' = 'BuiltIn'; 'NT SERVICE\IDLifecycle' = 'BuiltIn'
+            'CORP\svc-idl$' = 'Managed'; 'svc-idl$@corp.example' = 'Managed'
+            'CORP\svc-idl' = 'Password'; '.\svc-local' = 'Password'; 'svc-idl@corp.example' = 'Password'
+            'svc-idl' = ''; 'CORP\a\b' = ''; 'CORP\with space' = ''; '' = ''
+        }
+        foreach ($k in $kinds.Keys){
+            (Get-IDLServiceAccountKind -Account $k) | Should Be $kinds[$k]
+        }
+
+        (ConvertTo-IDLServiceAccountName -Account ' .\svc-local ') | Should Be ('{0}\svc-local' -f $env:COMPUTERNAME)
+        (ConvertTo-IDLServiceAccountName -Account 'CORP\svc-idl') | Should Be 'CORP\svc-idl'
+    }
+
+    It 'Test-IDLServiceLogonRight is false for an account that does not resolve' {
+        Test-IDLServiceLogonRight -Account 'NOSUCHDOMAIN-IDL\nobody' | Should Be $false
     }
 
     function New-BlockedScriptsDir {

@@ -283,6 +283,69 @@ func TestCreateNeedsApprovalThenAppliesWithRoles(t *testing.T) {
 	eq(t, "converged: unchanged", run.Counters["unchanged"], 2)
 }
 
+func TestPasswordAndMailTemplatesOnCreate(t *testing.T) {
+	e := newEnv(t)
+	e.tweak(func(s *model.Settings) {
+		s.NewUser.PasswordMode = model.PasswordModeTemplate
+		s.NewUser.PasswordTemplate = `{{ upper (first .LastName 1) }}{{ lower (first .FirstName 1) }}{{ .EmployeeID }}!{{ random 6 }}`
+		s.NewUser.ChangePasswordAtLogon = false // forced back on by Validate
+		s.Naming.MailTemplate = `{{ .FirstName | lower }}.{{ .LastName | lower }}`
+		s.Naming.MailDomain = "mail.example.com"
+		s.Naming.ConflictMode = model.ConflictNumber
+	})
+	e.writeCSV(
+		row("E1", "Jane", "Doe", "Marketing", "Designer", "A", ""),
+		row("E2", "Jane", "Doe", "Engineering", "Developer", "A", ""),
+	)
+	e.run()
+	pend := e.changes(model.StatusPending, model.ChangeCreate)
+	raw, _ := json.Marshal(pend)
+	if strings.Contains(strings.ToLower(string(raw)), "password") {
+		t.Fatal("change payloads must never carry passwords")
+	}
+	eq(t, "created", e.approveAll(model.ChangeCreate), 2)
+
+	eq(t, "two passwords", len(e.fake.Passwords), 2)
+	for i, pw := range e.fake.Passwords {
+		if !strings.HasPrefix(pw, "Dj") || len(pw) != 11 || !strings.Contains(pw, "!") {
+			t.Errorf("password %d does not follow the template (length %d)", i, len(pw))
+		}
+		eq(t, "change at logon forced", e.fake.MustChange[i], true)
+	}
+	if e.fake.Passwords[0] == e.fake.Passwords[1] {
+		t.Error("random part must differ per account")
+	}
+	// Mail follows the collision number of the account name (which of the two gets "2" is not fixed).
+	want := map[string]string{"jdoe": "jane.doe@mail.example.com", "jdoe2": "jane.doe2@mail.example.com"}
+	for _, ext := range []string{"E1", "E2"} {
+		u := e.user(ext)
+		eq(t, ext+" mail matches its sam "+u.Sam, u.Attrs["mail"], want[u.Sam])
+	}
+
+	audit, _, _ := e.st.ListAudit(e.ctx, store.AuditFilter{}, store.Page{Limit: 500})
+	auditJSON, _ := json.Marshal(audit)
+	for _, pw := range e.fake.Passwords {
+		if strings.Contains(string(auditJSON), pw) {
+			t.Fatal("password leaked into the audit log")
+		}
+	}
+
+	// A template whose result AD would refuse fails that change only, says why, and never reaches AD.
+	e.tweak(func(s *model.Settings) { s.NewUser.PasswordTemplate = `{{ lower .FirstName }}` })
+	e.writeCSV(
+		row("E1", "Jane", "Doe", "Marketing", "Designer", "A", ""),
+		row("E2", "Jane", "Doe", "Engineering", "Developer", "A", ""),
+		row("E3", "Ann", "Lee", "Engineering", "Developer", "A", ""),
+	)
+	e.run()
+	e.approveAll(model.ChangeCreate)
+	eq(t, "no third password sent", len(e.fake.Passwords), 2)
+	failed := e.changes(model.StatusFailed, model.ChangeCreate)
+	if len(failed) != 1 || !strings.Contains(failed[0].Error, "at least 8") || strings.Contains(failed[0].Error, "ann") {
+		t.Fatalf("failed create: %+v", failed)
+	}
+}
+
 func TestAutoApprovalAppliesWithoutHuman(t *testing.T) {
 	e := newEnv(t)
 	e.tweak(func(s *model.Settings) {
@@ -758,6 +821,7 @@ func TestDuplicateADAccountsAreReportedNotGuessed(t *testing.T) {
 
 func TestNameCollisionPicksNextCandidate(t *testing.T) {
 	e := newEnv(t)
+	e.tweak(func(s *model.Settings) { s.Naming.ConflictMode = model.ConflictNumber })
 	e.fake.AddUser(ad.FakeUser{DN: "CN=John Doe," + baseOU, Sam: "jdoe", UPN: "john.doe@corp.example.com", External: "E0", Enabled: true})
 	e.writeCSV(row("E0", "John", "Doe", "Engineering", "Dev", "A", ""), row("E1", "Jane", "Doe", "Marketing", "Designer", "A", ""))
 	e.run()

@@ -8,17 +8,19 @@
     Request:
       {"server":"", "idAttribute":"employeeID", "items":[
          {"changeId":"c1","externalId":"E1001","ou":"OU=Staff,DC=corp,DC=example,DC=com",
-          "candidates":[{"sam":"jdoe","upn":"jdoe@corp.example.com","cn":"Jane Doe"},
-                        {"sam":"jdoe2","upn":"jdoe2@corp.example.com","cn":"Jane Doe (2)"}],
+          "candidates":[{"sam":"jdoe","upn":"jdoe@corp.example.com","cn":"Jane Doe","mail":"jane.doe@corp.example.com"},
+                        {"sam":"jdoe2","upn":"jdoe2@corp.example.com","cn":"Jane Doe (2)","mail":"jane.doe2@corp.example.com"}],
           "attributes":{"givenName":"Jane","sn":"Doe","displayName":"Jane Doe","title":"Analyst"},
           "groups":["GG-AllStaff"],"password":"<generated>","enabled":true,"changePasswordAtLogon":true} ]}
 
     Per item:
       * Idempotent: if an account whose idAttribute equals externalId already exists the item is "skipped"
         ("exists") and its guid/dn/sam/upn are returned; nothing is changed.
-      * Otherwise the FIRST candidate whose sAMAccountName AND userPrincipalName are free directory-wide and whose
-        cn is free in the target OU is used. Existence is checked with a handful of bulk LDAP queries, and
-        candidates taken earlier in the same batch count as taken.
+      * Otherwise the FIRST candidate whose sAMAccountName AND userPrincipalName are free directory-wide, whose
+        cn is free in the target OU and whose optional "mail" is not used by any object (as mail or as an smtp:
+        proxyAddresses entry, e.g. on a contact) is used. Existence is checked with a handful of bulk LDAP queries,
+        and candidates taken earlier in the same batch count as taken. A candidate's "mail" is set as the account's
+        mail attribute (replacing a "mail" in attributes).
       * The user is created with New-ADUser (attributes via -OtherAttributes, idAttribute = externalId, password as
         a SecureString), then added to the groups (sAMAccountName or DN). If a group cannot be resolved the account
         is KEPT and the item is reported "failed" with the missing groups listed (guid/dn still returned).
@@ -132,7 +134,16 @@ try{
                     throw 'every candidate needs non-empty sam, upn and cn'
                 }
 
-                $p.Candidates.Add(@{ Sam = $sam.Trim(); Upn = $upn.Trim(); Cn = $cn.Trim() })
+                # Optional: the mail address that goes with this candidate (naming.mail_template on the Go side).
+                $mail = ([string](ConvertTo-IDLString -Value (Get-IDLField -Object $candidate -Name 'mail'))).Trim()
+                if (
+                    ($mail) -and
+                    ($mail -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$')
+                ){
+                    throw "candidate mail '$mail' is not an e-mail address"
+                }
+
+                $p.Candidates.Add(@{ Sam = $sam.Trim(); Upn = $upn.Trim(); Cn = $cn.Trim(); Mail = $mail })
             }
 
             $attributes = Get-IDLField -Object $item -Name 'attributes'
@@ -232,44 +243,29 @@ try{
     # 1. accounts that already carry the externalId (idempotency)
     $existing = Find-IDLUsersByAttribute -Attribute $idAttribute -Values ([string[]]@($valid | ForEach-Object { $_.ExternalId } | Select-Object -Unique)) -Server $server -Properties @($idAttribute, 'userPrincipalName')
 
-    # 2. candidate sAMAccountName / UPN already taken anywhere in the directory
+    # 2. candidate sAMAccountName / UPN / mail already taken anywhere in the directory (mail: as mail or smtp:
+    #    proxyAddresses of any object, e.g. a contact)
     $takenSam = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $takenUpn = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    $terms = [System.Collections.Generic.List[string]]::new()
-    $seenTerms = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $takenMail = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $names = [System.Collections.Generic.List[object]]::new()
     foreach ($p in $valid){
         if ($existing.ContainsKey($p.ExternalId)){
             continue
         }
 
         foreach ($candidate in $p.Candidates){
-            $samTerm = '(sAMAccountName={0})' -f (ConvertTo-IDLLdapFilterValue -Value $candidate.Sam)
-            $upnTerm = '(userPrincipalName={0})' -f (ConvertTo-IDLLdapFilterValue -Value $candidate.Upn)
-            if ($seenTerms.Add($samTerm)){
-                $terms.Add($samTerm)
-            }
-
-            if ($seenTerms.Add($upnTerm)){
-                $terms.Add($upnTerm)
+            $names.Add(@{ Field = 'sam'; Value = $candidate.Sam })
+            $names.Add(@{ Field = 'upn'; Value = $candidate.Upn })
+            if ($candidate.Mail){
+                $names.Add(@{ Field = 'mail'; Value = $candidate.Mail })
             }
         }
     }
 
-    if ($terms.Count -gt 0){
-        foreach ($chunk in (Split-IDLChunk -InputArray $terms.ToArray() -Size 40)){
-            $filter = New-IDLOrFilter -Terms ([string[]]$chunk)
-            foreach ($object in @(Get-ADObject -LDAPFilter $filter -Properties 'sAMAccountName', 'userPrincipalName' @serverParams)){
-                $sam = Get-IDLAdValue -Object $object -Name 'sAMAccountName'
-                $upn = Get-IDLAdValue -Object $object -Name 'userPrincipalName'
-                if ($sam){
-                    $null = $takenSam.Add($sam)
-                }
-
-                if ($upn){
-                    $null = $takenUpn.Add($upn)
-                }
-            }
-        }
+    $sets = @{ sam = $takenSam; upn = $takenUpn; mail = $takenMail }
+    foreach ($entry in (Find-IDLTakenNames -Names $names.ToArray() -Server $server).Taken){
+        $null = $sets[$entry.field].Add($entry.value)
     }
 
     # 3. cn collisions inside each target OU (OU existence is validated first)
@@ -392,9 +388,10 @@ try{
                 if (
                     ($takenSam.Contains($candidate.Sam)) -or
                     ($takenUpn.Contains($candidate.Upn)) -or
-                    ($takenCn[$ouKey].Contains($candidate.Cn))
+                    ($takenCn[$ouKey].Contains($candidate.Cn)) -or
+                    (($candidate.Mail) -and ($takenMail.Contains($candidate.Mail)))
                 ){
-                    Write-IDLLog "  Candidate sam='$($candidate.Sam)' upn='$($candidate.Upn)' cn='$($candidate.Cn)' is taken"
+                    Write-IDLLog "  Candidate sam='$($candidate.Sam)' upn='$($candidate.Upn)' cn='$($candidate.Cn)'$((($candidate.Mail)) ? (" mail='$($candidate.Mail)'") : ('')) is taken"
                     continue
                 }
 
@@ -403,14 +400,23 @@ try{
             }
 
             if ($null -eq $chosen){
-                throw "no free candidate among $($p.Candidates.Count) (sAMAccountName, UPN and CN must all be free)"
+                throw "no free candidate among $($p.Candidates.Count) (sAMAccountName, UPN, CN and mail must all be free)"
             }
 
-            Write-IDLLog "  Selected candidate sam='$($chosen.Sam)' upn='$($chosen.Upn)' cn='$($chosen.Cn)'"
+            Write-IDLLog "  Selected candidate sam='$($chosen.Sam)' upn='$($chosen.Upn)' cn='$($chosen.Cn)'$((($chosen.Mail)) ? (" mail='$($chosen.Mail)'") : (''))"
 
             $other = @{ $idAttribute = $externalId }
             foreach ($name in $p.Attributes.Keys){
                 $other[$name] = $p.Attributes[$name]
+            }
+
+            if ($chosen.Mail){
+                foreach ($name in @($other.Keys | Where-Object { $_ -ieq 'mail' })){
+                    Write-IDLLog "  Item $($p.ChangeId): attribute 'mail' replaced by the candidate's mail address" 'WARN'
+                    $null = $other.Remove($name)
+                }
+
+                $other['mail'] = $chosen.Mail
             }
 
             $plannedDn = 'CN={0},{1}' -f (ConvertTo-IDLDnEscapedValue -Value $chosen.Cn), $p.Ou
@@ -457,6 +463,10 @@ try{
             $null = $takenSam.Add($chosen.Sam)
             $null = $takenUpn.Add($chosen.Upn)
             $null = $takenCn[$ouKey].Add($chosen.Cn)
+            if ($chosen.Mail){
+                $null = $takenMail.Add($chosen.Mail)
+            }
+
             $createdInBatch[$externalId.ToLowerInvariant()] = $userFields
 
             # Groups: add everything we can, then report the unresolvable ones.

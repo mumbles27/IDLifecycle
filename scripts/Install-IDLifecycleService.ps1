@@ -15,15 +15,22 @@
          exactly that state (inheritance off, none of those four present), so inherited entries can never hide a
          loose ACL. Existing files inherit the new ACL unless they have inheritance disabled themselves;
       2. grants the service account read access to the config file;
-      3. creates the service (or fixes binPath / log-on account if it drifted) running as the given account,
-         start type Automatic (Delayed Start), with a description;
-      4. sets failure recovery: restart after 5s, 30s and 60s, counter reset after 24h, also on non-crash failures.
+      3. grants a domain/local account (MSA, gMSA or password account) "Log on as a service" (SeServiceLogonRight)
+         in the local security policy when it does not hold it directly;
+      4. creates the service (or fixes binPath / log-on account if it drifted) running as the given account,
+         start type Automatic (Delayed Start), with a description; for a password account the password is then set
+         through the Service Control Manager API (Set-Service -Credential), never on a command line;
+      5. sets failure recovery: restart after 5s, 30s and 60s, counter reset after 24h, also on non-crash failures.
     The service command line is:  "<BinaryPath>" service -config "<ConfigPath>"
     It does NOT start the service. Re-running it only changes what is out of line and reports the rest as skipped.
 
-    The service account must be a gMSA (name ends with $, e.g. CORP\svc-idl$) or a built-in/virtual account
-    (LocalSystem, NT AUTHORITY\NetworkService, NT SERVICE\...). Passwords are deliberately not supported, so no
-    credential ever touches a command line.
+    Supported service accounts:
+      - gMSA or standalone MSA (recommended): DOMAIN\name$ or name$@domain. Windows manages the password.
+      - Normal domain or local user: DOMAIN\name, .\name or name@domain. Needs -ServiceAccountPassword (or the
+        IDL_SERVICE_PASSWORD environment variable) when the service is created or its account changes; pass it again
+        after the password has been changed. The password is stored by the Service Control Manager (LSA secret).
+        When it expires or is changed in AD without updating the service, the service fails to start.
+      - Built-in/virtual: LocalSystem, NT AUTHORITY\LocalService / NetworkService, NT SERVICE\<name>.
 
 .PARAMETER BinaryPath
     Full path to idlifecycled.exe. Must exist.
@@ -33,8 +40,15 @@
     The optional "powershell.scripts_dir" decides which Logs folder gets the service account ACL.
 
 .PARAMETER ServiceAccount
-    Log-on account for the service, e.g. 'CORP\svc-idl$' (gMSA). The account needs the "Log on as a service" right
-    (normally granted by GPO) and must be allowed to retrieve the gMSA password on this host.
+    Log-on account for the service: a gMSA/MSA ('CORP\svc-idl$'), a normal user ('CORP\svc-idl', '.\svc-idl') or a
+    built-in account. A gMSA must be allowed to retrieve its password on this host. "Log on as a service" is granted
+    locally when missing; if a domain GPO defines that right, add the account there too or the next policy refresh
+    removes the local grant.
+
+.PARAMETER ServiceAccountPassword
+    SecureString password of a normal (password) account. Required when the service is created or moved to this
+    account; optional otherwise (given = the stored password is updated). Not allowed for MSA/gMSA/built-in accounts.
+    Falls back to the IDL_SERVICE_PASSWORD environment variable, which is removed from this process as soon as it is read.
 
 .PARAMETER ServiceName
     Name of the Windows service. Default: IDLifecycle.
@@ -47,6 +61,9 @@
 
 .EXAMPLE
     .\Install-IDLifecycleService.ps1 -BinaryPath 'C:\Program Files\IDLifecycle\idlifecycled.exe' -ConfigPath 'C:\ProgramData\IDLifecycle\config.json' -ServiceAccount 'CORP\svc-idl$' -ServiceName IDLifecycle
+
+.EXAMPLE
+    .\Install-IDLifecycleService.ps1 -BinaryPath 'C:\Program Files\IDLifecycle\idlifecycled.exe' -ConfigPath 'C:\ProgramData\IDLifecycle\config.json' -ServiceAccount 'CORP\svc-idl' -ServiceAccountPassword (Read-Host -AsSecureString 'Service account password')
 
 .NOTES
     Requires PowerShell 7+, Windows, sc.exe, and an elevated session (not required for -DryRun).
@@ -70,6 +87,8 @@ param(
 
     [string]$ServiceName = 'IDLifecycle',
 
+    [securestring]$ServiceAccountPassword,
+
     [switch]$DryRun
 )
 
@@ -79,6 +98,29 @@ $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'IDLifecycle.Common.psm1') -Force
 
 $script:FailedSteps = 0
+
+# IDL_SERVICE_PASSWORD (how Install-IDLifecycle.ps1 hands the password to this child) leaves the environment at once.
+$envServicePassword = [System.Environment]::GetEnvironmentVariable('IDL_SERVICE_PASSWORD', [System.EnvironmentVariableTarget]::Process)
+if (-not [string]::IsNullOrEmpty($envServicePassword)){
+    [System.Environment]::SetEnvironmentVariable('IDL_SERVICE_PASSWORD', $null, [System.EnvironmentVariableTarget]::Process)
+    if ($null -eq $ServiceAccountPassword){
+        $ServiceAccountPassword = ConvertTo-SecureString -String $envServicePassword -AsPlainText -Force
+    }
+}
+
+$envServicePassword = $null
+
+function Set-IDLServiceCredential {
+    # The password goes to ChangeServiceConfig through Set-Service, never onto a command line.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Account,
+        [Parameter(Mandatory)][securestring]$Password
+    )
+
+    Set-Service -Name $Name -Credential ([System.Management.Automation.PSCredential]::new($Account, $Password))
+}
 
 function Invoke-InstallStep {
     [CmdletBinding()]
@@ -123,10 +165,25 @@ function Invoke-InstallStep {
     }
 }
 
+function Get-IDLScEmptyArgument {
+    # The token that makes a native program (sc.exe) receive an EMPTY argument (gMSA: password= ""). Under
+    # PowerShell 7.3+ Standard/Windows native argument passing, '""' would arrive as a literal two-character `""`;
+    # only Legacy passing needs the quotes. Verified by Security.Tests.ps1 with an argv-echoing child.
+    $mode = Get-Variable -Name PSNativeCommandArgumentPassing -ValueOnly -ErrorAction SilentlyContinue
+    if (
+        ($null -eq $mode) -or
+        ([string]$mode -eq 'Legacy')
+    ){
+        return '""'
+    }
+
+    return ''
+}
+
 function Invoke-ScExe {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][string[]]$Arguments
+        [Parameter(Mandatory)][AllowEmptyString()][string[]]$Arguments
     )
 
     $output = & sc.exe @Arguments 2>&1
@@ -202,7 +259,14 @@ try{
         ConfigPath     = $ConfigPath
         ServiceAccount = $ServiceAccount
         ServiceName    = $ServiceName
+        ServiceAccountPassword = (($null -ne $ServiceAccountPassword) ? ('(set)') : ('(not set)'))
         DryRun         = [bool]$DryRun
+    }
+
+    $servicePasswordPlain = $null
+    if ($null -ne $ServiceAccountPassword){
+        $servicePasswordPlain = [System.Net.NetworkCredential]::new('', $ServiceAccountPassword).Password
+        Register-IDLSecret -Secret $servicePasswordPlain
     }
 
     # ---- Phase: validation (exit 2) and dependencies (exit 3) ----
@@ -231,17 +295,19 @@ try{
         throw (New-IDLException -Kind Input -Message "ConfigPath not found: $ConfigPath")
     }
 
-    $builtInAccounts = @('LocalSystem', 'NT AUTHORITY\LocalService', 'NT AUTHORITY\NetworkService', 'NT AUTHORITY\SYSTEM')
-    $isBuiltIn = (
-        ($ServiceAccount -in $builtInAccounts) -or
-        ($ServiceAccount -like 'NT SERVICE\*')
-    )
-    $isGmsa = ($ServiceAccount -match '^[^\\@\s]+\\[^\\\s]+\$$') -or ($ServiceAccount -match '^[^\\@\s]+\$@[^\\\s]+$')
+    $ServiceAccount = ConvertTo-IDLServiceAccountName -Account $ServiceAccount
+    $accountKind = Get-IDLServiceAccountKind -Account $ServiceAccount
+    if (-not $accountKind){
+        throw (New-IDLException -Kind Input -Message "ServiceAccount '$ServiceAccount' is not valid: use a gMSA/MSA (DOMAIN\name`$), a user account (DOMAIN\name, .\name or name@domain) or a built-in account (LocalSystem, NT AUTHORITY\NetworkService, NT SERVICE\<name>).")
+    }
+
+    $isManaged = ($accountKind -eq 'Managed')
+    $isPasswordAccount = ($accountKind -eq 'Password')
     if (
-        (-not $isBuiltIn) -and
-        (-not $isGmsa)
+        (-not $isPasswordAccount) -and
+        ($null -ne $servicePasswordPlain)
     ){
-        throw (New-IDLException -Kind Input -Message "ServiceAccount '$ServiceAccount' must be a gMSA (DOMAIN\name`$) or a built-in/virtual account; password accounts are not supported.")
+        throw (New-IDLException -Kind Input -Message "-ServiceAccountPassword is only for a user account; '$ServiceAccount' is a $(($isManaged) ? ('managed service account (Windows manages its password)') : ('built-in account')).")
     }
 
     try{
@@ -268,6 +334,32 @@ try{
 
     $logsDir = Join-Path -Path $scriptsDir -ChildPath 'Logs'
     $aclAccount = (($ServiceAccount -eq 'LocalSystem') ? ('NT AUTHORITY\SYSTEM') : ($ServiceAccount))
+    if ($accountKind -ne 'BuiltIn'){
+        # ACL checks compare NTAccount names: '.\name' and 'name@domain' resolve to their DOMAIN\name form.
+        $resolvedSid = ConvertTo-IDLSidSafe -Identity $ServiceAccount
+        if ($null -ne $resolvedSid){
+            $aclAccount = ConvertTo-IDLAccountName -Sid $resolvedSid.Value
+        }
+    }
+
+    $existing = Get-CimInstance -ClassName Win32_Service -Filter ("Name='{0}'" -f $ServiceName.Replace("'", "''")) -ErrorAction SilentlyContinue
+    $logOnAccount = (($ServiceAccount -eq 'LocalSystem') ? ('LocalSystem') : ($ServiceAccount))
+    $accountChanges = (
+        ($null -eq $existing) -or
+        (-not ([string]$existing.StartName -ieq $logOnAccount))
+    )
+    if (
+        $isPasswordAccount -and
+        $accountChanges -and
+        ($null -eq $servicePasswordPlain) -and
+        (-not $DryRun)
+    ){
+        throw (New-IDLException -Kind Input -Message "ServiceAccount '$ServiceAccount' is a user account: pass -ServiceAccountPassword (SecureString) or set IDL_SERVICE_PASSWORD. (A gMSA such as DOMAIN\name`$ needs no password.)")
+    }
+
+    if ($isPasswordAccount){
+        Write-IDLLog "Service account '$ServiceAccount' is a user account with a password. If the password expires or is changed in AD, re-run with the new -ServiceAccountPassword or the service will not start. A gMSA avoids this." 'WARN'
+    }
 
     if (
         (-not $DryRun) -and
@@ -325,15 +417,23 @@ try{
 
     Invoke-InstallStep -Action 'GrantConfigRead' -Identity "$ConfigPath <- $ServiceAccount" `
         -Details 'Read' `
-        -IsSatisfied { Test-AccessRulePresent -Path $ConfigPath -Account $ServiceAccount -Rights Read } `
-        -Apply { Grant-AccessRule -Path $ConfigPath -Account $ServiceAccount -Rights Read }
+        -IsSatisfied { Test-AccessRulePresent -Path $ConfigPath -Account $aclAccount -Rights Read } `
+        -Apply { Grant-AccessRule -Path $ConfigPath -Account $aclAccount -Rights Read }
 
     Stop-IDLPhase -Phase $phase
 
     # ---- Phase: service registration ----
     $phase = Start-IDLPhase -Name 'Service registration'
+
+    # Virtual (NT SERVICE\...) and built-in accounts have the right already; users, MSAs and gMSAs may not.
+    if ($accountKind -ne 'BuiltIn'){
+        Invoke-InstallStep -Action 'GrantServiceLogonRight' -Identity $ServiceAccount `
+            -Details "'Log on as a service' (SeServiceLogonRight) in the local security policy; a domain GPO that defines this right must list the account too" `
+            -IsSatisfied { Test-IDLServiceLogonRight -Account $ServiceAccount } `
+            -Apply { Grant-IDLServiceLogonRight -Account $ServiceAccount }
+    }
+
     $binPath = '"{0}" service -config "{1}"' -f $BinaryPath, $ConfigPath
-    $existing = Get-CimInstance -ClassName Win32_Service -Filter ("Name='{0}'" -f $ServiceName.Replace("'", "''")) -ErrorAction SilentlyContinue
     Write-IDLLog (($existing) ? ("Service exists: path=[$($existing.PathName)] account=[$($existing.StartName)] mode=$($existing.StartMode)") : ('Service does not exist yet'))
 
     $existingDelayed = $false
@@ -351,15 +451,15 @@ try{
     }
 
     $serviceDescription = 'Syncs HR source records to Active Directory with an approval workflow.'
-    $logOnAccount = (($ServiceAccount -eq 'LocalSystem') ? ('LocalSystem') : ($ServiceAccount))
 
     if (-not $existing){
         Invoke-InstallStep -Action 'CreateService' -Identity $ServiceName -Details $binPath `
             -IsSatisfied { $false } `
             -Apply {
+            # A user account is created with an empty password here; SetServiceCredential sets the real one next.
             $scArgs = @('create', $ServiceName, 'binPath=', $binPath, 'start=', 'delayed-auto', 'obj=', $logOnAccount, 'DisplayName=', 'IDLifecycle Identity Lifecycle Service')
-            if ($isGmsa){
-                $scArgs += @('password=', '""')
+            if ($accountKind -ne 'BuiltIn'){
+                $scArgs += @('password=', (Get-IDLScEmptyArgument))
             }
 
             $null = Invoke-ScExe -Arguments $scArgs
@@ -369,12 +469,16 @@ try{
         Invoke-InstallStep -Action 'ConfigureService' -Identity $ServiceName -Details "binPath/account -> $binPath as $logOnAccount" `
             -IsSatisfied {
             ([string]$existing.PathName -ceq $binPath) -and
-            ([string]$existing.StartName -ieq $logOnAccount)
+            (-not $accountChanges)
         } `
             -Apply {
-            $scArgs = @('config', $ServiceName, 'binPath=', $binPath, 'obj=', $logOnAccount)
-            if ($isGmsa){
-                $scArgs += @('password=', '""')
+            $scArgs = @('config', $ServiceName, 'binPath=', $binPath)
+            # obj= only when the account changes: re-sending it with an empty password would wipe a stored password.
+            if ($accountChanges){
+                $scArgs += @('obj=', $logOnAccount)
+                if ($accountKind -ne 'BuiltIn'){
+                    $scArgs += @('password=', (Get-IDLScEmptyArgument))
+                }
             }
 
             $null = Invoke-ScExe -Arguments $scArgs
@@ -383,6 +487,23 @@ try{
         Invoke-InstallStep -Action 'SetStartType' -Identity $ServiceName -Details 'Automatic (Delayed Start)' `
             -IsSatisfied { ([string]$existing.StartMode -eq 'Auto') -and $existingDelayed } `
             -Apply { $null = Invoke-ScExe -Arguments @('config', $ServiceName, 'start=', 'delayed-auto') }
+    }
+
+    if ($isPasswordAccount){
+        # Satisfied only when the account is unchanged and no new password was given (the SCM keeps the stored one).
+        Invoke-InstallStep -Action 'SetServiceCredential' -Identity "$ServiceName as $logOnAccount" `
+            -Details 'password stored by the Service Control Manager (Set-Service -Credential)' `
+            -IsSatisfied {
+            ($null -eq $servicePasswordPlain) -and
+            (-not $accountChanges)
+        } `
+            -Apply {
+            if ($null -eq $ServiceAccountPassword){
+                throw "ServiceAccount '$ServiceAccount' needs -ServiceAccountPassword."
+            }
+
+            Set-IDLServiceCredential -Name $ServiceName -Account $logOnAccount -Password $ServiceAccountPassword
+        }
     }
 
     Invoke-InstallStep -Action 'SetDescription' -Identity $ServiceName `
@@ -420,6 +541,7 @@ catch{
     Write-IDLLog "Stack: $($_.ScriptStackTrace)" 'DEBUG'
 }
 finally{
+    $servicePasswordPlain = $null
     Stop-IDLRun -ExitCode $exitCode
 }
 

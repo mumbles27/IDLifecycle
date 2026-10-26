@@ -168,6 +168,7 @@ type openKey struct{ identity, typ string }
 type runNotes struct {
 	pending    []string // "type display (external id)" of changes waiting for a human
 	thresholds []string // safety limits that held changes back
+	issues     []string // identity issues: names to choose, matches to verify, accounts nobody matches
 }
 
 func (e *Engine) sync(ctx context.Context, run *model.Run, notes *runNotes) error {
@@ -232,10 +233,13 @@ func (e *Engine) sync(ctx context.Context, run *model.Run, notes *runNotes) erro
 
 	// 2. AD snapshot.
 	props := attributeNames(mappings, rules)
+	if settings.Correlate.Enabled {
+		props = withCorrelationAttrs(props, settings.Correlate.Rules)
+	}
 	groupIDs := AllRuleGroups(rules)
 	snap, err := e.AD.Snapshot(ctx, ad.SnapshotRequest{
 		Server: settings.AD.Server, SearchBases: snapshotBases(settings.AD), IDAttribute: settings.AD.IDAttribute,
-		Properties: props, Groups: groupIDs,
+		Properties: props, Groups: groupIDs, IncludeUnlinked: settings.Correlate.Enabled,
 	})
 	if err != nil {
 		return fmt.Errorf("AD snapshot: %w", err)
@@ -244,9 +248,12 @@ func (e *Engine) sync(ctx context.Context, run *model.Run, notes *runNotes) erro
 	byExt := map[string][]*ad.User{}
 	for i := range snap.Users {
 		u := &snap.Users[i]
+		if u.ExternalID == "" {
+			continue // not linked to anybody (only returned for correlation)
+		}
 		byExt[u.ExternalID] = append(byExt[u.ExternalID], u)
 	}
-	if len(snap.Users) == 0 {
+	if len(byExt) == 0 {
 		for _, id := range idents {
 			if id.ADGUID != "" {
 				return errors.New("AD snapshot returned no users although accounts are linked; refusing to continue (check ad.search_bases and the service account's read rights)")
@@ -273,12 +280,17 @@ func (e *Engine) sync(ctx context.Context, run *model.Run, notes *runNotes) erro
 		}
 	}
 
-	// 3. link + plan.
-	type plan struct {
-		id model.Identity
-		p  *Planned
+	// 3. correlate, link + plan.
+	var transferring map[string]bool
+	if settings.Correlate.Enabled {
+		var warns []string
+		pc.Links, transferring, warns = correlate(settings, snap.Users, idents, byExt)
+		cnt["warnings"] += len(warns)
+		for _, w := range warns {
+			e.Log.Warn("correlation warning", "warning", w)
+		}
 	}
-	var plans []plan
+	var plans []plannedFor
 	processed := map[string]bool{}
 	decided := map[string]bool{} // identities the planner reached a verdict for (with or without a change)
 	var planErrs []string
@@ -289,6 +301,12 @@ func (e *Engine) sync(ctx context.Context, run *model.Run, notes *runNotes) erro
 	}
 	for _, id := range idents {
 		processed[id.ID] = true
+		if id.State == model.StateMerged {
+			// Its account was handed to another person record (MergedInto); that record manages it now.
+			decided[id.ID] = true
+			cnt["merged"]++
+			continue
+		}
 		if extCount[id.ExternalID] > 1 {
 			cnt["plan_errors"]++
 			planErrs = append(planErrs, fmt.Sprintf("%s: the same external id appears in more than one source; they would map to one AD account, so it is skipped", id.ExternalID))
@@ -337,12 +355,23 @@ func (e *Engine) sync(ctx context.Context, run *model.Run, notes *runNotes) erro
 				return fmt.Errorf("update identity %s: %w", id.ExternalID, err)
 			}
 		}
+		if p != nil && p.Type != "" && acct != nil && transferring[strings.ToLower(acct.ObjectGUID)] {
+			// The account is proposed for another person record (contractor -> employee, rehire): no changes from the
+			// old record until a person decides about the link.
+			cnt["held_for_link"]++
+			continue
+		}
 		if p == nil || p.Type == "" {
 			cnt["unchanged"]++
 			continue
 		}
-		plans = append(plans, plan{id, p})
+		plans = append(plans, plannedFor{id, p})
 	}
+	for _, w := range e.checkNames(ctx, settings, plans) {
+		cnt["warnings"]++
+		e.Log.Warn("name check", "warning", w)
+	}
+
 	if len(planErrs) > 0 {
 		shown := planErrs
 		if len(shown) > 5 {
@@ -380,6 +409,17 @@ func (e *Engine) sync(ctx context.Context, run *model.Run, notes *runNotes) erro
 		e.Log.Warn("bulk-destructive guard tripped; disables/deletes need manual approval", "count", destructive, "limit", settings.Engine.MaxDestructivePerRun)
 		cnt["guard_tripped"] = 1
 		notes.thresholds = append(notes.thresholds, fmt.Sprintf("%d disables/deletes were planned in one run, above engine.max_destructive_per_run (%d); all of them need manual approval.", destructive, settings.Engine.MaxDestructivePerRun))
+	}
+	autoLinks := 0
+	for _, pl := range plans {
+		if lp := pl.p.Payload.Link; pl.p.Type == model.ChangeLink && lp.Chosen != "" && !lp.Verify {
+			autoLinks++
+		}
+	}
+	heldLinks := settings.Correlate.MaxAutoLinksPerRun > 0 && autoLinks > settings.Correlate.MaxAutoLinksPerRun
+	if heldLinks {
+		cnt["link_guard_tripped"] = 1
+		notes.thresholds = append(notes.thresholds, fmt.Sprintf("%d accounts were matched to people in one run, above correlation.max_auto_links_per_run (%d); all of these links need manual approval.", autoLinks, settings.Correlate.MaxAutoLinksPerRun))
 	}
 	heldDeletes := settings.Engine.MaxDeletesPerRun > 0 && deletes > settings.Engine.MaxDeletesPerRun
 	if heldDeletes {
@@ -426,8 +466,28 @@ func (e *Engine) sync(ctx context.Context, run *model.Run, notes *runNotes) erro
 		if held && destructiveChange {
 			holds = append(holds, fmt.Sprintf("HELD for manual approval: %d disables/deletes in one run exceeds the limit of %d", destructive, settings.Engine.MaxDestructivePerRun))
 		}
+		if p.Payload.NeedsOU {
+			holds = append(holds, "WAITING for an OU: choose one with Change OU, then approve")
+		}
 		if heldDeletes && p.Type == model.ChangeDelete {
 			holds = append(holds, fmt.Sprintf("HELD for manual approval: %d deletes in one run exceeds the limit of %d", deletes, settings.Engine.MaxDeletesPerRun))
+		}
+		if p.Payload.NeedsName {
+			holds = append(holds, "WAITING for a username: choose one with Set name, then approve")
+			notes.issues = append(notes.issues, fmt.Sprintf("Username needed: %s (%s): %s", c.Display, c.ExternalID, conflictText(p.Payload.NameConflicts)))
+		}
+		if lp := p.Payload.Link; p.Type == model.ChangeLink {
+			switch {
+			case lp.Chosen == "":
+				holds = append(holds, "WAITING for a decision: choose the matching account (or create a new one), then approve")
+				notes.issues = append(notes.issues, fmt.Sprintf("Choose the account: %s (%s) matches %d existing account(s)", c.Display, c.ExternalID, len(lp.Candidates)))
+			case lp.Verify:
+				holds = append(holds, "VERIFY the match: approve only if the account belongs to this person")
+				ch, _ := lp.ChosenCandidate()
+				notes.issues = append(notes.issues, fmt.Sprintf("Verify the match: %s (%s) -> %s (%s)", c.Display, c.ExternalID, ch.Sam, matchText(ch)))
+			case heldLinks:
+				holds = append(holds, fmt.Sprintf("HELD for manual approval: %d links in one run exceeds the limit of %d", autoLinks, settings.Correlate.MaxAutoLinksPerRun))
+			}
 		}
 		switch {
 		case settings.Engine.DryRun:
@@ -472,6 +532,7 @@ func (e *Engine) sync(ctx context.Context, run *model.Run, notes *runNotes) erro
 			e.supersede(ctx, oc, cnt)
 		}
 	}
+	e.writeReport(ctx, run, settings, snap.Users, idents, pc.Links, plans, notes)
 	return nil
 }
 

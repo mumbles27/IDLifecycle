@@ -17,6 +17,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/coreos/go-oidc/v3/oidc"
+	"idlifecycle/internal/config"
+
 	"idlifecycle/internal/engine"
 	"idlifecycle/internal/model"
 	"idlifecycle/internal/notify"
@@ -40,6 +43,7 @@ type Server struct {
 	Store     *store.Store
 	Engine    *engine.Engine
 	Cipher    *secrets.Cipher
+	Config    config.Config // data_dir and config.json path (backups)
 	Scheduler Scheduler
 	Notifier  *notify.Service // optional; a default one is built from Store/Cipher when nil
 	Static    http.Handler
@@ -48,8 +52,21 @@ type Server struct {
 	TLS       bool
 	// BaseCtx outlives individual requests; background sync runs use it.
 	BaseCtx context.Context
+	// OIDCAuthority and OIDCHTTPClient default to Entra ID's login host and a client with a timeout;
+	// tests point them at a fake identity provider.
+	OIDCAuthority  string
+	OIDCHTTPClient *http.Client
 
 	limiter *ipLimiter
+
+	schemaMu     sync.Mutex
+	schemaCached *schemaCache
+	ous          ouCache
+
+	oidcMu        sync.Mutex
+	oidcProviders map[string]*oidc.Provider
+	oidcFlows     map[string]oidcFlow // pending sign-ins by state
+
 	handler http.Handler
 	once    sync.Once
 }

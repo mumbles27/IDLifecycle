@@ -184,6 +184,67 @@ Remove-ADUser -Identity bsmith -Confirm:`$false
         @((Read-StubStateFile -Path $state).objects)[0].dn | Should Be "CN=ExchangeActiveSyncDevices,CN=Jane Doe,OU=Disabled,$script:Root"
     }
 
+    It 'matches multi-valued attributes of users, groups and contacts value by value (case-insensitive)' {
+        $jane = New-StubUserEntry -Sam 'jdoe' -ExternalId 'E1001' -Cn 'Jane Doe' -Attributes @{ proxyAddresses = @('SMTP:jane@stub.test', 'smtp:jd@stub.test') }
+        $objects = @(@{ dn = "CN=Vendor,OU=Sales,$script:Root"; objectClass = 'contact'; attributes = @{ mail = 'v@vendor.example'; proxyAddresses = @('SMTP:v@vendor.example') } })
+        $state = New-StubStateFile -Users @($jane) -Groups @(@{ dn = "CN=Fin,OU=Groups,$script:Root"; sam = 'fin'; attributes = @{ mail = 'fin@stub.test' } }) -Ous @("OU=Staff,$script:Root", "OU=Sales,$script:Root", "OU=Groups,$script:Root") -Objects $objects
+        $code = @'
+function S($filter) { (@(Get-ADObject -LDAPFilter $filter -Properties mail) | ForEach-Object { $_.Name } | Sort-Object) -join ',' }
+"proxy=" + (S '(proxyAddresses=smtp:JD@stub.test)')
+"contact=" + (S '(|(mail=V@VENDOR.example)(proxyAddresses=smtp:v@vendor.example))')
+"group=" + (S '(mail=fin@stub.test)')
+"contactmail=" + (Get-ADObject -LDAPFilter '(objectClass=contact)' -Properties mail).mail
+'@
+        $r = Invoke-Snippet -State $state -Code $code
+        $r.ExitCode | Should Be 0
+        $r.StdOutRaw | Should Match 'proxy=Jane Doe'
+        $r.StdOutRaw | Should Match 'contact=Vendor'
+        $r.StdOutRaw | Should Match 'group=Fin'
+        $r.StdOutRaw | Should Match 'contactmail=v@vendor.example'
+    }
+
+    It 'Set-ADUser -Add/-Remove multi-valued values (errors like AD), -SamAccountName/-UserPrincipalName unique, -EmailAddress' {
+        $f = New-StubFixture
+        $code = @'
+Set-ADUser -Identity jdoe -Add @{ proxyAddresses = @('SMTP:jane@stub.test', 'smtp:j@stub.test') }
+try { Set-ADUser -Identity jdoe -Add @{ proxyAddresses = 'smtp:J@stub.test' } } catch { "dupadd=" + $_.Exception.Message }
+Set-ADUser -Identity jdoe -Remove @{ proxyAddresses = 'smtp:j@stub.test' }
+try { Set-ADUser -Identity jdoe -Remove @{ proxyAddresses = 'smtp:none@stub.test' } } catch { "missing=1" }
+try { Set-ADUser -Identity jdoe -SamAccountName 'bsmith' } catch { "samdup=" + $_.Exception.Message }
+try { Set-ADUser -Identity jdoe -UserPrincipalName 'bsmith@stub.test' } catch { "upndup=1" }
+Set-ADUser -Identity jdoe -SamAccountName 'jane' -UserPrincipalName 'jane@stub.test' -EmailAddress 'jane@stub.test'
+$u = Get-ADUser -Identity jane -Properties mail, proxyAddresses
+"now=" + $u.SamAccountName + "|" + $u.UserPrincipalName + "|" + $u.mail + "|" + (@($u.proxyAddresses) -join ';')
+'@
+        $r = Invoke-Snippet -State $f.State -Code $code
+        $r.ExitCode | Should Be 0
+        $r.StdOutRaw | Should Match 'dupadd=The specified value already exists'
+        $r.StdOutRaw | Should Match 'missing=1'
+        $r.StdOutRaw | Should Match 'samdup=The specified account already exists'
+        $r.StdOutRaw | Should Match 'upndup=1'
+        $r.StdOutRaw | Should Match 'now=jane\|jane@stub.test\|jane@stub.test\|SMTP:jane@stub.test'
+    }
+
+    It 'Rename-ADObject changes the RDN value (children move, the DN must stay unique) and is recorded' {
+        $jane = New-StubUserEntry -Sam 'jdoe' -ExternalId 'E1001' -Cn 'Jane Doe'
+        $bob = New-StubUserEntry -Sam 'bsmith' -ExternalId 'E1002' -Cn 'Bob Smith'
+        $state = New-StandardState -Users @($jane, $bob) -Objects @(@{ dn = "CN=ExchangeActiveSyncDevices,$($jane.dn)"; objectClass = 'msExchActiveSyncDevices' })
+        $code = @'
+$o = Rename-ADObject -Identity jdoe -NewName 'Jane Doe, Jr.' -PassThru
+"dn=" + $o.DistinguishedName
+try { Rename-ADObject -Identity bsmith -NewName 'Jane Doe, Jr.' } catch { "dup=" + $_.Exception.Message }
+'@
+        $r = Invoke-Snippet -State $state -Code $code
+        $r.ExitCode | Should Be 0
+        $r.StdOutRaw | Should Match ([regex]::Escape("dn=CN=Jane Doe\, Jr.,OU=Staff,$script:Root"))
+        $r.StdOutRaw | Should Match 'dup=The object already exists'
+        @((Read-StubStateFile -Path $state).objects)[0].dn | Should Be "CN=ExchangeActiveSyncDevices,CN=Jane Doe\, Jr.,OU=Staff,$script:Root"
+        $calls = Get-StubCalls -Path $state -Cmdlet 'Rename-ADObject'
+        $calls.Count | Should Be 2
+        $calls[0].result | Should Be 'ok'
+        $calls[1].result | Should Match '^error'
+    }
+
     It 'throws a connection error from every cmdlet when failConnect is set' {
         $state = New-StubStateFile -FailConnect $true
         $r = Invoke-Snippet -State $state -Code 'try { Get-ADRootDSE } catch { "type=" + $_.Exception.GetType().Name }'

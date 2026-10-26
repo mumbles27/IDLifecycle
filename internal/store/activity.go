@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"hash"
 	"strconv"
+	"strings"
 	"time"
 
 	"idlifecycle/internal/model"
@@ -18,17 +19,19 @@ import (
 // ---- identities ------------------------------------------------------------
 
 const identityCols = `i.id, i.source_id, s.name, i.external_id, i.display, i.attrs_json, i.attrs_hash, i.active, i.missing_runs,
-	i.first_seen, i.last_seen, i.ad_guid, i.ad_dn, i.ad_sam, i.applied_json, i.disabled_at, i.lifecycle_state`
+	i.first_seen, i.last_seen, i.ad_guid, i.ad_dn, i.ad_sam, i.applied_json, i.disabled_at, i.lifecycle_state,
+	i.ou_override, i.ou_override_value, i.merged_into, i.link_decision, c.name_override, c.link_rejects`
 
-const identityFrom = ` FROM identities i LEFT JOIN sources s ON s.id = i.source_id`
+const identityFrom = ` FROM identities i LEFT JOIN sources s ON s.id = i.source_id LEFT JOIN identity_choices c ON c.identity_id = i.id`
 
 func scanIdentity(sc interface{ Scan(...any) error }) (model.Identity, error) {
 	var x model.Identity
-	var src sql.NullString
+	var src, names, rejects sql.NullString
 	var attrs, applied, first, last, dis string
 	var active int
 	err := sc.Scan(&x.ID, &x.SourceID, &src, &x.ExternalID, &x.Display, &attrs, &x.AttrsHash, &active, &x.MissingRuns,
-		&first, &last, &x.ADGUID, &x.ADDN, &x.ADSam, &applied, &dis, &x.State)
+		&first, &last, &x.ADGUID, &x.ADDN, &x.ADSam, &applied, &dis, &x.State, &x.OUOverride, &x.OUOverrideValue,
+		&x.MergedInto, &x.LinkDecision, &names, &rejects)
 	x.SourceName = src.String
 	x.Active = active != 0
 	x.Attrs = map[string]string{}
@@ -36,6 +39,11 @@ func scanIdentity(sc interface{ Scan(...any) error }) (model.Identity, error) {
 	x.Applied = map[string]string{}
 	fromJSON(applied, &x.Applied)
 	x.FirstSeen, x.LastSeen, x.DisabledAt = parseTS(first), parseTS(last), parseTSP(dis)
+	if names.String != "" && names.String != "null" {
+		x.NameOverride = &model.Candidate{}
+		fromJSON(names.String, x.NameOverride)
+	}
+	fromJSON(rejects.String, &x.LinkRejects)
 	return x, err
 }
 
@@ -50,11 +58,24 @@ func (s *Store) InsertIdentity(ctx context.Context, x model.Identity) error {
 	return err
 }
 
+// SetIdentityOU records (or, with ou "", clears) the OU a person chose for an identity and the placement value
+// it applies to. It is separate from UpdateIdentity so a sync run never overwrites a choice made meanwhile.
+func (s *Store) SetIdentityOU(ctx context.Context, id, ou, value string) error {
+	n, err := s.affected(ctx, `UPDATE identities SET ou_override = ?, ou_override_value = ? WHERE id = ?`, ou, value, id)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *Store) UpdateIdentity(ctx context.Context, x model.Identity) error {
 	n, err := s.affected(ctx, `UPDATE identities SET display = ?, attrs_json = ?, attrs_hash = ?, active = ?, missing_runs = ?, last_seen = ?,
-		ad_guid = ?, ad_dn = ?, ad_sam = ?, applied_json = ?, disabled_at = ?, lifecycle_state = ? WHERE id = ?`,
+		ad_guid = ?, ad_dn = ?, ad_sam = ?, applied_json = ?, disabled_at = ?, lifecycle_state = ?, merged_into = ? WHERE id = ?`,
 		x.Display, toJSON(x.Attrs), x.AttrsHash, b2i(x.Active), x.MissingRuns, ts(x.LastSeen),
-		x.ADGUID, x.ADDN, x.ADSam, toJSON(x.Applied), tsp(x.DisabledAt), x.State, x.ID)
+		x.ADGUID, x.ADDN, x.ADSam, toJSON(x.Applied), tsp(x.DisabledAt), x.State, x.MergedInto, x.ID)
 	if err != nil {
 		return err
 	}
@@ -100,7 +121,7 @@ func (s *Store) ListIdentities(ctx context.Context, f IdentityFilter, p Page) ([
 	if f.State != "" {
 		w.add("i.lifecycle_state = ?", f.State)
 	}
-	w.like(f.Q, "i.external_id", "i.display", "i.ad_sam", "i.ad_dn")
+	w.like(s.driver, f.Q, "i.external_id", "i.display", "i.ad_sam", "i.ad_dn")
 
 	var total int
 	if err := s.queryRow(ctx, `SELECT COUNT(*)`+identityFrom+w.sql(), w.args...).Scan(&total); err != nil {
@@ -237,7 +258,7 @@ type ChangeFilter struct {
 	RunID      string
 }
 
-func (f ChangeFilter) where() *where {
+func (f ChangeFilter) where(driver string) *where {
 	w := &where{}
 	if f.Status != "" {
 		w.add("status = ?", f.Status)
@@ -251,12 +272,12 @@ func (f ChangeFilter) where() *where {
 	if f.RunID != "" {
 		w.add("run_id = ?", f.RunID)
 	}
-	w.like(f.Q, "display", "external_id")
+	w.like(driver, f.Q, "display", "external_id")
 	return w
 }
 
 func (s *Store) ListChanges(ctx context.Context, f ChangeFilter, p Page) ([]model.Change, int, error) {
-	w := f.where()
+	w := f.where(s.driver)
 	total, err := s.count(ctx, "changes", w)
 	if err != nil {
 		return nil, 0, err
@@ -367,6 +388,19 @@ func (s *Store) FinishChange(ctx context.Context, id, status, errMsg string) err
 	return nil
 }
 
+// UpdateChangePayload replaces a change's payload, summary and hash while it still has status (a person chose its OU).
+func (s *Store) UpdateChangePayload(ctx context.Context, id, status string, p model.ChangePayload, summary []string, hash string) error {
+	n, err := s.affected(ctx, `UPDATE changes SET payload_json = ?, summary_json = ?, payload_hash = ? WHERE id = ? AND status = ?`,
+		toJSON(p), toJSON(summary), hash, id, status)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrConflict
+	}
+	return nil
+}
+
 // FailInterruptedChanges marks 'applying' changes (from a crash) as failed.
 func (s *Store) FailInterruptedChanges(ctx context.Context) (int64, error) {
 	return s.affected(ctx, `UPDATE changes SET status = ?, error = ? WHERE status = ?`,
@@ -413,11 +447,76 @@ func (s *Store) AppendAudit(ctx context.Context, actor, action, entityType, enti
 	})
 }
 
+// AuditFilter selects audit entries. Every set field must match (AND); the entries of one list field are
+// alternatives (OR) except Text and NotText, whose terms must all (not) appear.
 type AuditFilter struct {
-	Actor      string
-	Action     string
-	EntityType string
-	EntityID   string
+	Actor      string // exact
+	Action     string // exact
+	EntityType string // exact
+	EntityID   string // exact
+	Actors     []string
+	Actions    []string // exact, or a prefix when it ends in '*' (change.* = every change action)
+	Text       []string // case-insensitive, in the actor, action, entity or detail
+	NotText    []string
+	From, To   time.Time // From <= ts < To (zero = open)
+	// ErrorsOnly keeps failures: actions that end in failed/denied/rejected/blocked, and entries whose detail has a
+	// non-empty "error".
+	ErrorsOnly bool
+}
+
+func (f AuditFilter) where(driver string) *where {
+	w := &where{}
+	for col, v := range map[string]string{"actor": f.Actor, "action": f.Action, "entity_type": f.EntityType, "entity_id": f.EntityID} {
+		if v != "" {
+			w.add(col+" = ?", v)
+		}
+	}
+	// Db2 needs a typed pattern marker (see like); the others take a plain one.
+	pat := "?"
+	if driver == DriverDB2 {
+		pat = "CAST(? AS VARCHAR(32672))"
+	}
+	anyOf := func(col string, vals []string) {
+		var ors []string
+		for _, v := range vals {
+			if strings.HasSuffix(v, "*") {
+				ors = append(ors, col+" LIKE "+pat+" ESCAPE '!'")
+				w.args = append(w.args, likeEscape(driver, strings.TrimSuffix(v, "*"))+"%")
+			} else {
+				ors = append(ors, col+" = ?")
+				w.args = append(w.args, v)
+			}
+		}
+		if len(ors) > 0 {
+			w.parts = append(w.parts, "("+strings.Join(ors, " OR ")+")")
+		}
+	}
+	anyOf("actor", f.Actors)
+	anyOf("action", f.Actions)
+	cols := []string{"actor", "action", "entity_type", "entity_id", "detail_json"}
+	for _, t := range f.Text {
+		w.like(driver, t, cols...)
+	}
+	for _, t := range f.NotText {
+		w.notLike(driver, t, cols...)
+	}
+	if !f.From.IsZero() {
+		w.add("ts >= ?", ts(f.From))
+	}
+	if !f.To.IsZero() {
+		w.add("ts < ?", ts(f.To))
+	}
+	if f.ErrorsOnly {
+		detail := "detail_json"
+		if driver == DriverDB2 {
+			detail = "CAST(detail_json AS VARCHAR(32672))"
+		}
+		l := " LIKE " + pat + " ESCAPE '!'"
+		w.parts = append(w.parts, "(action"+l+" OR action"+l+" OR action"+l+" OR action"+l+" OR ("+detail+l+" AND "+detail+" NOT"+l+"))")
+		// '_' after "error":" is the LIKE single-character wildcard: a non-empty error value.
+		w.args = append(w.args, "%failed", "%denied", "%rejected", "%blocked", `%"error":"_%`, `%"error":""%`)
+	}
+	return w
 }
 
 func scanAudit(sc interface{ Scan(...any) error }) (model.AuditEntry, string, error) {
@@ -433,19 +532,7 @@ func scanAudit(sc interface{ Scan(...any) error }) (model.AuditEntry, string, er
 const auditCols = `seq, ts, actor, action, entity_type, entity_id, detail_json, prev_hash, hash`
 
 func (s *Store) ListAudit(ctx context.Context, f AuditFilter, p Page) ([]model.AuditEntry, int, error) {
-	w := &where{}
-	if f.Actor != "" {
-		w.add("actor = ?", f.Actor)
-	}
-	if f.Action != "" {
-		w.add("action = ?", f.Action)
-	}
-	if f.EntityType != "" {
-		w.add("entity_type = ?", f.EntityType)
-	}
-	if f.EntityID != "" {
-		w.add("entity_id = ?", f.EntityID)
-	}
+	w := f.where(s.driver)
 	total, err := s.count(ctx, "audit_log", w)
 	if err != nil {
 		return nil, 0, err
@@ -546,7 +633,7 @@ func (s *Store) BrowseTable(ctx context.Context, name, q string, p Page) (TableV
 		return TableView{}, ErrNotFound
 	}
 	w := &where{}
-	w.like(q, def.search...)
+	w.like(s.driver, q, def.search...)
 	total, err := s.count(ctx, name, w)
 	if err != nil {
 		return TableView{}, err
@@ -561,6 +648,12 @@ func (s *Store) BrowseTable(ctx context.Context, name, q string, p Page) (TableV
 	cols, err := rows.Columns()
 	if err != nil {
 		return TableView{}, err
+	}
+	if s.driver == DriverDB2 {
+		// Db2 folds unquoted identifiers to upper case; keep the API's column names stable.
+		for i := range cols {
+			cols[i] = strings.ToLower(cols[i])
+		}
 	}
 	view := TableView{Name: name, Columns: cols, Rows: [][]any{}, Total: total}
 	for rows.Next() {

@@ -22,9 +22,11 @@ import (
 
 	"idlifecycle/internal/api"
 	"idlifecycle/internal/app"
+	"idlifecycle/internal/backup"
 	"idlifecycle/internal/config"
 	"idlifecycle/internal/datadir"
 	"idlifecycle/internal/model"
+	"idlifecycle/internal/secrets"
 	"idlifecycle/internal/store"
 )
 
@@ -33,16 +35,33 @@ const usage = `idlifecycled - Active Directory identity lifecycle service
 Usage:
   idlifecycled run      [-config FILE]     run in the foreground (Ctrl+C to stop)
   idlifecycled service  [-config FILE]     run under the Windows Service Control Manager
-  idlifecycled init     [-dir DIR] [-scripts DIR]   create a default config.json and data directory
+  idlifecycled init     [-dir DIR] [-scripts DIR] [-db-driver D -db-dsn DSN] [-listen ADDR -tls-cert F -tls-key F]
+                                                      create config.json and the (restricted) data directory
+  idlifecycled check    [-config FILE] [-json] [-skip-ad-module]   verify config, data dir ACL, database,
+                                                      admin user, PowerShell, scripts and the AD module. It connects
+                                                      to the database and creates/migrates the schema, and creates
+                                                      secret.key when missing (the installer's database setup step).
+                                                      Every check is always listed, in that order; one that did not
+                                                      run is marked skipped ("skipped": true in -json)
   idlifecycled lockdown [-config FILE] [-account NAME]  restrict the data directory to SYSTEM, Administrators,
                                                       you and the service account (the service refuses to start otherwise)
   idlifecycled user add    -username NAME -role viewer|approver|admin [-config FILE]
   idlifecycled user passwd -username NAME [-config FILE]
   idlifecycled user list   [-config FILE]
+  idlifecycled backup   [-config FILE] [-dir DIR] [-note TEXT]
+                                                      write an encrypted backup (database, config.json, master key) to
+                                                      DIR (default <data_dir>\backups) as IDLifecycle_<host>_<time>.idlbak
+  idlifecycled restore  -in FILE [-config FILE] [-with-config] [-force]
+                                                      replace the database with a backup and put its master key in
+                                                      place (stop the service first; start it afterwards). -with-config
+                                                      also takes its config.json except data_dir, database and
+                                                      powershell.scripts_dir. -force replaces a database that has data
+  idlifecycled restore  -in FILE -inspect             show a backup's header (no passphrase needed)
   idlifecycled version
 
 Passwords are read from the IDL_PASSWORD environment variable, or prompted for (hidden) on a terminal,
-or read from one line of stdin when piped. They are never accepted on the command line.
+or read from one line of stdin when piped. Backup passphrases (12+ characters) the same way, from
+IDL_BACKUP_PASSPHRASE. They are never accepted on the command line.
 `
 
 func main() {
@@ -63,8 +82,14 @@ func realMain(args []string, stdout, stderr io.Writer) int {
 		return cmdInit(args[1:], stdout, stderr)
 	case "lockdown":
 		return cmdLockdown(args[1:], stdout, stderr)
+	case "check":
+		return cmdCheck(args[1:], stdout, stderr)
 	case "user":
 		return cmdUser(args[1:], stdout, stderr)
+	case "backup":
+		return cmdBackup(args[1:], stdout, stderr)
+	case "restore":
+		return cmdRestore(args[1:], stdout, stderr)
 	case "version", "-v", "--version":
 		fmt.Fprintln(stdout, "idlifecycled", app.Version)
 		return 0
@@ -138,7 +163,22 @@ func cmdInit(args []string, stdout, stderr io.Writer) int {
 	def := filepath.Dir(defaultConfigPath())
 	dir := fs.String("dir", def, "data directory (holds config.json, the SQLite DB, logs and the key file)")
 	scripts := fs.String("scripts", "", "directory containing the PowerShell scripts (default: <dir>\\scripts)")
+	dbDriver := fs.String("db-driver", "", "database driver: sqlite (default), mssql, postgres, mysql or db2")
+	dbDSN := fs.String("db-dsn", "", `connection string; prefer env:VAR_NAME (read from the service's environment at run time): `+
+		`a literal value is visible in process listings and shell history (default for sqlite: <dir>\idlifecycle.db; needs -db-driver)`)
+	listen := fs.String("listen", "", "listen address host:port (default 127.0.0.1:8443; non-loopback needs -tls-cert/-tls-key)")
+	tlsCert := fs.String("tls-cert", "", "TLS certificate file (PEM)")
+	tlsKey := fs.String("tls-key", "", "TLS private key file (PEM)")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	// Usage errors first, before the data directory is created.
+	if *dbDSN != "" && *dbDriver == "" {
+		fmt.Fprintln(stderr, "error: -db-dsn requires -db-driver (sqlite, mssql, postgres, mysql or db2)")
+		return 2
+	}
+	if *dbDriver == "sqlite" && looksODBC(*dbDSN) {
+		fmt.Fprintln(stderr, "error: -db-dsn looks like an ODBC connection string, which -db-driver sqlite cannot use (did you mean -db-driver db2?)")
 		return 2
 	}
 	if err := os.MkdirAll(*dir, 0o750); err != nil {
@@ -159,6 +199,24 @@ func cmdInit(args []string, stdout, stderr io.Writer) int {
 	if *scripts != "" {
 		cfg.PowerShell.ScriptsDir = *scripts
 	}
+	if *dbDriver != "" && *dbDriver != "sqlite" {
+		if *dbDSN == "" {
+			fmt.Fprintln(stderr, "error: -db-dsn is required with -db-driver", *dbDriver)
+			return 2
+		}
+		cfg.Database.Driver = *dbDriver
+	}
+	if *dbDSN != "" {
+		cfg.Database.DSN = *dbDSN
+	}
+	if *listen != "" {
+		cfg.Listen = *listen
+	}
+	cfg.TLS.CertFile, cfg.TLS.KeyFile = *tlsCert, *tlsKey
+	if err := cfg.Validate(); err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 2
+	}
 	b, _ := json.MarshalIndent(cfg, "", "  ")
 	if err := os.WriteFile(path, append(b, '\n'), 0o600); err != nil {
 		fmt.Fprintln(stderr, "error:", err)
@@ -167,6 +225,12 @@ func cmdInit(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "Wrote %s\n\nNext steps:\n  1. Copy the scripts folder to %s\n  2. idlifecycled user add -config %q -username admin -role admin\n  3. idlifecycled run -config %q   (or install the service with scripts\\Install-IDLifecycleService.ps1)\n  4. Open http://%s/ and finish configuration in the GUI. The service starts in DRY-RUN mode.\n",
 		path, cfg.PowerShell.ScriptsDir, path, path, cfg.Listen)
 	return 0
+}
+
+// looksODBC reports an ODBC-style connection string (Driver=..., DSN=..., or ...;Uid=...).
+func looksODBC(dsn string) bool {
+	l := strings.ToLower(strings.ReplaceAll(dsn, " ", ""))
+	return strings.Contains(l, "driver=") || strings.Contains(l, "dsn=") || strings.Contains(l, ";uid=")
 }
 
 func cmdLockdown(args []string, stdout, stderr io.Writer) int {
@@ -233,13 +297,17 @@ func cmdUser(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		tw := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(tw, "USERNAME\tROLE\tDISABLED\tLAST LOGIN")
+		fmt.Fprintln(tw, "USERNAME\tROLE\tSIGN-IN\tDISABLED\tLAST LOGIN")
 		for _, u := range users {
 			last := "never"
 			if u.LastLoginAt != nil {
 				last = u.LastLoginAt.Local().Format(time.RFC3339)
 			}
-			fmt.Fprintf(tw, "%s\t%s\t%v\t%s\n", u.Username, u.Role, u.Disabled, last)
+			src := "password"
+			if u.AuthSource == model.AuthOIDC {
+				src = "entra-id"
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%v\t%s\n", u.Username, u.Role, src, u.Disabled, last)
 		}
 		_ = tw.Flush()
 		return 0
@@ -282,6 +350,10 @@ func cmdUser(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "error: no such user")
 			return 1
 		}
+		if u.AuthSource == model.AuthOIDC {
+			fmt.Fprintln(stderr, "error: this account signs in with Entra ID and has no password here; create a local break-glass admin with: idlifecycled user add -username <name> -role admin")
+			return 2
+		}
 		pw, err := readPassword(true)
 		if err != nil {
 			fmt.Fprintln(stderr, "error:", err)
@@ -306,11 +378,23 @@ func cmdUser(args []string, stdout, stderr io.Writer) int {
 }
 
 func readPassword(confirm bool) (string, error) {
-	pw := os.Getenv("IDL_PASSWORD")
+	pw, err := readSecret("IDL_PASSWORD", "Password", confirm)
+	if err != nil {
+		return "", err
+	}
+	if msg := api.ValidatePassword(pw); msg != "" {
+		return "", errors.New(msg)
+	}
+	return pw, nil
+}
+
+// readSecret takes a secret from the environment variable env, a hidden prompt on a terminal, or one line of stdin.
+func readSecret(env, label string, confirm bool) (string, error) {
+	pw := os.Getenv(env)
 	switch {
 	case pw != "":
 	case term.IsTerminal(int(os.Stdin.Fd())):
-		fmt.Fprint(os.Stderr, "Password: ")
+		fmt.Fprint(os.Stderr, label+": ")
 		b, err := term.ReadPassword(int(os.Stdin.Fd()))
 		fmt.Fprintln(os.Stderr)
 		if err != nil {
@@ -318,25 +402,140 @@ func readPassword(confirm bool) (string, error) {
 		}
 		pw = string(b)
 		if confirm {
-			fmt.Fprint(os.Stderr, "Repeat password: ")
+			fmt.Fprint(os.Stderr, "Repeat "+strings.ToLower(label)+": ")
 			b2, err := term.ReadPassword(int(os.Stdin.Fd()))
 			fmt.Fprintln(os.Stderr)
 			if err != nil {
 				return "", err
 			}
 			if string(b2) != pw {
-				return "", errors.New("passwords do not match")
+				return "", errors.New("the two entries do not match")
 			}
 		}
 	default:
 		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 		if err != nil && line == "" {
-			return "", errors.New("no password supplied (set IDL_PASSWORD or pipe one line on stdin)")
+			return "", fmt.Errorf("no %s supplied (set %s or pipe one line on stdin)", strings.ToLower(label), env)
 		}
 		pw = strings.TrimRight(line, "\r\n")
 	}
-	if msg := api.ValidatePassword(pw); msg != "" {
-		return "", errors.New(msg)
-	}
 	return pw, nil
+}
+
+func cmdBackup(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("backup", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	cfgPath := configFlag(fs)
+	dir := fs.String("dir", "", `folder for the backup (default <data_dir>\backups)`)
+	note := fs.String("note", "", "a note stored in the backup's header")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	pass, err := readSecret("IDL_BACKUP_PASSPHRASE", "Backup passphrase", true)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	if len([]rune(pass)) < backup.MinPassphrase {
+		fmt.Fprintf(stderr, "error: the backup passphrase must be at least %d characters\n", backup.MinPassphrase)
+		return 2
+	}
+	ctx := context.Background()
+	st, err := app.OpenStore(ctx, cfg)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	defer st.Close()
+	c, err := secrets.Load(cfg.DataDir)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	folder := *dir
+	if folder == "" {
+		folder = backup.DefaultFolder(cfg)
+	}
+	fi, h, err := backup.CreateFile(ctx, st, cfg, c, folder, pass, app.Version, *note, time.Now())
+	if err != nil {
+		_ = st.AppendAudit(ctx, "cli", "backup.failed", "backup", "", map[string]any{"error": err.Error(), "folder": folder})
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	_ = st.AppendAudit(ctx, "cli", "backup.create", "backup", fi.Name, map[string]any{"size": fi.Size, "rows": h.Tables, "folder": folder})
+	fmt.Fprintf(stdout, "Wrote %s (%d bytes)\n", fi.Path, fi.Size)
+	for _, t := range store.BackupTables {
+		fmt.Fprintf(stdout, "  %-12s %d rows\n", t, h.Tables[t])
+	}
+	fmt.Fprintln(stdout, "Keep the passphrase safe: without it the backup cannot be restored.")
+	return 0
+}
+
+func cmdRestore(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("restore", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	cfgPath := configFlag(fs)
+	in := fs.String("in", "", "the .idlbak file")
+	withConfig := fs.Bool("with-config", false, "also restore config.json (except data_dir, database, powershell.scripts_dir)")
+	force := fs.Bool("force", false, "replace a database that already has data")
+	inspect := fs.Bool("inspect", false, "only show the backup's header")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *in == "" {
+		fmt.Fprintln(stderr, "error: -in is required")
+		return 2
+	}
+	f, err := os.Open(*in)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	h, err := backup.ReadHeader(f)
+	_ = f.Close()
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 2
+	}
+	fmt.Fprintf(stdout, "Backup made %s by version %s (%s database, schema %d)%s\n", h.Created.Local().Format(time.RFC3339), h.AppVersion, h.Driver, h.Schema,
+		map[bool]string{true: ": " + h.Note, false: ""}[h.Note != ""])
+	for _, t := range store.BackupTables {
+		fmt.Fprintf(stdout, "  %-12s %d rows\n", t, h.Tables[t])
+	}
+	if *inspect {
+		return 0
+	}
+	pass, err := readSecret("IDL_BACKUP_PASSPHRASE", "Backup passphrase", false)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
+	}
+	res, err := backup.RestoreFile(context.Background(), *cfgPath, *in, backup.RestoreOptions{Passphrase: pass, Force: *force, WithConfig: *withConfig, Actor: "cli"})
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		if errors.Is(err, backup.ErrPassphrase) {
+			return 2
+		}
+		return 1
+	}
+	fmt.Fprintln(stdout, "Restored:")
+	for _, t := range store.BackupTables {
+		fmt.Fprintf(stdout, "  %-12s %d rows\n", t, res.Rows[t])
+	}
+	if res.KeyReplaced != "" {
+		fmt.Fprintf(stdout, "The previous secret.key was kept as %s\n", res.KeyReplaced)
+	}
+	if res.ConfigReplaced != "" {
+		fmt.Fprintf(stdout, "config.json taken from the backup; the previous one was kept as %s\n", res.ConfigReplaced)
+	}
+	if !res.AuditChainValid {
+		fmt.Fprintln(stdout, "WARNING: the restored audit log does not verify (it was already broken in the backup, or the backup is from a build with another audit key).")
+	}
+	fmt.Fprintln(stdout, "All sign-ins were ended. Start (or restart) the service now.")
+	return 0
 }

@@ -218,6 +218,142 @@ async function scenarioMapping() {
   await waitFor(() => !rowWith(name), 'the mapping to disappear after delete');
 }
 
+// Field mapper on the mappings page: needs the server's seeded csv source (EmployeeID, FirstName, LastName).
+async function scenarioFieldMapper() {
+  const missingName = `selftest-missing-${rand}`;
+  const mapName = `selftest-ln-${rand}`;
+  const created = [];
+  const missing = await api.post('/mappings', { name: missingName, target_attr: 'department', template: '{{ .Department }}', mode: 'sync', on_empty: 'skip', value_type: 'string', enabled: false });
+  created.push(missing.id);
+  try {
+    await go('#/mappings', 'mappings');
+    const panel = await waitFor(() => $('[data-test="field-mapper"]'), 'the field mapper panel');
+    await waitFor(() => $('[data-test="mapper-attr"][data-name="sn"] [data-test="map-attr"]'), 'the AD attribute list with a mappable "sn"');
+    if ($('[data-test="mapper-attr"][data-name="sAMAccountName"]')) {
+      throw new Error('unmappable attributes must be hidden until "show attributes that cannot be mapped" is ticked');
+    }
+    setValue($('[data-test="mapper-ad-filter"]'), 'surname');
+    await waitFor(() => $$('[data-test="mapper-attr"]').length === 1 && $('[data-test="mapper-attr"][data-name="sn"]'), 'the filter to narrow the list to "sn"');
+    setValue($('[data-test="mapper-ad-filter"]'), '');
+
+    const sel = $('[data-test="mapper-source"]', panel);
+    const opt = await waitFor(() => $$('option', sel).find((o) => text(o).startsWith('seed ')), 'the seeded source in the mapper');
+    setValue(sel, opt.value);
+    $('[data-test="mapper-load"]', panel).click();
+    const first = await waitFor(() => $('[data-test="mapper-field"][data-name="FirstName"]'), 'the source fields');
+    if (!text(first).includes('Jane') || !text(first).includes('100% filled')) {
+      throw new Error(`FirstName row does not show samples / fill rate: ${text(first)}`);
+    }
+    if (!text($('[data-test="mapper-field"][data-name="EmployeeID"]')).includes('link key')) {
+      throw new Error('EmployeeID is not marked as the link key');
+    }
+    const problem = await waitFor(() => $$('[data-test="mapper-problem"]').find((p) => text(p).includes(missingName)), 'a problem for the mapping that reads a missing field');
+    if (!text(problem).includes('Department')) {
+      throw new Error(`problem text does not name the missing field: ${text(problem)}`);
+    }
+    const last = $('[data-test="mapper-field"][data-name="LastName"]');
+    if (!$('[data-test="not-mapped"]', last)) {
+      throw new Error('LastName should show as not used by any mapping');
+    }
+
+    // Map… from the source side pre-fills the template.
+    $('[data-test="map-field"]', last).click();
+    const modal = await waitFor(() => topModal(), 'the mapping editor from Map…');
+    const tpl = $('[data-test="map-template"]', modal);
+    if (tpl.value !== '{{ .LastName }}') {
+      throw new Error(`template not pre-filled: "${tpl.value}"`);
+    }
+    const target = $('[data-test="map-target"]', modal);
+    const list = target.getAttribute('list') && document.getElementById(target.getAttribute('list'));
+    if (!list || !$$('option', list).some((o) => o.value === 'sn')) {
+      throw new Error('the target attribute has no AD attribute suggestions');
+    }
+    setValue(target, 'sAMAccountName');
+    await waitFor(() => { const w = $('[data-test="map-target-warn"]', modal); return w && !w.hidden && text(w).includes('cannot be mapped'); }, 'a warning for an unmappable target');
+    setValue(target, 'sn');
+    await waitFor(() => $('[data-test="map-target-warn"]', modal).hidden, 'the warning to clear for "sn"');
+    tpl.setSelectionRange(tpl.value.length, tpl.value.length);
+    $('[data-test="insert-field"][data-name="FirstName"]', modal).click();
+    if (!tpl.value.endsWith('{{ .FirstName }}')) {
+      throw new Error(`insert field did not add to the template: "${tpl.value}"`);
+    }
+    setValue(tpl, '{{ .LastName }}');
+    setValue($('[data-test="map-name"]', modal), mapName);
+    await submitModal('mapping editor (from the field mapper)');
+    await waitFor(() => text($('[data-test="mapper-field"][data-name="LastName"]')).includes(`${mapName} → sn`), 'LastName to show the new mapping');
+    await waitFor(() => text($('[data-test="mapper-attr"][data-name="sn"]')).includes(mapName), 'the sn attribute to show the new mapping');
+
+    // Map… from the AD side pre-fills the attribute.
+    $('[data-test="mapper-attr"][data-name="title"] [data-test="map-attr"]').click();
+    const modal2 = await waitFor(() => topModal(), 'the mapping editor from the AD side');
+    if ($('[data-test="map-target"]', modal2).value !== 'title') {
+      throw new Error('target attribute not pre-filled from the AD side');
+    }
+    byText('.modal-footer button, button', 'Cancel', modal2).click();
+    await waitFor(() => !modal2.isConnected, 'the editor to close on cancel');
+  }
+  finally {
+    const all = listItems(await api.get('/mappings', { limit: 500 }));
+    for (const m of all) {
+      if (m.name === mapName || created.includes(m.id)) {
+        await api.del(`/mappings/${encodeURIComponent(m.id)}`);
+      }
+    }
+  }
+}
+
+function listItems(resp) {
+  return (resp && Array.isArray(resp.items)) ? resp.items : [];
+}
+
+// Sign-in options: the Settings card, then the login page with Entra ID on and password sign-in limited to
+// admins. Nothing is redirected (no identity provider here); settings are restored afterwards.
+async function scenarioSignInOptions() {
+  const before = await api.get('/settings');
+  try {
+    await go('#/settings', 'settings');
+    await waitFor(() => $('[data-test="set-oidc-enabled"]') && $('[data-test="set-local-login"]'), 'the Sign-in card');
+    $('[data-test="set-oidc-redirect-here"]').click();
+    if ($('[data-test="set-oidc-redirect"]').value !== `${location.origin}/api/auth/oidc/callback`) {
+      throw new Error('"Use this server\'s address" did not fill the redirect URI');
+    }
+    const doc = await api.get('/settings');
+    doc.auth = {
+      local_login: 'admins_only',
+      oidc: {
+        enabled: true, tenant_id: '11111111-2222-3333-4444-555555555555', client_id: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+        client_secret: 'selftest-secret', redirect_url: 'http://localhost/api/auth/oidc/callback', button_label: 'Sign in with Contoso',
+        admin_values: ['IDLifecycle.Admin'], approver_values: [], viewer_values: [],
+      },
+    };
+    const saved = await api.put('/settings', doc);
+    if (saved.auth.oidc.client_secret !== '********') {
+      throw new Error('the saved settings must return the client secret masked');
+    }
+    await uiLogout();
+    const btn = await waitFor(() => $('[data-test="login-oidc"]'), 'the Sign in with Microsoft button');
+    if (text(btn) !== 'Sign in with Contoso' || !btn.getAttribute('href').endsWith('/api/auth/oidc/start')) {
+      throw new Error(`unexpected SSO button: "${text(btn)}" -> ${btn.getAttribute('href')}`);
+    }
+    if (!text($('[data-test="login-local-note"]')).includes('administrators only')) {
+      throw new Error('the break-glass note is missing when password sign-in is admins-only');
+    }
+    await uiLogin(USER, PASS); // a local admin may still sign in with a password
+  }
+  finally {
+    if (!$('[data-test="whoami"]')) {
+      await apiLogin(USER, PASS);
+    }
+    const cur = await api.get('/settings');
+    cur.auth = { ...before.auth, oidc: { ...before.auth.oidc, client_secret: '' } };
+    await api.put('/settings', cur);
+    location.hash = '#/dashboard';
+  }
+  await uiLogout();
+  await waitFor(() => $('[data-test="login-user"]') && $('[data-test="login-sso"]') && $('[data-test="login-sso"]').hidden && !$('[data-test="login-oidc"]'), 'the login page without the SSO button once Entra ID sign-in is off', 5000);
+  await uiLogin(USER, PASS);
+}
+
 async function scenarioSource() {
   const name = `selftest-csv-${rand}`;
   await go('#/sources', 'sources');
@@ -257,7 +393,7 @@ async function scenarioSource() {
 
 async function scenarioApprovals() {
   await go('#/approvals', 'approvals');
-  const findApprove = () => $('[data-test="approve"]');
+  const findApprove = () => $('[data-test="approve"]:not([disabled])');
   if (!findApprove()) {
     // Nothing pending: try to create work by running a sync, then refresh a few times.
     try {
@@ -354,6 +490,30 @@ async function scenarioSettings() {
   if (restored.engine.max_destructive_per_run !== original) {
     throw new Error('could not restore the original setting');
   }
+
+  // Initial password from a template: the template box and its complexity check appear, and "must change at next
+  // logon" is forced on. Not saved; reloading the page discards it.
+  const mode = await waitFor(() => $('[data-test="set-pw-mode"]'), 'the initial password mode');
+  mode.value = 'template';
+  mode.dispatchEvent(new Event('change', { bubbles: true }));
+  const tpl = await waitFor(() => $('[data-test="set-pw-template"]'), 'the password template field');
+  if (tpl.closest('[hidden]')) {
+    throw new Error('the password template field stays hidden in template mode');
+  }
+  const must = $('[data-test="set-must-change"]');
+  if (!must.checked || !must.disabled) {
+    throw new Error('template mode must force "must change password at next logon"');
+  }
+  setValue(tpl, '{{ .FirstName }}');
+  await waitFor(() => {
+    const c = $('[data-test="preview-check"]');
+    return c && text(c).includes('at least 8');
+  }, 'the password preview to report a too-short password');
+  await waitFor(() => $('[data-test="backup-list"]') && $('[data-test="backup-now"]'), 'the Backups card');
+  if (!$('[data-test="set-mail-template"]') || !$('[data-test="set-mail-domain"]')) {
+    throw new Error('the mail template fields are missing');
+  }
+  await go('#/dashboard', 'dashboard');
 }
 
 async function scenarioViewer() {
@@ -372,7 +532,7 @@ async function scenarioViewer() {
     if ($('.sidebar a[data-route="users"]')) {
       throw new Error('viewer can see the Users navigation entry');
     }
-    const views = ['dashboard', 'approvals', 'runs', 'identities', 'audit', 'mappings', 'roles', 'sources', 'settings', 'tables'];
+    const views = ['dashboard', 'approvals', 'runs', 'identities', 'manual', 'audit', 'mappings', 'roles', 'placement', 'matching', 'sources', 'settings', 'tables'];
     for (const v of views) {
       await go(`#/${v}`, v);
       const mutating = $$('[data-mutating]');
@@ -416,17 +576,241 @@ const STEPS = [
   ['login', scenarioLogin],
   ['dashboard renders status', scenarioDashboard],
   ['create mapping via modal', scenarioMapping],
+  ['field mapper shows fields, attributes and problems', scenarioFieldMapper],
   ['create csv source', scenarioSource],
   ['approve a pending change', scenarioApprovals],
   ['settings save round-trip', scenarioSettings],
+  ['sign-in options (Entra ID button, break-glass)', scenarioSignInOptions],
+  ['history search', scenarioHistory],
+  ['OU placement page', scenarioPlacement],
+  ['set a username on a name conflict', scenarioNeedsName],
+  ['choose the account for a link', scenarioLinkChoose],
+  ['add a person by hand (preview + create)', scenarioManualPerson],
+  ['matching page (rules, report, ignore)', scenarioMatching],
   ['viewer has no mutating controls', scenarioViewer],
 ];
 
+async function scenarioHistory() {
+  await go('#/audit', 'audit');
+  const q = await waitFor(() => $('[data-test="history-q"]'), 'the history search box');
+  setValue(q, 'action:change.*');
+  await waitFor(() => {
+    const rows = $$('[data-test="history-table"] tbody tr');
+    return rows.length > 0 && rows.every((tr) => text(tr.children[3]).startsWith('change.'));
+  }, 'only change.* entries for action:change.*');
+  // Clicking an actor adds it to the query.
+  const actorBtn = $('[data-test="history-table"] tbody tr td:nth-child(3) button');
+  const actor = text(actorBtn);
+  actorBtn.click();
+  await waitFor(() => q.value.includes(`actor:${actor}`), 'the clicked actor in the query');
+  setValue(q, 'colour:red');
+  await waitFor(() => byText('.notice', 'unknown filter'), 'an explanation for an unknown filter');
+  setValue(q, '');
+  const exp = $('[data-test="history-export"]');
+  if (!exp || !exp.getAttribute('href').startsWith('/api/audit?format=csv')) {
+    throw new Error('the CSV export link is missing');
+  }
+}
+
+async function scenarioPlacement() {
+  await go('#/placement', 'placement');
+  await waitFor(() => $('[data-test="placement-enabled"]') && $('[data-test="placement-rules"]'), 'the placement settings and rules');
+  await waitFor(() => {
+    const v = $('[data-test="placement-values"]');
+    return v && (v.querySelector('table') || text(v).includes('No active people'));
+  }, 'the department values in use');
+  // Add a rule and open the OU picker (the test directory has no OUs to list), then leave without saving.
+  $('[data-test="rule-add"]').click();
+  await waitFor(() => $$('[data-test="rule-match"]').length > 0, 'a new rule row');
+  byText('button', 'Pick…').click();
+  const modal = await waitFor(() => topModal(), 'the OU picker');
+  await waitFor(() => $('[data-test="ou-list"]', modal) && !text($('[data-test="ou-list"]', modal)).includes('Reading OUs'), 'the OU list to load');
+  byText('button', 'Cancel', modal).click();
+  await waitFor(() => !topModal(), 'the picker to close');
+  await go('#/dashboard', 'dashboard');
+}
+
+// Needs: a pending create with payload.needs_name (its sam is taken in AD) - see the fixtures in e2e_test.go.
+async function scenarioNeedsName() {
+  await go('#/approvals?status=pending', 'approvals');
+  const btn = await waitFor(() => $('[data-test="set-name"]'), 'a "Set username" button (fixture: a pending create whose sAMAccountName is taken)');
+  const id = btn.dataset.id;
+  const approve = $(`[data-test="approve"][data-id="${id}"]`);
+  if (!approve || !approve.disabled) {
+    throw new Error('Approve must be disabled while the change waits for a username');
+  }
+  const before = await api.get(`/changes/${encodeURIComponent(id)}`);
+  btn.click();
+  const modal = await waitFor(() => {
+    const m = topModal();
+    return m && $('[data-test="name-sam"]', m) ? m : null;
+  }, 'the username dialog');
+  // The taken name is refused inline (409) and the dialog stays open.
+  const takenSam = ((before.payload && before.payload.name_conflicts) || []).find((c) => c.field === 'sam');
+  if (takenSam && !takenSam.with) {
+    setValue($('[data-test="name-sam"]', modal), takenSam.value);
+    $('button[type="submit"]', modal).click();
+    await waitFor(() => $('[data-test="name-check"] .notice-error', modal), 'the inline "already taken" message');
+    if (!topModal()) {
+      throw new Error('the dialog closed although the name was taken');
+    }
+  }
+  const sam = `st${rand}`;
+  const suffix = (before.payload && before.payload.candidates && before.payload.candidates[0] && before.payload.candidates[0].upn.split('@')[1])
+    || ($('[data-test="name-upn"]', modal).value.split('@')[1]) || 'corp.test';
+  setValue($('[data-test="name-sam"]', modal), sam);
+  setValue($('[data-test="name-upn"]', modal), `${sam}@${suffix}`);
+  setValue($('[data-test="name-cn"]', modal), `Selftest ${rand}`);
+  const mail = $('[data-test="name-mail"]', modal);
+  if (mail && mail.closest('.field')) {
+    setValue(mail, `${sam}@${suffix}`);
+  }
+  $('[data-test="name-check-btn"]', modal).click();
+  await waitFor(() => text($('[data-test="name-check"]', modal)).includes('free'), 'the AD check to report the names as free');
+  await submitModal('set username');
+  const after = await waitFor(async () => {
+    const c = await api.get(`/changes/${encodeURIComponent(id)}`);
+    return c.payload && !c.payload.needs_name ? c : null;
+  }, 'needs_name to be cleared on the change');
+  const cand = (after.payload.candidates || [])[0] || {};
+  if (cand.sam !== sam) {
+    throw new Error(`the change got sam ${cand.sam}, expected ${sam}`);
+  }
+  await waitFor(() => {
+    const a = $(`[data-test="approve"][data-id="${id}"]`);
+    return a && !a.disabled;
+  }, 'Approve to be enabled after the username was set');
+}
+
+// Needs: a pending link change with at least one candidate (fixture: matching on, a source person with no account by ID,
+// and AD accounts without employeeID that match first + last name).
+async function scenarioLinkChoose() {
+  await go('#/approvals?status=pending&type=link', 'approvals');
+  const btn = await waitFor(() => $('[data-test="review-link"]'), 'a link change to review (fixture: a partial / ambiguous match)');
+  const id = btn.dataset.id;
+  btn.click();
+  const modal = await waitFor(() => {
+    const m = topModal();
+    return m && $$('[data-test="link-candidate"]', m).length > 0 ? m : null;
+  }, 'the candidate accounts');
+  if (!$('[data-test="link-create-new"]', modal)) {
+    throw new Error('the "create a new account" choice is missing');
+  }
+  if (!$('[data-test="match-full"], [data-test="match-partial"]', modal)) {
+    throw new Error('candidates show no full/partial badge');
+  }
+  const choose = $('[data-test="link-choose"]', modal);
+  const guid = choose.closest('[data-test="link-candidate"]').dataset.guid;
+  choose.click();
+  await waitFor(() => {
+    failOnErrorToast();
+    return !modal.isConnected;
+  }, 'the match dialog to close after choosing');
+  await waitFor(async () => {
+    const c = await api.get(`/changes/${encodeURIComponent(id)}`);
+    return c.payload && c.payload.link && c.payload.link.chosen === guid;
+  }, 'the chosen account to be stored on the change');
+  await waitFor(() => {
+    const a = $(`[data-test="approve"][data-id="${id}"]`);
+    return a && !a.disabled;
+  }, 'Approve to be enabled once an account is chosen');
+}
+
+// Self-contained: creates a manual source through the API, adds and deletes a person through the UI, removes the source.
+async function scenarioManualPerson() {
+  const name = `selftest-manual-${rand}`;
+  const src = await api.post('/sources', {
+    name, type: 'manual', enabled: true,
+    options: { external_id_field: 'ExternalID', status_field: 'Status', terminated_values: ['Terminated'], missing_means_terminated: false, missing_grace_runs: 0 },
+    config: {},
+  });
+  const sid = (src && src.id) || (listItems(await api.get('/sources')).find((s) => s.name === name) || {}).id;
+  if (!sid) {
+    throw new Error('could not create the manual source');
+  }
+  try {
+    await go(`#/manual?source=${encodeURIComponent(sid)}`, 'manual');
+    await waitFor(() => $('[data-test="mp-form"]') && $('[data-test="mp-FirstName"]'), 'the person form');
+    setValue($('[data-test="mp-FirstName"]'), 'Pat');
+    setValue($('[data-test="mp-LastName"]'), `Selftest${rand}`);
+    const dept = $('[data-test="mp-Department"]');
+    if (dept) {
+      setValue(dept, dept.tagName === 'SELECT' ? (Array.from(dept.options).find((o) => o.value) || {}).value || '' : 'Finance');
+    }
+    for (const el of $$('[data-test="mp-form"] :invalid')) {
+      if (el.dataset.field) {
+        setValue(el, el.type === 'date' ? '2030-01-31' : (el.type === 'email' ? 'pat@example.com' : 'x'));
+      }
+    }
+    $('[data-test="mp-preview-btn"]').click();
+    await waitFor(() => {
+      failOnErrorToast();
+      return text($('[data-test="mp-preview"]')).includes('sAMAccountName');
+    }, 'the preview of the account names');
+    const sync = $('[data-test="mp-sync"]');
+    if (sync.checked) {
+      sync.click(); // keep the run queue quiet for the later scenarios
+    }
+    $('[data-test="mp-create"]').click();
+    const row = await waitFor(() => {
+      failOnErrorToast();
+      return $$('.mp-people tbody tr').find((tr) => text(tr).includes(`Selftest${rand}`));
+    }, 'the new person in the list');
+    const del = $('[data-test="mp-delete"]', row);
+    if (!del) {
+      throw new Error('an admin cannot delete a person without an AD account');
+    }
+    del.click();
+    await confirmDanger('Delete');
+    await waitFor(() => !$$('.mp-people tbody tr').some((tr) => text(tr).includes(`Selftest${rand}`)), 'the person to disappear after delete');
+  }
+  finally {
+    try {
+      await api.del(`/sources/${encodeURIComponent(sid)}`);
+    }
+    catch (e) {
+      log(`cleanup problem: ${e.message}`);
+    }
+  }
+}
+
+// Needs: correlation enabled and a sync that reported at least one uncorrelated AD account (fixture: an AD account under
+// the search bases with no employeeID that matches nobody).
+async function scenarioMatching() {
+  await go('#/matching', 'matching');
+  await waitFor(() => $$('[data-test="m-rule"]').length > 0 && $('[data-test="m-enabled"]'), 'the matching rules');
+  await waitFor(() => $('[data-test="m-report-view"]'), 'the matching report');
+  const row = await waitFor(() => $$('.unc-table tbody tr').find((tr) => $('[data-test="m-ignore-btn"]', tr)), 'an uncorrelated AD account (fixture)');
+  const sam = text($('strong', row));
+  const before = await api.get('/settings');
+  $('[data-test="m-ignore-btn"]', row).click();
+  await waitFor(() => {
+    failOnErrorToast();
+    return byText('.toast', 'ignored');
+  }, 'the "ignored" toast');
+  const after = await api.get('/settings');
+  const list = (after.correlation && after.correlation.ignore_accounts) || [];
+  if (!list.some((x) => String(x).toLowerCase() === sam.toLowerCase())) {
+    throw new Error(`ignore_accounts does not contain ${sam}`);
+  }
+  await waitFor(() => !$$('.unc-table tbody tr').some((tr) => text($('strong', tr)) === sam), 'the ignored account to leave the report');
+  // restore
+  after.correlation.ignore_accounts = (before.correlation && before.correlation.ignore_accounts) || [];
+  await api.put('/settings', after);
+  $$('.toast').forEach((t) => t.remove());
+  await go('#/dashboard', 'dashboard');
+}
+
 async function main() {
-  const watchdog = setTimeout(() => fail('selftest timed out (90s)'), 90000);
+  const watchdog = setTimeout(() => fail('selftest timed out (170s)'), 170000);
+  // ?only=login,username,... runs just the steps whose names contain one of the words (handy against the mock API).
+  const only = (params.get('only') || '').split(',').map((s) => s.trim()).filter(Boolean);
   for (const [name, fn] of STEPS) {
     if (finished) {
       return;
+    }
+    if (only.length > 0 && !only.some((w) => name.includes(w))) {
+      continue;
     }
     log(`> ${name}`);
     try {

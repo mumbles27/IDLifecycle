@@ -229,7 +229,9 @@ function Start-IDLRun {
         [Parameter(Mandatory)][string]$ScriptRoot,
         [switch]$IsAction,
         [switch]$DryRun,
-        [hashtable]$Parameters = @{}
+        [hashtable]$Parameters = @{},
+        # Log/report folder; default <ScriptRoot>\Logs. The setup scripts pass a protected folder.
+        [string]$LogDir = ''
     )
 
     # Nothing but the single response document may reach stdout, so silence the other host streams.
@@ -244,7 +246,7 @@ function Start-IDLRun {
     $script:IDLContainerCache.Clear()
 
     $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-    $logDir = Join-Path -Path $ScriptRoot -ChildPath 'Logs'
+    $logDir = (([string]::IsNullOrWhiteSpace($LogDir)) ? (Join-Path -Path $ScriptRoot -ChildPath 'Logs') : ($LogDir))
     $logPath = Join-Path -Path $logDir -ChildPath ('{0}_{1}.log' -f $ScriptName, $stamp)
     $reportPath = Join-Path -Path $logDir -ChildPath ('{0}_Report_{1}.csv' -f $ScriptName, $stamp)
 
@@ -1167,6 +1169,163 @@ function Find-IDLUsersByAttribute {
     return $found
 }
 
+function Find-IDLTakenNames {
+    <#
+    .SYNOPSIS
+        Looks up which account names (sAMAccountName, userPrincipalName, mail, cn) are already used in the directory.
+    .DESCRIPTION
+        Names is a list of entries with Field ('sam' | 'upn' | 'mail' | 'cn'), Value and, for cn, Ou. sam and upn are
+        checked on ANY object (users, groups, computers ...) in the domain; mail against the mail attribute and the
+        smtp: proxyAddresses of any object (contacts and groups included), case-insensitively; cn one level below Ou.
+        Objects whose objectGUID is in Exclude never count as taken. LDAP filters are batched (at most 50 terms per
+        query). Returns @{ Taken = [ordered]@{field; value; dn; objectGuid}[] (one entry per name and object, value as
+        requested); MissingOus = string[] (cn target OUs that do not exist - nothing was checked there) }.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Names,
+        [AllowNull()][AllowEmptyString()][string]$Server,
+        [AllowEmptyCollection()][string[]]$Exclude = @()
+    )
+
+    $serverParams = Get-IDLServerParams -Server $Server
+    $excluded = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($text in $Exclude){
+        $guid = [guid]::Empty
+        if ([guid]::TryParse([string]$text, [ref]$guid)){
+            $null = $excluded.Add($guid.ToString())
+        }
+    }
+
+    $wanted = @{}
+    foreach ($field in @('sam', 'upn', 'mail')){
+        $wanted[$field] = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    }
+
+    $cnByOu = [ordered]@{}
+    foreach ($entry in $Names){
+        $field = ([string]$entry.Field).ToLowerInvariant()
+        $value = [string]$entry.Value
+        if ([string]::IsNullOrWhiteSpace($value)){
+            continue
+        }
+
+        if ($field -eq 'cn'){
+            $ou = [string]$entry.Ou
+            $key = $ou.ToLowerInvariant()
+            if (-not $cnByOu.Contains($key)){
+                $cnByOu[$key] = @{ Ou = $ou; Values = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase) }
+            }
+
+            $null = $cnByOu[$key].Values.Add($value)
+            continue
+        }
+
+        if ($wanted.ContainsKey($field)){
+            $null = $wanted[$field].Add($value)
+        }
+    }
+
+    $taken = [System.Collections.Generic.List[object]]::new()
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $record = {
+        param([string]$Field, [string]$Value, $Object)
+
+        $guid = ([guid]$Object.ObjectGUID).ToString()
+        if (
+            ($excluded.Contains($guid)) -or
+            (-not $seen.Add("$Field|$Value|$guid"))
+        ){
+            return
+        }
+
+        $taken.Add([ordered]@{
+                field      = $Field
+                value      = $Value
+                dn         = [string]$Object.DistinguishedName
+                objectGuid = $guid
+            })
+    }
+
+    # sam / upn / mail: directory-wide, any object class.
+    $terms = [System.Collections.Generic.List[string]]::new()
+    foreach ($value in $wanted['sam']){
+        $terms.Add('(sAMAccountName={0})' -f (ConvertTo-IDLLdapFilterValue -Value $value))
+    }
+
+    foreach ($value in $wanted['upn']){
+        $terms.Add('(userPrincipalName={0})' -f (ConvertTo-IDLLdapFilterValue -Value $value))
+    }
+
+    foreach ($value in $wanted['mail']){
+        $escaped = ConvertTo-IDLLdapFilterValue -Value $value
+        $terms.Add('(mail={0})' -f $escaped)
+        $terms.Add('(proxyAddresses=smtp:{0})' -f $escaped)
+    }
+
+    if ($terms.Count -gt 0){
+        foreach ($chunk in (Split-IDLChunk -InputArray $terms.ToArray() -Size 50)){
+            $filter = New-IDLOrFilter -Terms ([string[]]$chunk)
+            foreach ($object in @(Get-ADObject -LDAPFilter $filter -Properties 'sAMAccountName', 'userPrincipalName', 'mail', 'proxyAddresses' @serverParams)){
+                $sam = Get-IDLAdValue -Object $object -Name 'sAMAccountName'
+                if (($sam) -and ($wanted['sam'].Contains($sam))){
+                    & $record 'sam' ($wanted['sam'] | Where-Object { $_ -ieq $sam } | Select-Object -First 1) $object
+                }
+
+                $upn = Get-IDLAdValue -Object $object -Name 'userPrincipalName'
+                if (($upn) -and ($wanted['upn'].Contains($upn))){
+                    & $record 'upn' ($wanted['upn'] | Where-Object { $_ -ieq $upn } | Select-Object -First 1) $object
+                }
+
+                $addresses = [System.Collections.Generic.List[string]]::new()
+                $mail = Get-IDLAdValue -Object $object -Name 'mail'
+                if ($mail){
+                    $addresses.Add($mail)
+                }
+
+                foreach ($proxy in (Get-IDLAdValues -Object $object -Name 'proxyAddresses')){
+                    if ($proxy -match '^(?i)smtp:(.+)$'){
+                        $addresses.Add($Matches[1])
+                    }
+                }
+
+                foreach ($address in $addresses){
+                    if ($wanted['mail'].Contains($address)){
+                        & $record 'mail' ($wanted['mail'] | Where-Object { $_ -ieq $address } | Select-Object -First 1) $object
+                    }
+                }
+            }
+        }
+    }
+
+    # cn: one level below each target OU.
+    $missing = [System.Collections.Generic.List[string]]::new()
+    foreach ($key in $cnByOu.Keys){
+        $ou = $cnByOu[$key].Ou
+        $values = $cnByOu[$key].Values
+        if (-not (Test-IDLContainerExists -Dn $ou -Server $Server)){
+            $missing.Add($ou)
+            continue
+        }
+
+        $cnTerms = @($values | ForEach-Object { '(cn={0})' -f (ConvertTo-IDLLdapFilterValue -Value $_) })
+        foreach ($chunk in (Split-IDLChunk -InputArray $cnTerms -Size 50)){
+            $filter = New-IDLOrFilter -Terms ([string[]]$chunk)
+            foreach ($object in @(Get-ADObject -LDAPFilter $filter -SearchBase $ou -SearchScope OneLevel @serverParams)){
+                $name = [string]$object.Name
+                if ($values.Contains($name)){
+                    & $record 'cn' ($values | Where-Object { $_ -ieq $name } | Select-Object -First 1) $object
+                }
+            }
+        }
+    }
+
+    return @{
+        Taken      = $taken.ToArray()
+        MissingOus = [string[]]$missing.ToArray()
+    }
+}
+
 function Resolve-IDLTargetUsers {
     <#
     .SYNOPSIS
@@ -1680,11 +1839,110 @@ function Get-IDLDirectoryDacl {
     return [System.IO.FileSystemAclExtensions]::GetAccessControl([System.IO.DirectoryInfo]::new($Path), [System.Security.AccessControl.AccessControlSections]::Access)
 }
 
+function Get-IDLTrustedOwnerSids {
+    <#
+    .SYNOPSIS
+        SIDs that may own IDLifecycle folders/files: SYSTEM, Administrators, TrustedInstaller and the current user
+        (the same rule as the Go datadir package).
+    #>
+    [CmdletBinding()]
+    param()
+
+    return [string[]]@(
+        'S-1-5-18',
+        'S-1-5-32-544',
+        'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464',
+        [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    )
+}
+
+function Get-IDLOwnerSid {
+    <#
+    .SYNOPSIS
+        Owner SID of a file or directory (reads only the owner; needs no privilege).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    $item = Get-Item -LiteralPath $Path -Force
+    $sections = [System.Security.AccessControl.AccessControlSections]::Owner
+    if ($item -is [System.IO.DirectoryInfo]){
+        $sd = [System.IO.FileSystemAclExtensions]::GetAccessControl([System.IO.DirectoryInfo]$item, $sections)
+    }
+    else{
+        $sd = [System.IO.FileSystemAclExtensions]::GetAccessControl([System.IO.FileInfo]$item, $sections)
+    }
+
+    return $sd.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+}
+
+function Test-IDLTrustedOwner {
+    <#
+    .SYNOPSIS
+        True when the path is owned by SYSTEM, Administrators, TrustedInstaller or the current user. An untrusted owner
+        can always rewrite the ACL (implicit WRITE_DAC), so such a folder can never count as locked down.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    return ((Get-IDLOwnerSid -Path $Path) -in (Get-IDLTrustedOwnerSids))
+}
+
+function Test-IDLProcessElevated {
+    [CmdletBinding()]
+    param()
+
+    return ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Set-IDLAdministratorsOwner {
+    <#
+    .SYNOPSIS
+        Makes BUILTIN\Administrators the owner when elevated. Not elevated: keeps a trusted owner, throws for an
+        untrusted one (it could rewrite the ACL at any time).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    $admins = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+    if ((Get-IDLOwnerSid -Path $Path) -eq $admins.Value){
+        return
+    }
+
+    if (Test-IDLProcessElevated){
+        $item = Get-Item -LiteralPath $Path -Force
+        $sections = [System.Security.AccessControl.AccessControlSections]::Owner
+        if ($item -is [System.IO.DirectoryInfo]){
+            $sd = [System.IO.FileSystemAclExtensions]::GetAccessControl([System.IO.DirectoryInfo]$item, $sections)
+            $sd.SetOwner($admins)
+            [System.IO.FileSystemAclExtensions]::SetAccessControl([System.IO.DirectoryInfo]$item, $sd)
+        }
+        else{
+            $sd = [System.IO.FileSystemAclExtensions]::GetAccessControl([System.IO.FileInfo]$item, $sections)
+            $sd.SetOwner($admins)
+            [System.IO.FileSystemAclExtensions]::SetAccessControl([System.IO.FileInfo]$item, $sd)
+        }
+
+        return
+    }
+
+    if (-not (Test-IDLTrustedOwner -Path $Path)){
+        throw "'$Path' is owned by $(Get-IDLOwnerSid -Path $Path), which is not trusted; take ownership as an administrator (takeown /a /r /f) or delete it."
+    }
+}
+
 function Test-IDLDirectoryLockedDown {
     <#
     .SYNOPSIS
-        True when the directory ACL is protected (inheritance OFF), has no Users/Authenticated Users/CREATOR OWNER/Everyone ACE,
-        and grants SYSTEM + Administrators FullControl and the service account Modify.
+        True when the directory is owned by a trusted account (SYSTEM, Administrators, TrustedInstaller, current user),
+        its ACL is protected (inheritance OFF), has no Users/Authenticated Users/CREATOR OWNER/Everyone ACE, and grants
+        SYSTEM + Administrators FullControl and the service account Modify.
     #>
     [CmdletBinding()]
     param(
@@ -1693,6 +1951,10 @@ function Test-IDLDirectoryLockedDown {
     )
 
     if (-not (Test-Path -LiteralPath $Path -PathType Container)){
+        return $false
+    }
+
+    if (-not (Test-IDLTrustedOwner -Path $Path)){
         return $false
     }
 
@@ -1768,6 +2030,10 @@ function Set-IDLDirectoryLockdown {
         throw "Cannot resolve service account '$ServiceAccount' to a SID; refusing to lock down '$Path'."
     }
 
+    # Owner first: an untrusted owner could simply rewrite the ACL afterwards. Elevated sessions hand ownership to
+    # Administrators; otherwise a trusted owner (e.g. the current user) is kept and an untrusted one is refused.
+    Set-IDLAdministratorsOwner -Path $Path
+
     $acl = Get-IDLDirectoryDacl -Path $Path
     $acl.SetAccessRuleProtection($true, $false)
     foreach ($rule in @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))){
@@ -1788,6 +2054,770 @@ function Set-IDLDirectoryLockdown {
     }
 
     [System.IO.FileSystemAclExtensions]::SetAccessControl([System.IO.DirectoryInfo]::new($Path), $acl)
+}
+
+#endregion
+
+#region Setup helpers (Install-IDLifecycle.ps1, Uninstall-IDLifecycle.ps1, New-IDLifecycleRelease.ps1)
+
+$script:IDLFileWriteRights = [int64](2 -bor 4 -bor 16 -bor 64 -bor 256 -bor 65536 -bor 262144 -bor 524288 -bor 0x40000000 -bor 0x10000000)
+$script:IDLParentWriteRights = [int64](64 -bor 262144 -bor 524288 -bor 0x10000000)
+
+function Test-IDLPathWithin {
+    <#
+    .SYNOPSIS
+        True when Child equals Parent or lies below it (both normalised, case-insensitive).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Child,
+        [Parameter(Mandatory)][string]$Parent
+    )
+
+    $c = [System.IO.Path]::GetFullPath($Child).TrimEnd('\')
+    $p = [System.IO.Path]::GetFullPath($Parent).TrimEnd('\')
+    return (
+        ($c.Equals($p, [System.StringComparison]::OrdinalIgnoreCase)) -or
+        ($c.StartsWith($p + '\', [System.StringComparison]::OrdinalIgnoreCase))
+    )
+}
+
+function Get-IDLUnsafePathReason {
+    <#
+    .SYNOPSIS
+        Path safety guard for folders the setup scripts install to, write logs/backups to or delete. Returns why the
+        path is refused, or $null when it is acceptable.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)){
+        return 'the path is empty'
+    }
+
+    if ($Path -match '[\*\?"<>|]'){
+        return 'the path contains wildcard or invalid characters'
+    }
+
+    if ($Path -notmatch '^[A-Za-z]:[\\/]'){
+        return 'the path must be an absolute local path (X:\...)'
+    }
+
+    if ($Path.Substring(2).Contains(':')){
+        return "the path contains ':' after the drive letter (alternate data streams are not accepted)"
+    }
+
+    if ($Path -match '~\d'){
+        return '8.3 short names are not accepted; pass the full long path'
+    }
+
+    try{
+        $full = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+    }
+    catch{
+        return "the path is not valid: $($_.Exception.Message)"
+    }
+
+    if ($full -match '^[A-Za-z]:$'){
+        return 'the path is a drive root'
+    }
+
+    $profilesRoot = $null
+    if ($env:USERPROFILE){
+        $profilesRoot = Split-Path -Parent $env:USERPROFILE
+    }
+
+    $candidates = @(
+        $env:SystemRoot, $env:windir, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramW6432, $env:ProgramData,
+        $env:CommonProgramFiles, ${env:CommonProgramFiles(x86)}, $env:CommonProgramW6432, $env:ALLUSERSPROFILE,
+        $env:PUBLIC, $env:USERPROFILE, $env:APPDATA, $env:LOCALAPPDATA, $env:TEMP, $env:TMP, $profilesRoot,
+        [Environment]::GetFolderPath('Windows'), [Environment]::GetFolderPath('System'),
+        [Environment]::GetFolderPath('ProgramFiles'), [Environment]::GetFolderPath('CommonApplicationData'),
+        [Environment]::GetFolderPath('UserProfile'), [Environment]::GetFolderPath('Desktop'),
+        [Environment]::GetFolderPath('MyDocuments'),
+        'C:\Windows', 'C:\Program Files', 'C:\Program Files (x86)', 'C:\ProgramData', 'C:\Users'
+    )
+    if ($env:SystemDrive){
+        $candidates += (Join-Path -Path ($env:SystemDrive + '\') -ChildPath 'Users')
+    }
+
+    $protected = [System.Collections.Generic.List[string]]::new()
+    foreach ($candidate in $candidates){
+        if ([string]::IsNullOrWhiteSpace($candidate)){
+            continue
+        }
+
+        try{
+            $normal = [System.IO.Path]::GetFullPath($candidate).TrimEnd('\')
+        }
+        catch{
+            continue
+        }
+
+        if (-not $protected.Contains($normal)){
+            $protected.Add($normal)
+        }
+    }
+
+    $cmp = [System.StringComparison]::OrdinalIgnoreCase
+    foreach ($p in $protected){
+        if ($full.Equals($p, $cmp)){
+            return "the path is the protected folder '$p'"
+        }
+
+        if ($p.StartsWith($full + '\', $cmp)){
+            return "the path contains the protected folder '$p'"
+        }
+    }
+
+    # Folders whose whole subtree is off limits.
+    $subtrees = @($env:SystemRoot, [Environment]::GetFolderPath('Windows'), $PSHOME)
+    foreach ($base in @($env:ProgramData, 'C:\ProgramData')){
+        if ($base){
+            $subtrees += (Join-Path -Path $base -ChildPath 'Microsoft')
+        }
+    }
+
+    foreach ($root in $subtrees){
+        if ([string]::IsNullOrWhiteSpace($root)){
+            continue
+        }
+
+        $r = [System.IO.Path]::GetFullPath($root).TrimEnd('\')
+        if (
+            ($full.Equals($r, $cmp)) -or
+            ($full.StartsWith($r + '\', $cmp))
+        ){
+            return "the path is inside the protected folder '$r'"
+        }
+    }
+
+    # System folders at any drive root.
+    $firstSegment = ($full.Substring(3) -split '\\')[0]
+    if ($firstSegment -in @('$Recycle.Bin', 'System Volume Information', 'Recovery', '$WinREAgent', 'Config.Msi')){
+        return "the path is inside the system folder '$($full.Substring(0, 3))$firstSegment'"
+    }
+
+    # Nothing directly below the profiles root (C:\Users\<name>, Default, Public, All Users).
+    foreach ($root in @($profilesRoot, 'C:\Users')){
+        if (
+            (-not [string]::IsNullOrWhiteSpace($root)) -and
+            ((Split-Path -Parent $full).TrimEnd('\').Equals([System.IO.Path]::GetFullPath($root).TrimEnd('\'), $cmp))
+        ){
+            return "the path is directly below the profiles folder '$root'"
+        }
+    }
+
+    # A junction/symbolic link (on the path itself or a parent) could point anywhere.
+    $cursor = $full
+    while (-not [string]::IsNullOrEmpty($cursor)){
+        if (Test-Path -LiteralPath $cursor){
+            $item = Get-Item -LiteralPath $cursor -Force
+            if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0){
+                return "the path (or its parent '$cursor') is a junction or symbolic link"
+            }
+        }
+
+        $parent = Split-Path -Parent $cursor
+        if (
+            ([string]::IsNullOrEmpty($parent)) -or
+            ($parent -eq $cursor)
+        ){
+            break
+        }
+
+        $cursor = $parent.TrimEnd('\')
+        if ($cursor -match '^[A-Za-z]:$'){
+            break
+        }
+    }
+
+    return $null
+}
+
+function ConvertTo-IDLAccountName {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Sid
+    )
+
+    try{
+        return ([System.Security.Principal.SecurityIdentifier]::new($Sid)).Translate([System.Security.Principal.NTAccount]).Value
+    }
+    catch{
+        return $Sid
+    }
+}
+
+function Get-IDLUntrustedAclReason {
+    <#
+    .SYNOPSIS
+        Why a file/folder can be tampered with by someone other than SYSTEM, Administrators, TrustedInstaller, the
+        current user (or -ExtraTrustedSids), or $null.
+    .DESCRIPTION
+        -Mode Full (the item itself): an untrusted owner, or an untrusted Allow ACE granting any write-type right
+        (write/append data, write attributes, delete, delete child, change permissions, take ownership, generic write/all).
+        -Mode Parent (folders ABOVE the item): an untrusted owner, or an untrusted ACE granting delete child, change
+        permissions, take ownership or generic all - the rights that let someone delete/rename/replace the item or
+        re-ACL the parent. Create-files/folders on a parent is accepted on purpose: C:\ grants Users "create folders",
+        which only allows NEW siblings, never changing an existing child.
+        Inherit-only ACEs (CREATOR OWNER templates, (IO) entries) do not apply to the item and are ignored; Deny ACEs
+        are ignored (conservative).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [ValidateSet('Full', 'Parent')][string]$Mode = 'Full',
+        [string]$OwnerSid = '',
+        [string[]]$ExtraTrustedSids = @()
+    )
+
+    $item = Get-Item -LiteralPath $Path -Force
+    $trusted = @(Get-IDLTrustedOwnerSids) + @($ExtraTrustedSids | Where-Object { $_ })
+    if (-not $OwnerSid){
+        $OwnerSid = Get-IDLOwnerSid -Path $Path
+    }
+
+    if ($OwnerSid -notin $trusted){
+        return "'$Path' is owned by $(ConvertTo-IDLAccountName -Sid $OwnerSid), which is not SYSTEM, Administrators, TrustedInstaller or you"
+    }
+
+    $sections = [System.Security.AccessControl.AccessControlSections]::Access
+    if ($item -is [System.IO.DirectoryInfo]){
+        $acl = [System.IO.FileSystemAclExtensions]::GetAccessControl([System.IO.DirectoryInfo]$item, $sections)
+    }
+    else{
+        $acl = [System.IO.FileSystemAclExtensions]::GetAccessControl([System.IO.FileInfo]$item, $sections)
+    }
+
+    $mask = (($Mode -eq 'Full') ? ($script:IDLFileWriteRights) : ($script:IDLParentWriteRights))
+    foreach ($rule in @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))){
+        if (
+            ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) -or
+            (($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0)
+        ){
+            continue
+        }
+
+        $sid = $rule.IdentityReference.Value
+        if (
+            ($sid -in $trusted) -or
+            ($sid -eq 'S-1-3-4')
+        ){
+            continue
+        }
+
+        $granted = ([int64]$rule.FileSystemRights) -band $mask
+        if ($granted -ne 0){
+            return "'$Path' lets $(ConvertTo-IDLAccountName -Sid $sid) change it ($([System.Security.AccessControl.FileSystemRights]$rule.FileSystemRights))"
+        }
+    }
+
+    return $null
+}
+
+function Get-IDLUntrustedTreeReason {
+    <#
+    .SYNOPSIS
+        Get-IDLUntrustedAclReason over a whole tree: the parent chain (Mode Parent, optional), the folder and every file
+        and folder below it (Mode Full). Returns the first reason or $null.
+    .PARAMETER OwnerSidResolver
+        Scriptblock { param($Path) <owner SID> } (lets the caller's test seam supply owners).
+    .PARAMETER ExcludeRelative
+        Sub-folders (relative to Path) that are skipped, e.g. scripts\Logs where the service account writes.
+    .PARAMETER RefuseReparsePoints
+        Junctions/symbolic links below Path are a failure (a release folder never contains any).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [switch]$ParentChain,
+        [scriptblock]$OwnerSidResolver = $null,
+        [string[]]$ExcludeRelative = @(),
+        [switch]$RefuseReparsePoints,
+        [string[]]$ExtraTrustedSids = @()
+    )
+
+    $root = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+    $owner = {
+        param($p)
+        if ($null -ne $OwnerSidResolver){
+            return [string](& $OwnerSidResolver $p)
+        }
+
+        return (Get-IDLOwnerSid -Path $p)
+    }
+
+    if ($ParentChain){
+        $cursor = Split-Path -Parent $root
+        while (-not [string]::IsNullOrEmpty($cursor)){
+            $reason = Get-IDLUntrustedAclReason -Path $cursor -Mode Parent -OwnerSid (& $owner $cursor) -ExtraTrustedSids $ExtraTrustedSids
+            if ($reason){
+                return "parent folder: $reason"
+            }
+
+            $next = Split-Path -Parent $cursor
+            if (
+                ([string]::IsNullOrEmpty($next)) -or
+                ($next -eq $cursor)
+            ){
+                break
+            }
+
+            $cursor = $next
+        }
+    }
+
+    $reason = Get-IDLUntrustedAclReason -Path $root -Mode Full -OwnerSid (& $owner $root) -ExtraTrustedSids $ExtraTrustedSids
+    if ($reason){
+        return $reason
+    }
+
+    $excluded = @($ExcludeRelative | Where-Object { $_ } | ForEach-Object { Join-Path -Path $root -ChildPath $_ })
+    foreach ($entry in @(Get-ChildItem -LiteralPath $root -Recurse -Force -ErrorAction Stop)){
+        if (@($excluded | Where-Object { Test-IDLPathWithin -Child $entry.FullName -Parent $_ }).Count -gt 0){
+            continue
+        }
+
+        if (
+            ($RefuseReparsePoints) -and
+            (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)
+        ){
+            return "'$($entry.FullName)' is a junction or symbolic link"
+        }
+
+        $reason = Get-IDLUntrustedAclReason -Path $entry.FullName -Mode Full -OwnerSid (& $owner $entry.FullName) -ExtraTrustedSids $ExtraTrustedSids
+        if ($reason){
+            return $reason
+        }
+    }
+
+    return $null
+}
+
+function Read-IDLManifest {
+    <#
+    .SYNOPSIS
+        Reads a SHA256SUMS manifest ("<sha256 hex>  <relative path>" per line, '#' comments allowed) and returns
+        @{ Relative; Hash } entries. Throws on a malformed line or an unsafe path (absolute, '..', ':', Logs).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    $entries = [System.Collections.Generic.List[object]]::new()
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $n = 0
+    foreach ($line in [System.IO.File]::ReadAllLines($Path)){
+        $n++
+        if (
+            ([string]::IsNullOrWhiteSpace($line)) -or
+            ($line.TrimStart().StartsWith('#'))
+        ){
+            continue
+        }
+
+        $m = [regex]::Match($line, '^(?<hash>[0-9A-Fa-f]{64}) [ *](?<path>.+)$')
+        if (-not $m.Success){
+            throw "SHA256SUMS line $n is malformed."
+        }
+
+        $rel = $m.Groups['path'].Value.Trim().Replace('/', '\')
+        if (
+            ($rel -match '^[\\]|:') -or
+            (@($rel -split '\\') -contains '..') -or
+            (@($rel -split '\\') -contains '.') -or
+            (('\' + $rel + '\') -match '\\Logs\\')
+        ){
+            throw "SHA256SUMS line $n has an unsafe path '$rel'."
+        }
+
+        if (-not $seen.Add($rel)){
+            throw "SHA256SUMS lists '$rel' twice."
+        }
+
+        $entries.Add(@{ Relative = $rel; Hash = $m.Groups['hash'].Value.ToUpperInvariant() })
+    }
+
+    return , $entries.ToArray()
+}
+
+function New-IDLManifestText {
+    <#
+    .SYNOPSIS
+        Builds SHA256SUMS text for the given files (paths relative to Root).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string[]]$Relative
+    )
+
+    $lines = foreach ($rel in ($Relative | Sort-Object)){
+        '{0}  {1}' -f (Get-FileHash -LiteralPath (Join-Path -Path $Root -ChildPath $rel) -Algorithm SHA256).Hash.ToLowerInvariant(), $rel.Replace('\', '/')
+    }
+
+    return (($lines -join "`n") + "`n")
+}
+
+function Copy-IDLReleaseFiles {
+    <#
+    .SYNOPSIS
+        Completes a release folder whose idlifecycled.exe is already in place: copies <SourceRoot>\scripts (every file,
+        Logs folders excluded) to <OutDir>\scripts and <SourceRoot>\Setup.cmd (when present) to <OutDir>, then writes
+        <OutDir>\SHA256SUMS. Returns the number of files in the manifest. Used by New-IDLifecycleRelease.ps1 and by
+        Install-IDLifecycle.ps1 when it builds from source.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$SourceRoot,
+        [Parameter(Mandatory)][string]$OutDir
+    )
+
+    $scriptsSource = Join-Path -Path $SourceRoot -ChildPath 'scripts'
+    if (-not (Test-Path -LiteralPath $scriptsSource -PathType Container)){
+        throw "'$SourceRoot' has no scripts folder."
+    }
+
+    if (-not (Test-Path -LiteralPath (Join-Path -Path $OutDir -ChildPath 'idlifecycled.exe') -PathType Leaf)){
+        throw "'$OutDir' has no idlifecycled.exe."
+    }
+
+    $relative = [System.Collections.Generic.List[string]]::new()
+    $relative.Add('idlifecycled.exe')
+    foreach ($file in @(Get-ChildItem -LiteralPath $scriptsSource -Recurse -File -Force)){
+        $rel = $file.FullName.Substring($scriptsSource.Length).TrimStart('\')
+        if (('\' + $rel) -match '(^|\\)Logs\\'){
+            continue
+        }
+
+        $target = Join-Path -Path (Join-Path -Path $OutDir -ChildPath 'scripts') -ChildPath $rel
+        $parent = Split-Path -Parent $target
+        if (-not (Test-Path -LiteralPath $parent -PathType Container)){
+            $null = New-Item -Path $parent -ItemType Directory -Force
+        }
+
+        Copy-Item -LiteralPath $file.FullName -Destination $target
+        $relative.Add((Join-Path -Path 'scripts' -ChildPath $rel))
+    }
+
+    # Double-click launcher for the setup window (scripts\Start-IDLifecycleSetup.ps1).
+    $launcher = Join-Path -Path $SourceRoot -ChildPath 'Setup.cmd'
+    if (Test-Path -LiteralPath $launcher -PathType Leaf){
+        Copy-Item -LiteralPath $launcher -Destination (Join-Path -Path $OutDir -ChildPath 'Setup.cmd')
+        $relative.Add('Setup.cmd')
+    }
+
+    [System.IO.File]::WriteAllText((Join-Path -Path $OutDir -ChildPath 'SHA256SUMS'), (New-IDLManifestText -Root $OutDir -Relative $relative.ToArray()), [System.Text.UTF8Encoding]::new($false))
+    return $relative.Count
+}
+
+function Expand-IDLZipSafe {
+    <#
+    .SYNOPSIS
+        Extracts a zip into an EMPTY destination folder, refusing any entry that would land outside it (absolute
+        paths, '..', drive letters, alternate data streams) and archives over -MaxBytes uncompressed (default 2 GB).
+        Returns the folder that holds the content: the destination, or its only sub-folder when the archive wraps
+        everything in one top folder (as GitHub's source zips and zipped release folders do).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ZipPath,
+        [Parameter(Mandatory)][string]$Destination,
+        [int64]$MaxBytes = 2GB
+    )
+
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    $dest = [System.IO.Path]::GetFullPath($Destination).TrimEnd('\')
+    if (
+        (Test-Path -LiteralPath $dest) -and
+        (@(Get-ChildItem -LiteralPath $dest -Force).Count -gt 0)
+    ){
+        throw (New-IDLException -Kind Input -Message "'$dest' is not empty.")
+    }
+
+    $null = New-Item -Path $dest -ItemType Directory -Force
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+    try{
+        $total = [int64]0
+        foreach ($entry in $zip.Entries){
+            $total += $entry.Length
+            if ($total -gt $MaxBytes){
+                throw (New-IDLException -Kind Input -Message "'$ZipPath' expands to more than $([int]($MaxBytes / 1MB)) MB; refusing.")
+            }
+
+            $name = $entry.FullName.Replace('/', '\')
+            if (
+                ($name -match '(^|\\)\.\.(\\|$)') -or
+                ($name -match ':') -or
+                ([System.IO.Path]::IsPathRooted($name))
+            ){
+                throw (New-IDLException -Kind Input -Message "'$ZipPath' contains an unsafe entry '$($entry.FullName)'; refusing.")
+            }
+
+            $target = [System.IO.Path]::GetFullPath((Join-Path -Path $dest -ChildPath $name))
+            if (-not (Test-IDLPathWithin -Child $target -Parent $dest)){
+                throw (New-IDLException -Kind Input -Message "'$ZipPath' entry '$($entry.FullName)' points outside the destination; refusing.")
+            }
+
+            if ($name.EndsWith('\')){
+                $null = New-Item -Path $target -ItemType Directory -Force
+                continue
+            }
+
+            $parent = Split-Path -Parent $target
+            if (-not (Test-Path -LiteralPath $parent -PathType Container)){
+                $null = New-Item -Path $parent -ItemType Directory -Force
+            }
+
+            [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $target, $false)
+        }
+    }
+    finally{
+        $zip.Dispose()
+    }
+
+    $top = @(Get-ChildItem -LiteralPath $dest -Force)
+    if (
+        ($top.Count -eq 1) -and
+        ($top[0] -is [System.IO.DirectoryInfo])
+    ){
+        return $top[0].FullName
+    }
+
+    return $dest
+}
+
+function Register-IDLDsnSecrets {
+    <#
+    .SYNOPSIS
+        Registers a connection string AND its password component(s) as secrets, so neither the whole DSN nor a
+        fragment of it can reach a log line, report cell or error text.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Dsn
+    )
+
+    if (
+        ([string]::IsNullOrEmpty($Dsn)) -or
+        ($Dsn -match '^env:[A-Za-z_][A-Za-z0-9_]*$')
+    ){
+        return
+    }
+
+    Register-IDLSecret -Secret $Dsn
+    $patterns = @(
+        '(?i)(?:^|[;\s])(?:password|pwd)\s*=\s*(?<v>\{[^}]*\}|[^;]+)',
+        '^[a-zA-Z][a-zA-Z0-9+.\-]*://[^:/@]*:(?<v>.*)@[^@]*$',
+        '^[^:@/]*:(?<v>.*)@(?:tcp|unix)\('
+    )
+    foreach ($pattern in $patterns){
+        foreach ($m in [regex]::Matches($Dsn, $pattern)){
+            $value = $m.Groups['v'].Value
+            Register-IDLSecret -Secret $value
+            Register-IDLSecret -Secret ([uri]::UnescapeDataString($value))
+            Register-IDLSecret -Secret $value.Trim('{', '}')
+        }
+    }
+}
+
+function Get-IDLDsnTarget {
+    <#
+    .SYNOPSIS
+        "database X on host Y" from a connection string, never including user names or passwords: URL userinfo is
+        cut at the LAST '@' (so a '/' or '@' inside a password cannot leak), key/value DSNs only use database/host keys.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Dsn
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Dsn)){
+        return '(unknown database)'
+    }
+
+    $db = ''
+    $server = ''
+    $url = [regex]::Match($Dsn, '^[a-zA-Z][a-zA-Z0-9+.\-]*://(?<rest>.*)$')
+    if ($url.Success){
+        $rest = $url.Groups['rest'].Value
+        $at = $rest.LastIndexOf('@')
+        if ($at -ge 0){
+            $rest = $rest.Substring($at + 1)
+        }
+
+        $hm = [regex]::Match($rest, '^(?<host>[^/?;]*)(?:/(?<db>[^?;]*))?(?:\?(?<q>.*))?$')
+        if ($hm.Success){
+            $server = $hm.Groups['host'].Value
+            $db = $hm.Groups['db'].Value
+            $q = [regex]::Match($hm.Groups['q'].Value, '(?i)(?:^|&)database=(?<v>[^&]+)')
+            if ($q.Success){
+                $db = $q.Groups['v'].Value
+            }
+        }
+    }
+    else{
+        $at = $Dsn.LastIndexOf('@')
+        $mysql = [regex]::Match((($at -ge 0) ? ($Dsn.Substring($at)) : ('')), '^@(?:tcp|unix)\((?<host>[^)]*)\)/(?<db>[^?]*)')
+        if ($mysql.Success){
+            $server = $mysql.Groups['host'].Value
+            $db = $mysql.Groups['db'].Value
+        }
+        else{
+            foreach ($key in @('database', 'dbname', 'initial catalog')){
+                $m = [regex]::Match($Dsn, "(?i)(?:^|[;\s])$([regex]::Escape($key))\s*=\s*(?<v>[^;\s]+)")
+                if ($m.Success){
+                    $db = $m.Groups['v'].Value
+                }
+            }
+
+            foreach ($key in @('hostname', 'host', 'server', 'data source')){
+                $m = [regex]::Match($Dsn, "(?i)(?:^|[;\s])$([regex]::Escape($key))\s*=\s*(?<v>[^;\s]+)")
+                if ($m.Success){
+                    $server = $m.Groups['v'].Value
+                    break
+                }
+            }
+        }
+    }
+
+    return ("database '{0}' on '{1}'" -f (($db) ? ($db) : ('?')), (($server) ? ($server) : ('?')))
+}
+
+function Initialize-IDLProtectedDir {
+    <#
+    .SYNOPSIS
+        Creates a folder for setup logs/backups and makes sure nobody else can tamper with it. Refuses an existing
+        folder that is a junction/symbolic link or has an untrusted owner. With -Lock: owner Administrators (when
+        elevated), inheritance off, SYSTEM + Administrators FullControl (+ the current user with -IncludeCurrentUser).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [switch]$Lock,
+        [switch]$IncludeCurrentUser
+    )
+
+    $reason = Get-IDLUnsafePathReason -Path $Path
+    if ($reason){
+        throw "Folder '$Path' refused: $reason."
+    }
+
+    if (Test-Path -LiteralPath $Path){
+        if (-not (Test-Path -LiteralPath $Path -PathType Container)){
+            throw "'$Path' exists and is not a folder."
+        }
+
+        if (-not (Test-IDLTrustedOwner -Path $Path)){
+            throw "'$Path' already exists and is owned by $(ConvertTo-IDLAccountName -Sid (Get-IDLOwnerSid -Path $Path)); delete it if you did not create it."
+        }
+    }
+    else{
+        $null = New-Item -Path $Path -ItemType Directory -Force
+    }
+
+    if (-not $Lock){
+        return
+    }
+
+    Set-IDLAdministratorsOwner -Path $Path
+    $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    $acl = Get-IDLDirectoryDacl -Path $Path
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($rule in @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))){
+        $null = $acl.RemoveAccessRuleAll($rule)
+    }
+
+    $sids = @('S-1-5-18', 'S-1-5-32-544')
+    if ($IncludeCurrentUser){
+        $sids += [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    }
+
+    foreach ($sid in $sids){
+        $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+                [System.Security.Principal.SecurityIdentifier]::new($sid),
+                [System.Security.AccessControl.FileSystemRights]::FullControl,
+                $inherit, [System.Security.AccessControl.PropagationFlags]::None,
+                [System.Security.AccessControl.AccessControlType]::Allow))
+    }
+
+    [System.IO.FileSystemAclExtensions]::SetAccessControl([System.IO.DirectoryInfo]::new($Path), $acl)
+}
+
+function Get-IDLTestHookRefusal {
+    <#
+    .SYNOPSIS
+        Why a setup script's -TestHook must NOT be loaded, or $null. Allowed only when IDL_SETUP_TEST=1, the hook is a
+        plain file inside <repo>\tests\powershell (relative to the script folder, no junction/symlink anywhere on its
+        path) and the script does not run from InstallDir or a Program Files folder.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$HookPath,
+        [Parameter(Mandatory)][string]$ScriptRoot,
+        [AllowEmptyString()][string]$InstallDir = ''
+    )
+
+    if ($env:IDL_SETUP_TEST -ne '1'){
+        return 'IDL_SETUP_TEST is not set to 1'
+    }
+
+    $testsDir = [System.IO.Path]::GetFullPath((Join-Path -Path $ScriptRoot -ChildPath '..\tests\powershell')).TrimEnd('\')
+    if (-not (Test-Path -LiteralPath $testsDir -PathType Container)){
+        return "there is no tests folder next to this script ($testsDir)"
+    }
+
+    try{
+        $hook = [System.IO.Path]::GetFullPath($HookPath)
+    }
+    catch{
+        return 'the hook path is not valid'
+    }
+
+    if (
+        (-not (Test-Path -LiteralPath $hook -PathType Leaf)) -or
+        (-not (Test-IDLPathWithin -Child $hook -Parent $testsDir))
+    ){
+        return "the hook must be a file inside $testsDir"
+    }
+
+    $cursor = $hook
+    while (-not [string]::IsNullOrEmpty($cursor)){
+        if ((([System.IO.File]::GetAttributes($cursor)) -band [System.IO.FileAttributes]::ReparsePoint) -ne 0){
+            return "'$cursor' is a junction or symbolic link"
+        }
+
+        $next = Split-Path -Parent $cursor
+        if (
+            ([string]::IsNullOrEmpty($next)) -or
+            ($next -eq $cursor)
+        ){
+            break
+        }
+
+        $cursor = $next
+    }
+
+    # An InstallDir the path guard refuses (e.g. C:\) is rejected by the script's own validation right after.
+    $forbidden = @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramW6432) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    if (
+        (-not [string]::IsNullOrWhiteSpace($InstallDir)) -and
+        ($null -eq (Get-IDLUnsafePathReason -Path $InstallDir))
+    ){
+        $forbidden = @($InstallDir) + @($forbidden)
+    }
+
+    foreach ($dir in $forbidden){
+        if (Test-IDLPathWithin -Child $ScriptRoot -Parent $dir){
+            return "the script runs from '$dir'"
+        }
+    }
+
+    return $null
 }
 
 #endregion
@@ -1848,6 +2878,240 @@ function Unblock-IDLScriptFiles {
 
 #endregion
 
+#region Listen address
+
+function Split-IDLListen {
+    # 'host:port' / '[v6]:port' / ':port' -> @{ Host; Port } or $null.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Value
+    )
+
+    $m = [regex]::Match($Value, '^(?:\[(?<h>[^\]]+)\]|(?<h>[^:\[\]]*)):(?<p>\d{1,5})$')
+    if (-not $m.Success){
+        return $null
+    }
+
+    $port = [int]$m.Groups['p'].Value
+    if (
+        ($port -lt 1) -or
+        ($port -gt 65535)
+    ){
+        return $null
+    }
+
+    return @{ Host = $m.Groups['h'].Value; Port = $port }
+}
+
+function Test-IDLLoopbackHost {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()][string]$HostName
+    )
+
+    if ($HostName -ieq 'localhost'){
+        return $true
+    }
+
+    $ip = $null
+    if ([System.Net.IPAddress]::TryParse($HostName, [ref]$ip)){
+        return [System.Net.IPAddress]::IsLoopback($ip)
+    }
+
+    return $false
+}
+
+#endregion
+
+#region Service account
+
+function Get-IDLServiceAccountKind {
+    <#
+    .SYNOPSIS
+        Classifies a service log-on account name:
+          BuiltIn  - LocalSystem, NT AUTHORITY\LocalService / NetworkService / SYSTEM, NT SERVICE\<name> (no password)
+          Managed  - an MSA or gMSA: DOMAIN\name$ or name$@domain (Windows retrieves the password)
+          Password - a normal domain or local user: DOMAIN\name, .\name or name@domain (needs its password)
+        Returns '' for anything else.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()][string]$Account
+    )
+
+    $builtIn = @('LocalSystem', 'NT AUTHORITY\LocalService', 'NT AUTHORITY\NetworkService', 'NT AUTHORITY\SYSTEM')
+    if (
+        ($Account -in $builtIn) -or
+        ($Account -match '^NT SERVICE\\[A-Za-z0-9_.\-]+$')
+    ){
+        return 'BuiltIn'
+    }
+
+    if (
+        ($Account -match '^[^\\@\s]+\\[^\\@\s]+\$$') -or
+        ($Account -match '^[^\\@\s]+\$@[^\\@\s]+$')
+    ){
+        return 'Managed'
+    }
+
+    if (
+        ($Account -match '^[^\\@\s]+\\[^\\@\s]+$') -or
+        ($Account -match '^[^\\@\s]+@[^\\@\s]+$')
+    ){
+        return 'Password'
+    }
+
+    return ''
+}
+
+function ConvertTo-IDLServiceAccountName {
+    # '.\name' (a local account) -> '<COMPUTERNAME>\name': name-to-SID lookups (NTAccount, LookupAccountName) do not
+    # understand '.'. Everything else is returned trimmed and unchanged.
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()][string]$Account
+    )
+
+    $Account = $Account.Trim()
+    if ($Account -match '^\.\\(.+)$'){
+        return ('{0}\{1}' -f $env:COMPUTERNAME, $Matches[1])
+    }
+
+    return $Account
+}
+
+$script:LsaRightsSource = @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
+
+namespace IDLifecycle {
+    public static class LsaRights {
+        [StructLayout(LayoutKind.Sequential)]
+        struct LSA_UNICODE_STRING { public ushort Length; public ushort MaximumLength; public IntPtr Buffer; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct LSA_OBJECT_ATTRIBUTES {
+            public int Length; public IntPtr RootDirectory; public IntPtr ObjectName; public uint Attributes;
+            public IntPtr SecurityDescriptor; public IntPtr SecurityQualityOfService;
+        }
+
+        [DllImport("advapi32.dll")] static extern uint LsaOpenPolicy(IntPtr systemName, ref LSA_OBJECT_ATTRIBUTES attributes, uint access, out IntPtr handle);
+        [DllImport("advapi32.dll")] static extern uint LsaEnumerateAccountRights(IntPtr handle, byte[] sid, out IntPtr rights, out uint count);
+        [DllImport("advapi32.dll")] static extern uint LsaAddAccountRights(IntPtr handle, byte[] sid, LSA_UNICODE_STRING[] rights, uint count);
+        [DllImport("advapi32.dll")] static extern uint LsaFreeMemory(IntPtr buffer);
+        [DllImport("advapi32.dll")] static extern uint LsaClose(IntPtr handle);
+        [DllImport("advapi32.dll")] static extern int LsaNtStatusToWinError(uint status);
+
+        const uint POLICY_CREATE_ACCOUNT = 0x10;
+        const uint POLICY_LOOKUP_NAMES = 0x800;
+        const uint STATUS_OBJECT_NAME_NOT_FOUND = 0xC0000034;
+
+        static IntPtr Open(uint access) {
+            var oa = new LSA_OBJECT_ATTRIBUTES();
+            oa.Length = Marshal.SizeOf(oa);
+            IntPtr h;
+            uint st = LsaOpenPolicy(IntPtr.Zero, ref oa, access, out h);
+            if (st != 0) throw new Win32Exception(LsaNtStatusToWinError(st));
+            return h;
+        }
+
+        static byte[] SidBytes(string sid) {
+            var s = new SecurityIdentifier(sid);
+            var b = new byte[s.BinaryLength];
+            s.GetBinaryForm(b, 0);
+            return b;
+        }
+
+        // Rights granted directly to the SID (not through a group).
+        public static string[] Get(string sid) {
+            IntPtr h = Open(POLICY_LOOKUP_NAMES);
+            try {
+                IntPtr p; uint n;
+                uint st = LsaEnumerateAccountRights(h, SidBytes(sid), out p, out n);
+                if (st == STATUS_OBJECT_NAME_NOT_FOUND) return new string[0];
+                if (st != 0) throw new Win32Exception(LsaNtStatusToWinError(st));
+                try {
+                    var result = new string[n];
+                    int size = Marshal.SizeOf(typeof(LSA_UNICODE_STRING));
+                    for (int i = 0; i < n; i++) {
+                        var u = (LSA_UNICODE_STRING)Marshal.PtrToStructure(p + i * size, typeof(LSA_UNICODE_STRING));
+                        result[i] = Marshal.PtrToStringUni(u.Buffer, u.Length / 2);
+                    }
+                    return result;
+                } finally { LsaFreeMemory(p); }
+            } finally { LsaClose(h); }
+        }
+
+        public static void Add(string sid, string right) {
+            IntPtr h = Open(POLICY_LOOKUP_NAMES | POLICY_CREATE_ACCOUNT);
+            try {
+                var u = new LSA_UNICODE_STRING();
+                u.Buffer = Marshal.StringToHGlobalUni(right);
+                u.Length = (ushort)(right.Length * 2);
+                u.MaximumLength = (ushort)(u.Length + 2);
+                try {
+                    uint st = LsaAddAccountRights(h, SidBytes(sid), new[] { u }, 1);
+                    if (st != 0) throw new Win32Exception(LsaNtStatusToWinError(st));
+                } finally { Marshal.FreeHGlobal(u.Buffer); }
+            } finally { LsaClose(h); }
+        }
+    }
+}
+'@
+
+function Initialize-IDLLsaRights {
+    if (-not ('IDLifecycle.LsaRights' -as [type])){
+        Add-Type -TypeDefinition $script:LsaRightsSource -Language CSharp
+    }
+}
+
+function Test-IDLServiceLogonRight {
+    <#
+    .SYNOPSIS
+        True when the account holds SeServiceLogonRight ("Log on as a service") directly in this computer's local
+        security policy. False when it does not, or when the account cannot be resolved or the policy cannot be read.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Account
+    )
+
+    $sid = ConvertTo-IDLSidSafe -Identity $Account
+    if ($null -eq $sid){
+        return $false
+    }
+
+    try{
+        Initialize-IDLLsaRights
+        return (@([IDLifecycle.LsaRights]::Get($sid.Value)) -contains 'SeServiceLogonRight')
+    }
+    catch{
+        Write-IDLLog "Could not read the user rights of '$Account': $($_.Exception.Message)" 'WARN'
+        return $false
+    }
+}
+
+function Grant-IDLServiceLogonRight {
+    # Adds SeServiceLogonRight for the account to the local security policy (elevation required). A domain GPO
+    # that defines "Log on as a service" replaces the local list at its next refresh.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Account
+    )
+
+    $sid = ConvertTo-IDLSidSafe -Identity $Account
+    if ($null -eq $sid){
+        throw "Cannot resolve service account '$Account' to a SID."
+    }
+
+    Initialize-IDLLsaRights
+    [IDLifecycle.LsaRights]::Add($sid.Value, 'SeServiceLogonRight')
+}
+
+#endregion
+
 #endregion
 
 Export-ModuleMember -Function @(
@@ -1860,9 +3124,15 @@ Export-ModuleMember -Function @(
     'ConvertTo-IDLLdapFilterValue', 'ConvertTo-IDLLdapGuidValue', 'ConvertTo-IDLDnEscapedValue',
     'Get-IDLServerParams', 'Get-IDLParentDn', 'Get-IDLLeafRdn', 'Test-IDLDistinguishedName',
     'Get-IDLAdValue', 'Get-IDLAdValues', 'Split-IDLChunk', 'New-IDLOrFilter', 'Test-IDLAdNotFound',
-    'Test-IDLAdConnection', 'Test-IDLContainerExists', 'Find-IDLUsersByGuid', 'Find-IDLUsersByAttribute',
+    'Test-IDLAdConnection', 'Test-IDLContainerExists', 'Find-IDLUsersByGuid', 'Find-IDLUsersByAttribute', 'Find-IDLTakenNames',
     'Resolve-IDLTargetUsers', 'Resolve-IDLGroups', 'Update-IDLGroupMembership', 'Move-IDLUser',
     'Get-IDLProtectedAttributes', 'Get-IDLUserFields', 'Test-IDLProtectedAttribute', 'Test-IDLDnShape', 'Get-IDLGroupDns',
     'Get-IDLPrivilegedReason', 'Test-IDLDirectoryLockedDown', 'Set-IDLDirectoryLockdown', 'Get-IDLDirectoryDacl',
-    'Get-IDLBlockedFiles', 'Unblock-IDLScriptFiles'
+    'Get-IDLTrustedOwnerSids', 'Get-IDLOwnerSid', 'Test-IDLTrustedOwner', 'Test-IDLProcessElevated', 'Set-IDLAdministratorsOwner',
+    'Test-IDLPathWithin', 'Get-IDLUnsafePathReason', 'ConvertTo-IDLAccountName', 'Get-IDLUntrustedAclReason', 'Get-IDLUntrustedTreeReason',
+    'Read-IDLManifest', 'New-IDLManifestText', 'Copy-IDLReleaseFiles', 'Expand-IDLZipSafe', 'Register-IDLDsnSecrets', 'Get-IDLDsnTarget', 'Initialize-IDLProtectedDir',
+    'Get-IDLTestHookRefusal',
+    'Get-IDLBlockedFiles', 'Unblock-IDLScriptFiles',
+    'Split-IDLListen', 'Test-IDLLoopbackHost',
+    'ConvertTo-IDLSidSafe', 'Get-IDLServiceAccountKind', 'ConvertTo-IDLServiceAccountName', 'Test-IDLServiceLogonRight', 'Grant-IDLServiceLogonRight'
 )

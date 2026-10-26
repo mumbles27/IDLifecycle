@@ -1,4 +1,4 @@
-// Users (admin only): local accounts and their roles.
+// Users (admin only): local accounts and Entra ID accounts (created on first sign-in), with their roles.
 
 import { api } from '../api.js';
 import {
@@ -16,6 +16,7 @@ export async function render(root, ctx) {
   const listEl = h('div', null, loading());
   root.append(
     pageHeader('Users', mutBtn('New user', { class: 'btn-primary', 'data-test': 'new-user', onclick: () => openEditor(null) })),
+    h('p', { class: 'help' }, 'New user creates a local account that signs in with a password. People who sign in with Entra ID appear here after their first sign-in; their name and role come from Entra ID, and you can disable or delete them here.'),
     listEl);
 
   async function load() {
@@ -30,6 +31,7 @@ export async function render(root, ctx) {
     replaceContent(listEl, dataTable([
       { label: 'Username', render: (u) => [h('strong', null, u.username), u.username === ctx.user.username ? h('span', { class: 'muted small' }, ' (you)') : null] },
       { label: 'Role', render: (u) => pill(u.role) },
+      { label: 'Sign-in', render: (u) => (u.auth_source === 'oidc' ? h('span', { 'data-test': 'user-source', title: 'Name and role come from Entra ID' }, 'Entra ID') : h('span', { class: 'muted', 'data-test': 'user-source' }, 'Password')) },
       { label: 'Status', render: (u) => pill(u.disabled ? 'disabled' : 'active') },
       { label: 'Created', render: (u) => fmtTime(u.created_at) },
       { label: 'Last login', render: (u) => fmtTime(u.last_login_at) },
@@ -38,9 +40,10 @@ export async function render(root, ctx) {
         className: 'col-actions',
         render: (u) => {
           const self = u.username === ctx.user.username;
+          const entra = u.auth_source === 'oidc';
           return h('div', { class: 'row-actions' },
-            mutBtn('Edit', { class: 'btn-sm', 'data-test': 'edit-user', onclick: () => openEditor(u) }),
-            mutBtn('Reset password', { class: 'btn-sm', 'data-test': 'reset-user', onclick: () => openReset(u) }),
+            entra ? null : mutBtn('Edit', { class: 'btn-sm', 'data-test': 'edit-user', onclick: () => openEditor(u) }),
+            entra ? null : mutBtn('Reset password', { class: 'btn-sm', 'data-test': 'reset-user', onclick: () => openReset(u) }),
             self ? null : mutBtn(u.disabled ? 'Enable' : 'Disable', { class: 'btn-sm', 'data-test': 'toggle-user', onclick: (e) => toggle(u, e.currentTarget) }),
             self ? null : mutBtn('Delete', { class: 'btn-sm btn-danger', 'data-test': 'delete-user', onclick: (e) => remove(u, e.currentTarget) }));
         },

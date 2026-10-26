@@ -366,3 +366,43 @@ func TestRealScriptsDisableIsNotBlockedByPrivilegedGroup(t *testing.T) {
 		t.Fatalf("applied disables: %d", len(applied))
 	}
 }
+
+// seedStub adds accounts to the stub directory before the first run.
+func (p *pwshEnv) seedStub(users ...map[string]any) {
+	p.t.Helper()
+	b, err := os.ReadFile(p.state)
+	p.must(err)
+	var raw map[string]any
+	p.must(json.Unmarshal(b, &raw))
+	raw["users"] = users
+	b, _ = json.Marshal(raw)
+	p.must(os.WriteFile(p.state, b, 0o600))
+}
+
+func TestRealScriptsCorrelationLinksAndRenames(t *testing.T) {
+	p := newPwshEnv(t)
+	p.seedStub(map[string]any{
+		"objectGuid": "11111111-2222-3333-4444-555555555555", "dn": "CN=Jane D," + baseOU, "sam": "jane.d",
+		"upn": "jane.d@corp.example.com", "enabled": true, "objectClass": "user",
+		"attributes": map[string]any{"givenName": "Jane", "sn": "Doe", "department": "Marketing"},
+	})
+	p.correlation(func(c *model.CorrelationSettings) { c.Rename = model.RenameAlways })
+	p.writeCSV(row("E1", "Jane", "Doe", "Marketing", "Designer", "A", ""))
+	run := p.run()
+	if run.Counters["planned_link"] != 1 || run.Counters["applied"] < 1 || run.Counters["planned_create"] != 0 {
+		t.Fatalf("link through the real scripts: %+v %s", run.Counters, run.Error)
+	}
+	i, s := p.account("jdoe")
+	eq(t, "id attribute set by Set-IDLLink", s.Users[i].Attributes["employeeID"], any("E1"))
+	eq(t, "upn renamed", s.Users[i].UPN, "jane.doe@corp.example.com")
+	eq(t, "identity linked", p.identity("E1").ADGUID, "11111111-2222-3333-4444-555555555555")
+
+	taken, err := p.eng.AD.CheckNames(p.ctx, ad.NameCheckRequest{Names: []ad.NameQuery{{Field: "sam", Value: "JDOE"}, {Field: "sam", Value: "free1"}}})
+	p.must(err)
+	if len(taken) != 1 || !strings.Contains(taken[0].DN, baseOU) {
+		t.Fatalf("Test-IDLNames: %+v", taken)
+	}
+	taken, err = p.eng.AD.CheckNames(p.ctx, ad.NameCheckRequest{Names: []ad.NameQuery{{Field: "sam", Value: "jdoe"}}, Exclude: []string{"11111111-2222-3333-4444-555555555555"}})
+	p.must(err)
+	eq(t, "excluded object does not count", len(taken), 0)
+}

@@ -45,6 +45,7 @@ func init() {
 	register(csvType())
 	register(paylocityType())
 	register(sqlType())
+	register(manualType())
 }
 
 // Types lists registered source types sorted by name (New funcs are not serialized).
@@ -89,6 +90,11 @@ func Validate(src model.Source) error {
 	}
 	if src.Type == "sql" {
 		if err := validateSQLConfig(src.Config); err != nil {
+			return err
+		}
+	}
+	if src.Type == TypeManual {
+		if err := validateManualConfig(src.Config); err != nil {
 			return err
 		}
 	}

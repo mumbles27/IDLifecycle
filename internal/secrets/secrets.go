@@ -92,6 +92,39 @@ func Load(dataDir string) (*Cipher, error) {
 	return New(key)
 }
 
+// KeyBytes returns a copy of the master key. Only the backup code uses it, to put the key into a backup file
+// encrypted with the backup passphrase (so a restore on another server can still read the stored secrets).
+func (c *Cipher) KeyBytes() []byte { return append([]byte(nil), c.key...) }
+
+// ReplaceKeyFile writes key as dataDir\secret.key (DPAPI-wrapped on Windows), for a restore. An existing key file is
+// first renamed to secret.key.replaced-<stamp> (returned) so nothing is lost if the restore was a mistake. It refuses
+// when IDL_MASTER_KEY is set: then the key lives in that variable and must be changed there.
+func ReplaceKeyFile(dataDir string, key []byte, stamp string) (string, error) {
+	if len(key) != 32 {
+		return "", errors.New("secrets: key must be 32 bytes")
+	}
+	if strings.TrimSpace(os.Getenv(envKey)) != "" {
+		return "", fmt.Errorf("%s is set, so the key is not read from %s: set %s to the backup's key instead (or unset it)", envKey, keyFile, envKey)
+	}
+	wrapped, err := wrapKey(key)
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(dataDir, keyFile)
+	replaced := ""
+	if _, err := os.Stat(path); err == nil {
+		replaced = path + ".replaced-" + stamp
+		if err := os.Rename(path, replaced); err != nil {
+			return "", err
+		}
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(wrapped), 0o600); err != nil {
+		return replaced, err
+	}
+	return replaced, os.Rename(tmp, path)
+}
+
 func wrapKey(key []byte) (string, error) {
 	if protect != nil {
 		out, err := protect(key)

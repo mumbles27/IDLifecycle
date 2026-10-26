@@ -23,21 +23,30 @@
       "objects": [ { "dn": "CN=ExchangeActiveSyncDevices,CN=Jane Doe,OU=Staff,DC=stub,DC=test", "objectClass": "msExchActiveSyncDevices" } ],
       "calls":  [ { "cmdlet": "New-ADUser", "args": { "Name": "Jane Doe", "AccountPassword": "***" }, "result": "ok" } ],
       "faults": [ { "cmdlet": "Add-ADGroupMember", "match": "jdoe", "message": "boom {password}" } ],
-      "failConnect": false
+      "failConnect": false,
+      "schema": { "classes":    [ { "lDAPDisplayName": "user", "subClassOf": "organizationalPerson", "mayContain": ["employeeID"] } ],
+                  "attributes": [ { "lDAPDisplayName": "employeeID", "attributeSyntax": "2.5.5.12", "isSingleValued": true } ] }
     }
 
       * users[].objectClass defaults to "user" (use "computer" to test the not-a-user refusal).
+      * groups[] and objects[] may carry an "attributes" table too (e.g. a contact with mail / proxyAddresses);
+        multi-valued attributes are JSON arrays and match filters value by value, case-insensitively.
+      * Set-ADUser supports -Replace/-Clear/-Add/-Remove (applied Remove, Add, Replace, Clear like the real cmdlet; adding
+        an existing or removing a missing value throws) and -SamAccountName/-UserPrincipalName (uniqueness enforced)/
+        -EmailAddress. Rename-ADObject changes the RDN value (children move along, the DN must stay unique).
       * groups[].adminCount / objectSid (both optional) are returned by Get-ADGroup -Properties adminCount,objectSid.
       * faults[] with cmdlet "Get-ADObject" also make READS throw when "match" is found in the Identity/filter/
         search base (reads are not recorded in calls).
       * objects[] are generic child objects; one whose DN ends with ",<user DN>" makes that user a non-leaf:
         Remove-ADUser and Remove-ADObject without -Recursive throw the leaf-object error, -Recursive deletes the subtree.
       * calls[] is appended to by every MUTATING cmdlet (New/Set/Remove-ADUser, Enable/Disable-ADAccount,
-        Move-ADObject, Remove-ADObject, Add/Remove-ADGroupMember), including attempts that fail (result starts with "error").
+        Move-ADObject, Rename-ADObject, Remove-ADObject, Add/Remove-ADGroupMember), including attempts that fail (result starts with "error").
         Passwords are never recorded (AccountPassword is "***").
       * faults[] makes a matching mutating cmdlet throw ADException(message). "match" is a case-insensitive
         substring searched in the call's JSON args ("" matches all). "{password}" in message is replaced with the
         plaintext AccountPassword (only used to prove the scripts scrub secrets from errors).
+      * schema (optional) holds classSchema / attributeSchema objects with their LDAP property names. Get-ADObject
+        with -SearchBase <schemaNamingContext> returns them (the filter only picks classSchema vs attributeSchema).
       * failConnect=true makes every cmdlet throw ADServerDownException (exit code 4 tests).
       * Domain root DNs (starting with "DC=") are always valid search bases/paths. Other containers must be listed in ous.
 
@@ -65,6 +74,7 @@ class ADServerDownException : ADException {
 }
 
 $script:StubRoot = 'DC=stub,DC=test'
+$script:StubSchemaNc = 'CN=Schema,CN=Configuration,DC=stub,DC=test'
 $script:Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 $script:StubLeafError = 'The directory service can perform the requested operation only on a leaf object.'
 
@@ -131,6 +141,7 @@ function Read-StubState {
         calls       = [System.Collections.Generic.List[object]]::new()
         faults      = [System.Collections.Generic.List[object]]::new()
         failConnect = [bool](Get-StubKey $source 'failConnect' $false)
+        schema      = (Get-StubKey $source 'schema' @{})
     }
 
     if ($state.failConnect){
@@ -169,6 +180,7 @@ function Read-StubState {
                 sam        = [string](Get-StubKey $g 'sam')
                 adminCount = (Get-StubKey $g 'adminCount')
                 objectSid  = (Get-StubKey $g 'objectSid')
+                attributes = (ConvertTo-StubAttributeTable (Get-StubKey $g 'attributes'))
             })
     }
 
@@ -188,6 +200,7 @@ function Read-StubState {
                 objectGuid  = ([guid]$guid).ToString()
                 dn          = $dn
                 objectClass = [string](Get-StubKey $o 'objectClass' 'container')
+                attributes  = (ConvertTo-StubAttributeTable (Get-StubKey $o 'attributes'))
             })
     }
 
@@ -503,17 +516,21 @@ function Get-StubEntityValues {
                 if ($null -ne $groupValue){
                     return @([string]$groupValue)
                 }
+            }
 
+            # users, groups and generic objects (e.g. contacts) may carry an attributes table.
+            if (
+                ($Entity.Kind -notin @('user', 'group', 'object')) -or
+                ($null -eq $Entity.Source) -or
+                (-not $Entity.Source.ContainsKey('attributes')) -or
+                ($null -eq $Entity.Source.attributes)
+            ){
                 return @()
             }
 
-            if ($Entity.Kind -ne 'user'){
-                return @()
-            }
-
-            foreach ($key in $user.attributes.Keys){
+            foreach ($key in $Entity.Source.attributes.Keys){
                 if ([string]$key -ieq $Attribute){
-                    $value = $user.attributes[$key]
+                    $value = $Entity.Source.attributes[$key]
                     if ($null -eq $value){
                         return @()
                     }
@@ -897,6 +914,7 @@ function Get-ADRootDSE {
     return [pscustomobject]@{
         defaultNamingContext = $script:StubRoot
         rootDomainNamingContext = $script:StubRoot
+        schemaNamingContext = $script:StubSchemaNc
         dnsHostName = 'stub-dc.stub.test'
     }
 }
@@ -923,6 +941,18 @@ function Invoke-StubGet {
                 throw [ADException]::new([string](Get-StubKey $fault 'message' 'stub fault'))
             }
         }
+    }
+
+    if (
+        (-not $HasIdentity) -and
+        ($SearchBase -ieq $script:StubSchemaNc)
+    ){
+        $kind = (($LDAPFilter -match 'classSchema') ? ('classes') : ('attributes'))
+        foreach ($o in @(Get-StubKey $state.schema $kind @())){
+            [pscustomobject]$o
+        }
+
+        return
     }
 
     if ($HasIdentity){
@@ -986,6 +1016,7 @@ function Get-ADObject {
         [string]$SearchBase,
         [ValidateSet('Base', 'OneLevel', 'Subtree')][string]$SearchScope,
         [string[]]$Properties = @(),
+        [int]$ResultPageSize,
         [string]$Server,
         [pscredential]$Credential
     )
@@ -1136,6 +1167,9 @@ function Set-ADUser {
         [hashtable]$Add,
         [hashtable]$Remove,
         [string]$Description,
+        [string]$SamAccountName,
+        [string]$UserPrincipalName,
+        [string]$EmailAddress,
         [bool]$ChangePasswordAtLogon,
         [bool]$Enabled,
         [switch]$PassThru,
@@ -1145,13 +1179,105 @@ function Set-ADUser {
 
     $state = Read-StubState
     $call = Add-StubCall -State $state -Cmdlet 'Set-ADUser' -CallArgs (ConvertTo-StubCallArgs -Bound $PSBoundParameters)
+    $user = $null
+    $original = $null
     try{
         Invoke-StubFault -State $state -Cmdlet 'Set-ADUser' -Call $call -PlainPassword ''
 
         $entity = Resolve-StubIdentity -State $state -Identity $Identity -Kinds @('user')
         $user = $entity.Source
+        $originalSam = $user.sam
+        $originalUpn = $user.upn
+        $readOnly = @('distinguishedname', 'objectguid', 'objectsid', 'memberof', 'cn', 'name', 'unicodepwd', 'userpassword', 'useraccountcontrol', 'samaccountname', 'userprincipalname')
+
+        # Like the real cmdlet: -Remove, then -Add, then -Replace, then -Clear (multi-valued values compare case-insensitively).
+        # Worked out on a copy first, so a refused value leaves the object untouched (an LDAP modify is atomic).
+        $original = $user.attributes
+        $user.attributes = @{}
+        foreach ($k in $original.Keys){
+            $user.attributes[$k] = $original[$k]
+        }
+
+        foreach ($pair in @(@('Remove', $Remove), @('Add', $Add))){
+            $operation = $pair[0]
+            $table = $pair[1]
+            if ($null -eq $table){
+                continue
+            }
+
+            foreach ($key in $table.Keys){
+                if (([string]$key).ToLowerInvariant() -in $readOnly){
+                    throw [ADException]::new("Stub: attribute '$key' cannot be modified through Set-ADUser -$operation (constraint violation).")
+                }
+
+                $existingKey = $null
+                foreach ($k in @($user.attributes.Keys)){
+                    if ([string]$k -ieq [string]$key){
+                        $existingKey = $k
+                    }
+                }
+
+                $current = [System.Collections.Generic.List[string]]::new()
+                if ($null -ne $existingKey){
+                    foreach ($v in @($user.attributes[$existingKey])){
+                        if ($null -ne $v){
+                            $current.Add([string]$v)
+                        }
+                    }
+
+                    $user.attributes.Remove($existingKey)
+                }
+
+                foreach ($v in @($table[$key])){
+                    $text = [string]$v
+                    $index = -1
+                    for ($j = 0; $j -lt $current.Count; $j++){
+                        if ($current[$j] -ieq $text){
+                            $index = $j
+                        }
+                    }
+
+                    if ($operation -eq 'Add'){
+                        if ($index -ge 0){
+                            throw [ADException]::new("The specified value already exists ('$key').")
+                        }
+
+                        $current.Add($text)
+                    }
+                    else{
+                        if ($index -lt 0){
+                            throw [ADException]::new("The specified value does not exist ('$key').")
+                        }
+
+                        $current.RemoveAt($index)
+                    }
+                }
+
+                if ($current.Count -gt 0){
+                    $user.attributes[[string]$key] = (($current.Count -eq 1) ? ($current[0]) : ([string[]]$current.ToArray()))
+                }
+            }
+        }
+
+        if ($PSBoundParameters.ContainsKey('SamAccountName')){
+            if ([string]::IsNullOrWhiteSpace($SamAccountName) -or ($SamAccountName.Length -gt 20)){
+                throw [ADException]::new("The specified sAMAccountName '$SamAccountName' is empty or longer than 20 characters.")
+            }
+
+            Test-StubUnique -State $state -Sam $SamAccountName -Upn '' -Dn '' -ExceptGuid $user.objectGuid
+            $user.sam = $SamAccountName
+        }
+
+        if ($PSBoundParameters.ContainsKey('UserPrincipalName')){
+            Test-StubUnique -State $state -Sam '' -Upn $UserPrincipalName -Dn '' -ExceptGuid $user.objectGuid
+            $user.upn = $UserPrincipalName
+        }
 
         $replacements = @{}
+        if ($PSBoundParameters.ContainsKey('EmailAddress')){
+            $replacements['mail'] = $EmailAddress
+        }
+
         if ($Replace){
             foreach ($key in $Replace.Keys){
                 $replacements[[string]$key] = $Replace[$key]
@@ -1230,6 +1356,12 @@ function Set-ADUser {
     }
     catch{
         $call.result = 'error: ' + $_.Exception.Message
+        if (($null -ne $user) -and ($null -ne $original)){
+            $user.attributes = $original
+            $user.sam = $originalSam
+            $user.upn = $originalUpn
+        }
+
         throw
     }
     finally{
@@ -1403,6 +1535,53 @@ function Move-ADObject {
     }
 }
 
+function Rename-ADObject {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory, Position = 0)]$Identity,
+        [Parameter(Mandatory, Position = 1)][string]$NewName,
+        [switch]$PassThru,
+        [string]$Server,
+        [pscredential]$Credential
+    )
+
+    $state = Read-StubState
+    $call = Add-StubCall -State $state -Cmdlet 'Rename-ADObject' -CallArgs (ConvertTo-StubCallArgs -Bound $PSBoundParameters)
+    try{
+        Invoke-StubFault -State $state -Cmdlet 'Rename-ADObject' -Call $call -PlainPassword ''
+        $entity = Resolve-StubIdentity -State $state -Identity $Identity -Kinds @('user', 'group', 'object')
+        if ([string]::IsNullOrWhiteSpace($NewName) -or ($NewName.Length -gt 64)){
+            throw [ADException]::new("Stub: the new name '$NewName' is empty or longer than 64 characters.")
+        }
+
+        $leaf = Get-StubLeafRdn -Dn $entity.Dn
+        $type = $leaf.Substring(0, $leaf.IndexOf('='))
+        $newDn = '{0}={1},{2}' -f $type, (ConvertTo-StubEscapedRdn -Value $NewName), (Get-StubParentDn -Dn $entity.Dn)
+        if ($newDn -cne $entity.Dn){
+            Test-StubUnique -State $state -Sam '' -Upn '' -Dn $newDn -ExceptGuid $entity.Guid
+            # Child objects keep their place below the renamed object.
+            foreach ($child in (Get-StubDescendants -State $state -Dn $entity.Dn)){
+                $child.Source.dn = $child.Dn.Substring(0, $child.Dn.Length - $entity.Dn.Length) + $newDn
+            }
+
+            $entity.Source.dn = $newDn
+        }
+
+        $call.result = 'ok'
+    }
+    catch{
+        $call.result = 'error: ' + $_.Exception.Message
+        throw
+    }
+    finally{
+        Save-StubState -State $state
+    }
+
+    if ($PassThru){
+        New-StubAdObject -Entity (Resolve-StubIdentity -State $state -Identity $entity.Guid -Kinds @('user', 'group', 'object'))
+    }
+}
+
 function Add-ADGroupMember {
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -1478,5 +1657,5 @@ function Remove-ADGroupMember {
 Export-ModuleMember -Function @(
     'Get-ADRootDSE', 'Get-ADUser', 'Get-ADGroup', 'Get-ADObject',
     'New-ADUser', 'Set-ADUser', 'Disable-ADAccount', 'Enable-ADAccount', 'Remove-ADUser',
-    'Remove-ADObject', 'Move-ADObject', 'Add-ADGroupMember', 'Remove-ADGroupMember'
+    'Remove-ADObject', 'Move-ADObject', 'Rename-ADObject', 'Add-ADGroupMember', 'Remove-ADGroupMember'
 )

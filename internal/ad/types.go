@@ -24,6 +24,8 @@ type SnapshotRequest struct {
 	IDAttribute string   `json:"idAttribute"`
 	Properties  []string `json:"properties"`
 	Groups      []string `json:"groups"`
+	// IncludeUnlinked also returns accounts whose id attribute is empty (ExternalID ""), for correlation.
+	IncludeUnlinked bool `json:"includeUnlinked,omitempty"`
 }
 
 type User struct {
@@ -136,6 +138,10 @@ type Client interface {
 	Disable(ctx context.Context, o ActionOpts, items []DisableItem) ([]Result, error)
 	Enable(ctx context.Context, o ActionOpts, items []EnableItem) ([]Result, error)
 	Remove(ctx context.Context, o ActionOpts, items []RemoveItem) ([]Result, error)
+	// CheckNames reports which account names are in use (read-only).
+	CheckNames(ctx context.Context, req NameCheckRequest) ([]TakenName, error)
+	// Link hands existing accounts to identities (id attribute, optional rename).
+	Link(ctx context.Context, o ActionOpts, items []LinkItem) ([]Result, error)
 }
 
 // Error kinds, mapped from script exit codes.

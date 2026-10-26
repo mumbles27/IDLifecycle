@@ -467,6 +467,27 @@ func TestMappingsAndTemplatePreview(t *testing.T) {
 		t.Errorf("preview of a bad template must report the error: %+v", prev)
 	}
 
+	// Initial-password preview: the password functions plus an AD complexity check.
+	var pw struct {
+		OK     bool
+		Output string
+		Error  string
+		Check  *string
+	}
+	want(t, "password preview", admin.do("POST", "/api/templates/preview", map[string]any{"kind": "password", "template": "{{ upper .A }}{{ .B }}!{{ random 4 }}", "record": map[string]string{"A": "x", "B": "2026"}}, &pw), 200)
+	if !pw.OK || len(pw.Output) != 10 || pw.Check == nil || *pw.Check != "" {
+		t.Errorf("password preview: %+v", pw)
+	}
+	pw.Check = nil
+	admin.do("POST", "/api/templates/preview", map[string]any{"kind": "password", "template": "{{ .A }}", "record": map[string]string{"A": "short"}}, &pw)
+	if !pw.OK || pw.Check == nil || !strings.Contains(*pw.Check, "at least 8") {
+		t.Errorf("a weak preview must say why: %+v", pw)
+	}
+	admin.do("POST", "/api/templates/preview", map[string]any{"template": "{{ random 4 }}", "record": map[string]string{}}, &prev)
+	if prev.OK {
+		t.Errorf("random must not work in an ordinary template preview: %+v", prev)
+	}
+
 	want(t, "delete", admin.do("DELETE", "/api/mappings/"+m.ID, nil, nil), 204)
 	want(t, "gone", admin.do("GET", "/api/mappings/"+m.ID, nil, nil), 404)
 }
@@ -520,6 +541,12 @@ func TestSettingsValidationAndAudit(t *testing.T) {
 	bad = s
 	bad.Engine.DryRun, bad.AD.UPNSuffix = false, ""
 	want(t, "cannot go live without AD settings", admin.do("PUT", "/api/settings", bad, nil), 400)
+	bad = s
+	bad.NewUser.PasswordMode, bad.NewUser.PasswordTemplate = model.PasswordModeTemplate, "{{ range . }}"
+	want(t, "unsafe password template", admin.do("PUT", "/api/settings", bad, nil), 400)
+	bad = s
+	bad.Naming.MailTemplate, bad.Naming.MailDomain = "{{ random 3 }}", "corp.example.com"
+	want(t, "random is not allowed in the mail template", admin.do("PUT", "/api/settings", bad, nil), 400)
 
 	s.Approval.Update = "auto"
 	s.Schedule = model.ScheduleSettings{Enabled: true, Kind: "daily", DailyTime: "03:30", Timezone: "America/Chicago", IntervalMinutes: 60, CronExpr: "0 * * * *"}

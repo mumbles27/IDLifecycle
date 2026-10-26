@@ -25,6 +25,8 @@ const (
 	ChangeDisable = "disable"
 	ChangeEnable  = "enable"
 	ChangeDelete  = "delete"
+	// ChangeLink hands an existing AD account to an identity (correlation): sets the id attribute, optionally renames.
+	ChangeLink = "link"
 )
 
 // Change statuses.
@@ -46,6 +48,8 @@ const (
 	StateDisabled = "disabled"
 	StateDeleted  = "deleted"
 	StateError    = "error"
+	// StateMerged: the identity's account was handed to another identity (MergedInto); the planner skips it.
+	StateMerged = "merged"
 )
 
 // Run statuses.
@@ -66,10 +70,18 @@ type User struct {
 	Disabled     bool       `json:"disabled"`
 	CreatedAt    time.Time  `json:"created_at"`
 	LastLoginAt  *time.Time `json:"last_login_at"`
+	AuthSource   string     `json:"auth_source"` // local | oidc
+	ExternalID   string     `json:"external_id"` // oidc: "<tenant id>:<object id>"
 	PasswordHash string     `json:"-"`
 	FailedLogins int        `json:"-"`
 	LockedUntil  *time.Time `json:"-"`
 }
+
+// User sign-in sources.
+const (
+	AuthLocal = "local"
+	AuthOIDC  = "oidc"
+)
 
 type Session struct {
 	TokenHash  string
@@ -171,12 +183,102 @@ type Identity struct {
 	Applied     map[string]string `json:"-"` // last values this service pushed per attribute
 	DisabledAt  *time.Time        `json:"disabled_at"`
 	State       string            `json:"state"`
+	// OUOverride is an OU chosen by a person for this identity (Change OU on an approval). It applies while the
+	// placement field (e.g. Department) still has the value OUOverrideValue; a department change ends it.
+	OUOverride      string `json:"ou_override,omitempty"`
+	OUOverrideValue string `json:"ou_override_value,omitempty"`
+	// NameOverride are account names a person chose for this identity (Set name on a create); used in every
+	// naming.conflict_mode instead of the templates.
+	NameOverride *Candidate `json:"name_override,omitempty"`
+	// Correlation: MergedInto is the identity that took over this identity's account; LinkRejects are objectGUIDs a
+	// person said are not this identity; LinkDecision is "" | "new" (always create) | "guid:<objectGUID>" (link to it).
+	MergedInto   string   `json:"merged_into,omitempty"`
+	LinkRejects  []string `json:"link_rejects,omitempty"`
+	LinkDecision string   `json:"link_decision,omitempty"`
+}
+
+// Identity.LinkDecision values.
+const (
+	LinkDecisionNew  = "new"
+	LinkDecisionGUID = "guid:"
+)
+
+// ManualPerson is a person typed into the console (source type "manual"), e.g. a contractor.
+type ManualPerson struct {
+	ID         string            `json:"id"`
+	SourceID   string            `json:"source_id"`
+	ExternalID string            `json:"external_id"`
+	Attrs      map[string]string `json:"attrs"`
+	Ended      bool              `json:"ended"`
+	CreatedBy  string            `json:"created_by"`
+	CreatedAt  time.Time         `json:"created_at"`
+	UpdatedBy  string            `json:"updated_by"`
+	UpdatedAt  time.Time         `json:"updated_at"`
+	// Filled in by the API from the identity (read-only).
+	State string `json:"state,omitempty"`
+	ADSam string `json:"ad_sam,omitempty"`
+}
+
+// NameConflict is a generated account name that is already in use.
+type NameConflict struct {
+	Field string `json:"field"`          // sam | upn | mail | cn
+	Value string `json:"value"`          //
+	DN    string `json:"dn,omitempty"`   // the AD object that has it
+	With  string `json:"with,omitempty"` // "Display (external id)" of another person planned in the same run
+}
+
+// FieldMatch is one correlation rule evaluated against one AD account.
+type FieldMatch struct {
+	Field   string `json:"field"`
+	ADAttr  string `json:"ad_attr"`
+	Value   string `json:"value"`
+	ADValue string `json:"ad_value"`
+	Matched bool   `json:"matched"`
+}
+
+// LinkCandidate is an existing AD account that may belong to an identity.
+type LinkCandidate struct {
+	ObjectGUID      string       `json:"object_guid"`
+	DN              string       `json:"dn"`
+	Sam             string       `json:"sam"`
+	UPN             string       `json:"upn"`
+	Enabled         bool         `json:"enabled"`
+	ExternalID      string       `json:"external_id"`           // current id attribute value ("" = none)
+	IdentityID      string       `json:"identity_id,omitempty"` // identity the account belongs to now (a transfer)
+	IdentityDisplay string       `json:"identity_display,omitempty"`
+	SourceName      string       `json:"source_name,omitempty"`
+	Fields          []FieldMatch `json:"fields"`
+	Full            bool         `json:"full"`
+	Manual          bool         `json:"manual,omitempty"` // chosen by a person (link_decision)
+}
+
+// LinkPayload is the correlation part of a link change.
+type LinkPayload struct {
+	Candidates []LinkCandidate `json:"candidates"`
+	Chosen     string          `json:"chosen"` // object_guid or ""
+	Verify     bool            `json:"verify"` // a person must confirm (partial or several candidates)
+	Rename     *Candidate      `json:"rename,omitempty"`
+	RenameNote string          `json:"rename_note,omitempty"`
+}
+
+// ChosenCandidate returns the chosen candidate, if any.
+func (l *LinkPayload) ChosenCandidate() (LinkCandidate, bool) {
+	if l == nil || l.Chosen == "" {
+		return LinkCandidate{}, false
+	}
+	for _, c := range l.Candidates {
+		if c.ObjectGUID == l.Chosen {
+			return c, true
+		}
+	}
+	return LinkCandidate{}, false
 }
 
 type Candidate struct {
-	Sam string `json:"sam"`
-	UPN string `json:"upn"`
-	CN  string `json:"cn"`
+	Sam  string `json:"sam"`
+	UPN  string `json:"upn"`
+	CN   string `json:"cn"`
+	Mail string `json:"mail,omitempty"` // only when naming.mail_template is set and no mapping writes mail
 }
 
 type AttrDiff struct {
@@ -199,6 +301,16 @@ type ChangePayload struct {
 	RemoveGroups []string            `json:"remove_groups,omitempty"`
 	MoveTo       string              `json:"move_to,omitempty"`
 	Description  string              `json:"description,omitempty"`
+	// OU placement: NeedsOU marks a create/move that waits for a person to choose the OU (no mapping for the
+	// department); Placement is the placement field's value the plan was made for (recorded when applied).
+	NeedsOU   bool   `json:"needs_ou,omitempty"`
+	OUReason  string `json:"ou_reason,omitempty"`
+	Placement string `json:"placement,omitempty"`
+	// Naming conflicts: NeedsName marks a create whose names are all taken; a person sets one (Set name).
+	NeedsName     bool           `json:"needs_name,omitempty"`
+	NameConflicts []NameConflict `json:"name_conflicts,omitempty"`
+	// Link (change type link): ObjectGUID/DN are the chosen account.
+	Link *LinkPayload `json:"link,omitempty"`
 }
 
 type Change struct {

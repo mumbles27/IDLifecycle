@@ -47,6 +47,7 @@ func (e *Engine) finish(ctx context.Context, run *model.Run) {
 	e.audit(ctx, "system", "sync.finish", "run", run.ID, map[string]any{"status": run.Status, "counters": run.Counters, "error": run.Error})
 	e.Log.Info("sync finished", "run", run.ID, "status", run.Status, "counters", run.Counters, "error", run.Error)
 	e.notifyRun(ctx, run, notes.pending, notes.thresholds)
+	e.notifyIssues(ctx, run, notes.issues)
 }
 
 const (
@@ -75,7 +76,7 @@ func isTerminated(opt model.SourceOptions, attrs map[string]string) bool {
 
 // ingest fetches one source and upserts identities. The returned slice is the source's full identity set.
 func (e *Engine) ingest(ctx context.Context, src model.Source, cnt map[string]int) ([]model.Identity, error) {
-	built, err := sources.Build(src, e.Cipher)
+	built, err := sources.BuildFor(src, e.Cipher, e.Store.ListManualPeople)
 	if err != nil {
 		return nil, err
 	}
@@ -88,11 +89,13 @@ func (e *Engine) ingest(ctx context.Context, src model.Source, cnt map[string]in
 	if err != nil {
 		return nil, err
 	}
-	if len(rows) == 0 && len(existing) > 0 {
+	// The feed guards protect against truncated HR exports; people typed into the console cannot be truncated.
+	feed := src.Type != sources.TypeManual
+	if feed && len(rows) == 0 && len(existing) > 0 {
 		return nil, errors.New("source returned zero records although identities exist; refusing to treat that as 'everyone left'")
 	}
 
-	if len(existing) > 0 {
+	if feed && len(existing) > 0 {
 		valid := 0
 		for _, r := range rows {
 			if strings.TrimSpace(lookupAttr(r, src.Options.ExternalIDField)) != "" {
@@ -121,7 +124,7 @@ func (e *Engine) ingest(ctx context.Context, src model.Source, cnt map[string]in
 
 	// A feed that suddenly lacks most of the known population is far more likely truncated than real.
 	// Checked before anything is written so a rejected feed leaves no trace.
-	if len(existing) >= minPopulationForShrinkGuard {
+	if feed && len(existing) >= minPopulationForShrinkGuard {
 		active, absent := 0, 0
 		for _, cur := range all {
 			if cur.Active {

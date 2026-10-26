@@ -83,6 +83,107 @@ func broadReaders(path string, isDir bool) ([]Problem, error) {
 	return out, nil
 }
 
+const (
+	fileWriteData  = 0x2        // FILE_WRITE_DATA / FILE_ADD_FILE
+	fileAppendData = 0x4        // FILE_APPEND_DATA / FILE_ADD_SUBDIRECTORY
+	fileDelChild   = 0x40       // FILE_DELETE_CHILD
+	deleteRight    = 0x10000    // DELETE
+	writeDAC       = 0x40000    // WRITE_DAC
+	writeOwner     = 0x80000    // WRITE_OWNER
+	genericWrite   = 0x40000000 // GENERIC_WRITE
+	inheritOnly    = 0x8        // INHERIT_ONLY_ACE
+	writeMask      = fileWriteData | fileAppendData | fileDelChild | deleteRight | writeDAC | writeOwner | genericWrite | genericAll
+)
+
+// trustedOwners may own the data and program folders. TrustedInstaller owns Program Files itself.
+var trustedOwners = map[string]bool{
+	"S-1-5-18":     true, // SYSTEM
+	"S-1-5-32-544": true, // BUILTIN\Administrators
+	"S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464": true, // NT SERVICE\TrustedInstaller
+}
+
+func accountName(sid *windows.SID) string {
+	if a, d, _, err := sid.LookupAccount(""); err == nil {
+		if d != "" {
+			return d + `\` + a
+		}
+		return a
+	}
+	return sid.String()
+}
+
+// untrustedOwner returns the owner's name when it is neither a trusted owner nor the current process user.
+func untrustedOwner(path string) (string, error) {
+	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION)
+	if err != nil {
+		return "", err
+	}
+	owner, _, err := sd.Owner()
+	if err != nil {
+		return "", err
+	}
+	if owner == nil {
+		return "(no owner)", nil
+	}
+	if trustedOwners[owner.String()] {
+		return "", nil
+	}
+	tu, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		return "", err
+	}
+	if windows.EqualSid(owner, tu.User.Sid) {
+		return "", nil
+	}
+	return accountName(owner), nil
+}
+
+// broadWriters lists broad principals with an allow ACE that lets them create, modify or delete objects.
+// Inherit-only ACEs on a directory are skipped (the children's own ACLs carry them and are walked too).
+func broadWriters(path string, isDir bool) ([]Problem, error) {
+	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	if err != nil {
+		return nil, err
+	}
+	dacl, _, err := sd.DACL()
+	if err != nil {
+		return nil, err
+	}
+	if dacl == nil {
+		return []Problem{{Path: path, Principal: "Everyone (NULL ACL)"}}, nil
+	}
+	var out []Problem
+	for i := uint32(0); i < uint32(dacl.AceCount); i++ {
+		var ace *windows.ACCESS_ALLOWED_ACE
+		if err := windows.GetAce(dacl, i, &ace); err != nil {
+			return nil, err
+		}
+		if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE || ace.Mask&writeMask == 0 {
+			continue
+		}
+		if isDir && ace.Header.AceFlags&inheritOnly != 0 {
+			continue
+		}
+		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart)).String()
+		if name, ok := broadName(sid); ok {
+			out = append(out, Problem{Path: path, Principal: name})
+		}
+	}
+	return out, nil
+}
+
+// setOwnerAdministrators makes BUILTIN\Administrators the owner (works from an elevated token).
+func setOwnerAdministrators(path string) error {
+	admins, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+	if err != nil {
+		return err
+	}
+	var pin runtime.Pinner
+	pin.Pin(admins)
+	defer pin.Unpin()
+	return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION, admins, nil, nil, nil)
+}
+
 func lockdown(dir string, accounts []string) error {
 	var pin runtime.Pinner
 	defer pin.Unpin()

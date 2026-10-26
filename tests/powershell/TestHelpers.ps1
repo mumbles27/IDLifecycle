@@ -127,7 +127,8 @@ function New-StubStateFile {
         [string[]]$Ous = @(),
         [object[]]$Objects = @(),
         [object[]]$Faults = @(),
-        [bool]$FailConnect = $false
+        [bool]$FailConnect = $false,
+        [hashtable]$Schema = @{}
     )
 
     $null = New-Item -ItemType Directory -Force -Path $script:StateDir
@@ -140,6 +141,7 @@ function New-StubStateFile {
         calls       = @()
         faults      = @($Faults)
         failConnect = $FailConnect
+        schema      = $Schema
     }
     [System.IO.File]::WriteAllText($path, (ConvertTo-Json -InputObject $state -Depth 20), $script:Utf8NoBom)
     return $path

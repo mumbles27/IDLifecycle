@@ -3,12 +3,13 @@
 import { qs } from './ui.js';
 
 export class ApiError extends Error {
-  constructor(message, { status = 0, code = '', handled = false } = {}) {
+  constructor(message, { status = 0, code = '', handled = false, data = null } = {}) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
     this.code = code;
     this.handled = handled;
+    this.data = data; // the parsed error body (e.g. "conflicts" on a 409)
   }
 }
 
@@ -107,7 +108,7 @@ export async function request(method, path, { body, params, quiet401 = false } =
     }
     throw new ApiError(message, { status: 401, code, handled: true });
   }
-  throw new ApiError(message, { status: res.status, code });
+  throw new ApiError(message, { status: res.status, code, data: data && typeof data === 'object' ? data : null });
 }
 
 export const api = {
@@ -149,4 +150,14 @@ export async function logout() {
 
 export function changePassword(current, next) {
   return api.post('/auth/password', { current, new: next });
+}
+
+/** What the login page may offer (public): { local_login, oidc: { enabled, label } }. */
+export async function signInOptions() {
+  try {
+    return await request('GET', '/auth/providers', { quiet401: true });
+  }
+  catch (e) {
+    return { local_login: 'all', oidc: { enabled: false, label: '' } };
+  }
 }

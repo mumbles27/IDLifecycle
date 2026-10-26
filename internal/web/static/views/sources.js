@@ -154,6 +154,14 @@ export async function render(root, ctx) {
     };
     let config = existing ? { ...(existing.config || {}) } : {};
     const cfgBox = h('div', { class: 'stack-sm', 'data-test': 'source-config' });
+    // A manual source fixes these options on the server (ExternalID / Status / Terminated), so they are hidden for it.
+    const idOpts = h('fieldset', { class: 'group' },
+      h('legend', null, 'Identity options'),
+      field('External ID field', inputText(optModel, 'external_id_field', { placeholder: 'EmployeeId', 'data-test': 'opt-extid' }), { help: 'The source field that uniquely identifies a person. It is stored in the AD ID attribute (e.g. employeeID).' }),
+      field('Status field', inputText(optModel, 'status_field', { placeholder: 'Status' }), { help: 'Optional. Source field that says whether the person is still employed.' }),
+      field('Terminated values', inputText(optModel, 'terminated_values', { placeholder: 'T, Terminated' }), { help: 'Comma-separated status values that mean "has left". Matching people are disabled, then deleted after the grace period.' }),
+      inputCheck(optModel, 'missing_means_terminated', 'Treat people missing from the feed as terminated'),
+      field('Missing grace runs', inputNumber(optModel, 'missing_grace_runs', { min: '0', step: '1' }), { help: 'How many consecutive runs a person may be absent before they count as terminated. Protects against partial feeds.' }));
 
     function drawConfig() {
       clear(cfgBox);
@@ -161,6 +169,13 @@ export async function render(root, ctx) {
       if (!def) {
         cfgBox.appendChild(h('p', { class: 'muted' }, 'Unknown source type.'));
         return;
+      }
+      const manual = model.type === 'manual';
+      if (idOpts) {
+        idOpts.hidden = manual;
+      }
+      if (manual) {
+        cfgBox.appendChild(notice('info', 'People in a manual source are typed in under ', h('a', { href: '#/manual' }, 'Add person'), '. "form_fields" defines that form, one field per line: Name | Label | flags (required, date, email, select: A; B; C, default: value). The employee ID is generated from the prefix, and the person counts as left the day after the end date field.'));
       }
       for (const f of def.fields || []) {
         if (config[f.name] === undefined && f.default !== undefined && f.default !== null) {
@@ -191,13 +206,7 @@ export async function render(root, ctx) {
       field('Type', typeSel, { required: true }),
       inputCheck(model, 'enabled', 'Enabled'),
       h('fieldset', { class: 'group' }, h('legend', null, 'Connection'), cfgBox),
-      h('fieldset', { class: 'group' },
-        h('legend', null, 'Identity options'),
-        field('External ID field', inputText(optModel, 'external_id_field', { placeholder: 'EmployeeId', 'data-test': 'opt-extid' }), { help: 'The source field that uniquely identifies a person. It is stored in the AD ID attribute (e.g. employeeID).' }),
-        field('Status field', inputText(optModel, 'status_field', { placeholder: 'Status' }), { help: 'Optional. Source field that says whether the person is still employed.' }),
-        field('Terminated values', inputText(optModel, 'terminated_values', { placeholder: 'T, Terminated' }), { help: 'Comma-separated status values that mean "has left". Matching people are disabled, then deleted after the grace period.' }),
-        inputCheck(optModel, 'missing_means_terminated', 'Treat people missing from the feed as terminated'),
-        field('Missing grace runs', inputNumber(optModel, 'missing_grace_runs', { min: '0', step: '1' }), { help: 'How many consecutive runs a person may be absent before they count as terminated. Protects against partial feeds.' })),
+      idOpts,
     ];
 
     formModal({
@@ -213,6 +222,12 @@ export async function render(root, ctx) {
             continue;
           }
           cfg[k] = v;
+        }
+        if (model.type === 'manual') {
+          optModel.external_id_field = 'ExternalID';
+          optModel.status_field = 'Status';
+          optModel.terminated_values = 'Terminated';
+          optModel.missing_means_terminated = false;
         }
         const body = {
           name: model.name.trim(),

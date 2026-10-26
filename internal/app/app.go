@@ -20,6 +20,7 @@ import (
 
 	"idlifecycle/internal/ad"
 	"idlifecycle/internal/api"
+	"idlifecycle/internal/backup"
 	"idlifecycle/internal/config"
 	"idlifecycle/internal/datadir"
 	"idlifecycle/internal/engine"
@@ -72,11 +73,9 @@ func OpenStore(ctx context.Context, cfg config.Config) (*store.Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	st.SetAuditKey(cipher.Derive(auditKeyLabel))
+	st.SetAuditKey(cipher.Derive(store.AuditKeyLabel))
 	return st, nil
 }
-
-const auditKeyLabel = "audit-chain-v1"
 
 // App is a running service instance.
 type App struct {
@@ -88,6 +87,7 @@ type App struct {
 	Server    *http.Server
 
 	listener net.Listener
+	cipher   *secrets.Cipher
 }
 
 // New builds everything and verifies prerequisites, but does not start serving.
@@ -112,7 +112,7 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error)
 		Timeout:         time.Duration(cfg.PowerShell.TimeoutSeconds) * time.Second,
 		Logger:          log,
 	}
-	for _, f := range []string{"Get-IDLSnapshot.ps1", "New-IDLUser.ps1", "Set-IDLUser.ps1", "Disable-IDLUser.ps1", "Enable-IDLUser.ps1", "Remove-IDLUser.ps1"} {
+	for _, f := range []string{"Get-IDLSnapshot.ps1", "New-IDLUser.ps1", "Set-IDLUser.ps1", "Disable-IDLUser.ps1", "Enable-IDLUser.ps1", "Remove-IDLUser.ps1", "Test-IDLNames.ps1", "Set-IDLLink.ps1"} {
 		if _, err := os.Stat(filepath.Join(cfg.PowerShell.ScriptsDir, f)); err != nil {
 			log.Warn("AD script missing; syncs will fail until it is installed", "script", f, "dir", cfg.PowerShell.ScriptsDir)
 		}
@@ -134,9 +134,9 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error)
 	}
 	sched := scheduler.New(st, eng, log)
 
-	a := &App{Cfg: cfg, Log: log, Store: st, Engine: eng, Scheduler: sched}
+	a := &App{Cfg: cfg, Log: log, Store: st, Engine: eng, Scheduler: sched, cipher: cipher}
 	apiSrv := &api.Server{
-		Store: st, Engine: eng, Cipher: cipher, Scheduler: sched, Notifier: notifier, Static: web.Handler(), Log: log,
+		Store: st, Engine: eng, Cipher: cipher, Config: cfg, Scheduler: sched, Notifier: notifier, Static: web.Handler(), Log: log,
 		Version: Version, TLS: cfg.TLSEnabled(), BaseCtx: ctx,
 	}
 	a.Server = &http.Server{
@@ -181,10 +181,13 @@ func (a *App) Run(ctx context.Context) error {
 		a.Log.Warn("no GUI users exist; create the first administrator with: idlifecycled user add -config <config.json> -username <name> -role admin")
 	}
 
+	_ = a.Store.AppendAudit(ctx, "system", "service.start", "service", "", map[string]any{"version": Version, "addr": a.Addr()})
+
 	var wg sync.WaitGroup
 	bg := func(f func()) { wg.Add(1); go func() { defer wg.Done(); f() }() }
 	bg(func() { a.Engine.RunWorker(ctx) })
 	bg(func() { a.Scheduler.Run(ctx) })
+	bg(func() { a.runBackupSchedule(ctx) })
 	bg(func() {
 		t := time.NewTicker(time.Hour)
 		defer t.Stop()
@@ -224,7 +227,28 @@ func (a *App) Run(ctx context.Context) error {
 	_ = a.Server.Shutdown(shutdownCtx)
 	a.Engine.Shutdown(20 * time.Second)
 	wg.Wait()
+	_ = a.Store.AppendAudit(context.Background(), "system", "service.stop", "service", "", map[string]any{"version": Version})
 	_ = a.Store.Close()
 	a.Log.Info("stopped")
 	return runErr
+}
+
+// runBackupSchedule checks every 15 minutes (first after 2 minutes) whether a scheduled backup is due.
+func (a *App) runBackupSchedule(ctx context.Context) {
+	wait := 2 * time.Minute
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(wait):
+		}
+		wait = 15 * time.Minute
+		ran, fi, err := backup.RunIfDue(ctx, a.Store, a.Cfg, a.cipher, Version, time.Now())
+		switch {
+		case err != nil:
+			a.Log.Error("scheduled backup failed", "error", err)
+		case ran:
+			a.Log.Info("scheduled backup written", "file", fi.Path, "bytes", fi.Size)
+		}
+	}
 }
