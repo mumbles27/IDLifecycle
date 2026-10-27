@@ -248,6 +248,58 @@ Describe 'Install-IDLifecycle.ps1 (fakes for every system change; temp folders o
         Remove-SetupFixture -Fixture $fx
     }
 
+    It 'tray: tray.json for the tray, Start menu + Startup shortcuts with the service''s execution policy, a protected branding folder; -NoTray removes the tray shortcuts' {
+        $fx = New-SetupFixture
+        Set-Content -LiteralPath (Join-Path $fx.Source 'Setup.cmd') -Value '@echo launcher'
+        Write-ReleaseManifest -Root $fx.Source
+        $r = Invoke-SetupScript -Script 'Install-IDLifecycle' -Params (Get-BaseParams -Fx $fx) -StatePath $fx.State -AdminPassword $adminPw
+        $r.ExitCode | Should Be 0
+
+        Import-Module (Join-Path $script:ScriptsDir 'IDLifecycle.Common.psm1') -Force
+        $tray = Read-IDLTrayInfo -Path (Join-Path $fx.Install 'tray.json')
+        $tray['service_name'] | Should Be 'IDLSetupTest'
+        $tray['console_url'] | Should Be 'http://127.0.0.1:8443/'
+        $tray['tls'] | Should Be $false
+        $tray['config_path'] | Should Be $fx.Config
+        $tray['install_dir'] | Should Be $fx.Install
+        $tray['version'] | Should Be '1.0.0'
+        $tray['execution_policy'] | Should Be 'RemoteSigned'
+        [System.IO.File]::ReadAllText((Join-Path $fx.Install 'tray.json')) | Should Not Match ([regex]::Escape($adminPw))
+
+        $desktop = Join-Path (Split-Path -Parent $fx.State) 'desktop'
+        $shortcuts = (Read-FakeSetupState -Path $fx.State)['shortcuts']
+        @($shortcuts.Keys | Sort-Object) -join '|' | Should Be ((@(
+                    (Join-Path $desktop 'Programs\IDLifecycle\IDLifecycle Setup.lnk'),
+                    (Join-Path $desktop 'Programs\IDLifecycle\IDLifecycle Tray.lnk'),
+                    (Join-Path $desktop 'Startup\IDLifecycle Tray.lnk')) | Sort-Object) -join '|')
+        $lnk = $shortcuts[(Join-Path $desktop 'Startup\IDLifecycle Tray.lnk')]
+        $lnk['Arguments'] | Should Be ('-NoProfile -STA -WindowStyle Hidden -ExecutionPolicy RemoteSigned -File "{0}"' -f (Join-Path $fx.Install 'scripts\Start-IDLifecycleTray.ps1'))
+        $lnk['Arguments'] | Should Not Match 'Bypass'
+        $shortcuts[(Join-Path $desktop 'Programs\IDLifecycle\IDLifecycle Setup.lnk')]['Target'] | Should Be (Join-Path $fx.Install 'Setup.cmd')
+        (Test-Path -LiteralPath (Join-Path $desktop 'IDLifecycle-Branding\README.txt')) | Should Be $true
+        foreach ($step in @('WriteTrayInfo', 'BrandingFolder', 'SetupShortcut', 'TrayShortcut', 'TrayAutostart')){
+            $r.ReportText | Should Match ('"' + $step + '","Applied"')
+        }
+
+        # Re-run: everything is up to date.
+        $r = Invoke-SetupScript -Script 'Install-IDLifecycle' -Params (Get-BaseParams -Fx $fx) -StatePath $fx.State -AdminPassword $adminPw
+        $r.ExitCode | Should Be 0
+        foreach ($step in @('WriteTrayInfo', 'BrandingFolder', 'SetupShortcut', 'TrayShortcut', 'TrayAutostart')){
+            $r.ReportText | Should Match ('"' + $step + '","Skipped"')
+        }
+
+        # A branding folder others can change is reported (WARN), never "fixed" silently.
+        Update-FakeSetupState -Path $fx.State -Change { param($s) $s['brandingUntrusted'] = 'BUILTIN\Users can change it' }
+        $r = Invoke-SetupScript -Script 'Install-IDLifecycle' -Params (Get-BaseParams -Fx $fx -Extra @{ NoTray = $true }) -StatePath $fx.State -AdminPassword $adminPw
+        $r.ExitCode | Should Be 0
+        $r.LogText | Should Match '\[WARN\] SKIP: BrandingFolder .*not protected \(BUILTIN\\Users can change it\)'
+        $r.ReportText | Should Match '"RemoveTrayShortcut","Applied"'
+        $r.ReportText | Should Match '"RemoveTrayAutostart","Applied"'
+        @((Read-FakeSetupState -Path $fx.State)['shortcuts'].Keys) -join '|' | Should Be (Join-Path $desktop 'Programs\IDLifecycle\IDLifecycle Setup.lnk')
+        $r.LogText | Should Not Match 'Tray icon: starts for everyone'
+        Remove-SetupFixture -Fixture $fx
+    }
+
     It 'IDL_PASSWORD in the environment is used for user add only and removed from the installer process' {
         $fx = New-SetupFixture
         $r = Invoke-SetupScript -Script 'Install-IDLifecycle' -Params (Get-BaseParams -Fx $fx -Extra @{ Start = $false }) -StatePath $fx.State -ExtraEnv @{ IDL_PASSWORD = $adminPw }
@@ -675,6 +727,77 @@ Describe 'Install-IDLifecycle.ps1 security (release trust, pre-created folders, 
         $r = Invoke-SetupScript -Script 'Install-IDLifecycle' -Params $p -StatePath $fx.State
         $r.ExitCode | Should Be 2
         $r.LogText | Should Match 'has no SHA256SUMS manifest'
+        @(Get-FakeOps -Path $fx.State) -contains 'daemon:version' | Should Be $false
+        Remove-SetupFixture -Fixture $fx
+    }
+
+    It 'SkipIntegrityCheck (least safe): no or a stale SHA256SUMS is accepted with warnings; the installed manifest lists what was copied' {
+        $fx = New-SetupFixture
+        $stagingDir = Join-Path $script:StateDir 'Staging'
+        $tempBefore = @(Get-ChildItem -LiteralPath $stagingDir -Filter 'unverified_*' -ErrorAction SilentlyContinue).Count
+        Remove-Item -LiteralPath (Join-Path $fx.Source 'SHA256SUMS') -Force
+        Set-Content -LiteralPath (Join-Path $fx.Source 'scripts\Extra-Test.ps1') -Value '# a local test script'
+        Set-Content -LiteralPath (Join-Path $fx.Source 'Setup.cmd') -Value '@echo launcher'
+        $null = New-Item -ItemType Directory -Path (Join-Path $fx.Source 'scripts\Logs')
+        Set-Content -LiteralPath (Join-Path $fx.Source 'scripts\Logs\old.log') -Value 'not shipped'
+
+        $r = Invoke-SetupScript -Script 'Install-IDLifecycle' -Params (Get-BaseParams -Fx $fx -Extra @{ SkipIntegrityCheck = $true }) -StatePath $fx.State -AdminPassword $adminPw
+        $r.ExitCode | Should Be 0
+        $r.LogText | Should Match 'UNVERIFIED INSTALL \(-SkipIntegrityCheck, least safe\)'
+        $r.LogText | Should Match 'Reminder: this was an UNVERIFIED install'
+        $r.ReportText | Should Match '"IntegrityCheck","Skipped"'
+        (Test-Path -LiteralPath (Join-Path $fx.Install 'scripts\Extra-Test.ps1')) | Should Be $true
+        (Test-Path -LiteralPath (Join-Path $fx.Install 'scripts\Logs\old.log')) | Should Be $false
+
+        # The installed SHA256SUMS describes exactly the copied files, so upgrade and uninstall work as usual.
+        $manifest = Get-Content -LiteralPath (Join-Path $fx.Install 'SHA256SUMS')
+        @($manifest | Where-Object { $_ -match '  scripts/Extra-Test\.ps1$' }).Count | Should Be 1
+        @($manifest | Where-Object { $_ -match '  Setup\.cmd$' }).Count | Should Be 1
+        @($manifest | Where-Object { $_ -match 'Logs' }).Count | Should Be 0
+        foreach ($line in $manifest){
+            $hash, $rel = $line -split '  ', 2
+            (Get-FileHash -LiteralPath (Join-Path $fx.Install $rel) -Algorithm SHA256).Hash | Should Be $hash.ToUpperInvariant()
+        }
+
+        # The generated manifest's staging folder is gone.
+        @(Get-ChildItem -LiteralPath $stagingDir -Filter 'unverified_*' -ErrorAction SilentlyContinue).Count | Should Be $tempBefore
+
+        # A changed file in a folder with a stale manifest is accepted too (that is the point - and the risk).
+        Write-ReleaseManifest -Root $fx.Source
+        [System.IO.File]::WriteAllText((Join-Path $fx.Source 'scripts\Extra-Test.ps1'), '# changed after the manifest', $script:Utf8NoBom)
+        # (the installed copy differs now, so this is an upgrade: -Force)
+        $r = Invoke-SetupScript -Script 'Install-IDLifecycle' -Params (Get-BaseParams -Fx $fx -Extra @{ SkipIntegrityCheck = $true; DryRun = $true; Force = $true }) -StatePath $fx.State
+        $r.ExitCode | Should Be 0
+        $r.LogText | Should Match 'UNVERIFIED INSTALL'
+        Remove-SetupFixture -Fixture $fx
+    }
+
+    It 'SkipIntegrityCheck still refuses an untrusted folder, a missing exe or required script, and an unsigned exe with -RequireSignature' {
+        $fx = New-SetupFixture
+        $tempBefore = @(Get-ChildItem -LiteralPath (Join-Path $script:StateDir 'Staging') -Filter 'unverified_*' -ErrorAction SilentlyContinue).Count
+        $p = Get-BaseParams -Fx $fx -Extra @{ SkipIntegrityCheck = $true; DryRun = $true }
+
+        Remove-Item -LiteralPath (Join-Path $fx.Source 'scripts\New-IDLUser.ps1') -Force
+        $r = Invoke-SetupScript -Script 'Install-IDLifecycle' -Params $p -StatePath $fx.State
+        $r.ExitCode | Should Be 2
+        $r.LogText | Should Match 'is missing: scripts\\New-IDLUser\.ps1'
+        Copy-Item -LiteralPath (Join-Path $script:ScriptsDir 'New-IDLUser.ps1') -Destination (Join-Path $fx.Source 'scripts\New-IDLUser.ps1')
+
+        Move-Item -LiteralPath $fx.Exe -Destination (Join-Path $fx.Root 'moved.exe')
+        $r = Invoke-SetupScript -Script 'Install-IDLifecycle' -Params $p -StatePath $fx.State
+        $r.ExitCode | Should Be 2
+        $r.LogText | Should Match 'has no idlifecycled\.exe\. In a source checkout build it first'
+        Move-Item -LiteralPath (Join-Path $fx.Root 'moved.exe') -Destination $fx.Exe
+
+        $r = Invoke-SetupScript -Script 'Install-IDLifecycle' -Params (Get-BaseParams -Fx $fx -Extra @{ SkipIntegrityCheck = $true; DryRun = $true; RequireSignature = $true }) -StatePath $fx.State
+        $r.ExitCode | Should Be 2
+        $r.LogText | Should Match 'no valid Authenticode signature'
+        @(Get-ChildItem -LiteralPath (Join-Path $script:StateDir 'Staging') -Filter 'unverified_*' -ErrorAction SilentlyContinue).Count | Should Be $tempBefore
+
+        Grant-TestAce -Path (Join-Path $fx.Source 'scripts') -Sid 'S-1-5-32-545' -Rights 'Modify'
+        $r = Invoke-SetupScript -Script 'Install-IDLifecycle' -Params $p -StatePath $fx.State
+        $r.ExitCode | Should Be 2
+        $r.LogText | Should Match 'is not trusted'
         @(Get-FakeOps -Path $fx.State) -contains 'daemon:version' | Should Be $false
         Remove-SetupFixture -Fixture $fx
     }
@@ -1107,6 +1230,36 @@ Describe 'Install-IDLifecycle.ps1 sources: build from GitHub, release zip (downl
         $r = Invoke-SetupScript -Script 'Install-IDLifecycle' -Params (Get-SourceParams -Fx $fx -Extra @{ SourceDir = $zip; DryRun = $true }) -StatePath $fx.State
         $r.ExitCode | Should Be 2
         $r.LogText | Should Match 'is not trusted'
+        Remove-SetupFixture -Fixture $fx
+    }
+
+    It 'SkipIntegrityCheck: a zip without SHA256SUMS (one top folder, like GitHub "Download ZIP") is handed over with the flag; -FromGitHub drops it' {
+        $fx = New-SetupFixture
+        Remove-Item -LiteralPath (Join-Path $fx.Source 'SHA256SUMS') -Force
+        $zipDir = Join-Path $fx.Root 'zips'
+        $null = New-Item -ItemType Directory -Path $zipDir
+        $wrap = Join-Path $fx.Root 'wrap\IDLifecycle-main'
+        $null = New-Item -ItemType Directory -Force -Path $wrap
+        Copy-Item -Path (Join-Path $fx.Source '*') -Destination $wrap -Recurse
+        $zip = Join-Path $zipDir 'IDLifecycle-main.zip'
+        Compress-Archive -LiteralPath $wrap -DestinationPath $zip
+
+        $r = Invoke-SetupScript -Script 'Install-IDLifecycle' -Params (Get-SourceParams -Fx $fx -Extra @{ SourceDir = $zip; DryRun = $true }) -StatePath $fx.State
+        $r.ExitCode | Should Be 2
+        $r.LogText | Should Match 'not an IDLifecycle release zip \(no SHA256SUMS\).*-SkipIntegrityCheck'
+
+        $r = Invoke-SetupScript -Script 'Install-IDLifecycle' -Params (Get-SourceParams -Fx $fx -Extra @{ SourceDir = $zip; DryRun = $true; SkipIntegrityCheck = $true }) -StatePath $fx.State
+        $r.ExitCode | Should Be 0
+        $h = Get-HandOff -StatePath $fx.State
+        (Split-Path -Leaf $h.Source) | Should Be 'IDLifecycle-main'
+        $h.Args -contains '-SkipIntegrityCheck' | Should Be $true
+        Remove-SetupFixture -Fixture $fx
+
+        $fx = New-GitHubFixture
+        $r = Invoke-SetupScript -Script 'Install-IDLifecycle' -Params (Get-SourceParams -Fx $fx -Extra @{ FromGitHub = $true; DryRun = $true; SkipIntegrityCheck = $true }) -StatePath $fx.State -ExtraEnv @{ IDL_GITHUB_TOKEN = $token }
+        $r.ExitCode | Should Be 0
+        (Get-HandOff -StatePath $fx.State).Args -contains '-SkipIntegrityCheck' | Should Be $false
+        $r.LogText | Should Match 'not needed with -FromGitHub'
         Remove-SetupFixture -Fixture $fx
     }
 }

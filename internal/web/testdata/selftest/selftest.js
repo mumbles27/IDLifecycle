@@ -162,10 +162,64 @@ const rand = Math.random().toString(36).slice(2, 8);
 
 // ---------------------------------------------------------------- scenarios
 
+// The brand comes from /branding/brand.json: the default in the real E2E, a custom one from the mock API.
+async function scenarioBranding() {
+  const brand = await (await fetch('/branding/brand.json', { cache: 'no-cache' })).json();
+  const name = brand.product_name;
+  if (!name) {
+    throw new Error('brand.json has no product_name');
+  }
+  if (window.__IDL_MOCK && (name !== 'Acme Identity (mock)' || !brand.custom)) {
+    throw new Error(`the mock serves a custom brand, got ${JSON.stringify(brand)}`);
+  }
+  if (!window.__IDL_MOCK && (name !== 'IDLifecycle' || brand.custom)) {
+    throw new Error(`the real server serves the default brand, got ${JSON.stringify(brand)}`);
+  }
+  const title = await waitFor(() => $('[data-test="login-title"]'), 'the login heading');
+  if (text(title) !== name) {
+    throw new Error(`login heading "${text(title)}", want "${name}"`);
+  }
+  const logo = $('.login-card [data-test="brand-logo"]');
+  if (!logo || !logo.getAttribute('src').endsWith('/branding/logo')) {
+    throw new Error('login logo missing');
+  }
+  if (!window.__IDL_MOCK) {
+    await waitFor(() => logo.complete && logo.naturalWidth > 0, 'the logo image to load');
+    const r = await fetch('/branding/logo');
+    if (r.headers.get('Content-Type') !== 'image/svg+xml' || !(r.headers.get('Content-Security-Policy') || '').includes('sandbox')) {
+      throw new Error(`logo headers: ${r.headers.get('Content-Type')} / ${r.headers.get('Content-Security-Policy')}`);
+    }
+    const ico = await fetch('/branding/favicon.ico');
+    if (!ico.ok || ico.headers.get('Content-Type') !== 'image/x-icon') {
+      throw new Error('favicon not served');
+    }
+  }
+  const icon = $('link[rel="icon"]');
+  if (icon && !icon.getAttribute('href').startsWith('/branding/favicon.ico')) {
+    throw new Error('favicon link');
+  }
+  if (!document.title.includes(name)) {
+    throw new Error(`document.title "${document.title}" lacks "${name}"`);
+  }
+  if (brand.accent) {
+    const accent = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim().toLowerCase();
+    if (accent !== brand.accent.toLowerCase()) {
+      throw new Error(`accent ${accent}, want ${brand.accent}`);
+    }
+  }
+}
+
 async function scenarioLogin() {
   await uiLogin(USER, PASS);
   if ($$('.sidebar a[data-route]').length < 8) {
     throw new Error('navigation looks incomplete for an admin');
+  }
+  const brandName = text($('[data-test="brand"] .brand-name'));
+  if (!brandName || !document.title.endsWith(brandName)) {
+    throw new Error(`top bar product name "${brandName}" / title "${document.title}"`);
+  }
+  if (!$('[data-test="brand"] [data-test="brand-logo"]')) {
+    throw new Error('top bar logo missing');
   }
 }
 
@@ -573,6 +627,7 @@ async function scenarioViewer() {
 // ---------------------------------------------------------------- runner
 
 const STEPS = [
+  ['branding (logo, product name, favicon)', scenarioBranding],
   ['login', scenarioLogin],
   ['dashboard renders status', scenarioDashboard],
   ['create mapping via modal', scenarioMapping],

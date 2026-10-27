@@ -23,7 +23,10 @@ Dependency-free SPA (hand-written ES modules, no build step) in `internal/web/st
 | `#/approvals?status=&type=&q=` | viewer | filter, expand (summary + payload), approve/reject/retry and bulk (approver) |
 | `#/runs`, `#/runs/<id>` | viewer | history, counters, errors (auto-refresh while running) |
 | `#/identities`, `#/identities/<id>` | viewer | search, attributes, AD link, recent changes |
-| `#/audit` | viewer | filters, "Verify integrity" |
+| `#/manual` (Add person) | viewer (create/edit/end: approver; delete: admin) | manual-entry sources: form from the source's fields, preview (names, OU, conflicts), people list |
+| `#/audit` (History) | viewer | search with query syntax and filters, CSV export, "Verify integrity" |
+| `#/placement` (OU placement) | viewer (edit: admin) | department -> OU rules, OU picker from AD, CSV import/export, values in use |
+| `#/matching` (Matching) | viewer (edit: admin) | correlation rules and settings, report of uncorrelated accounts (link to person, ignore) |
 | `#/mappings` | viewer (edit: admin) | editor with mode explanations and live template preview |
 | `#/roles` | viewer (edit: admin) | rule editor, "Test a record" (admin) |
 | `#/sources` | viewer (edit: admin) | form generated from `/api/source-types`, test connection |
@@ -35,7 +38,8 @@ Mutating controls carry `data-mutating`; they are not rendered for roles that ca
 
 ## Source layout
 
-`app.js` (shell, router, status banner) · `api.js` (fetch + CSRF + 401 handling) · `ui.js` (`h()` DOM helper,
+`app.js` (shell, router, status banner) · `brand.js` (product name, logo and accent from `/branding/brand.json`) ·
+`branding/` (default `logo.svg`, `favicon.ico`) · `api.js` (fetch + CSRF + 401 handling) · `ui.js` (`h()` DOM helper,
 modals, toasts, tables, form helpers) · `components.js` (mapping fields, sample-record picker, template preview)
 · `views/*.js` (one per route).
 

@@ -188,10 +188,22 @@ function Get-IDLGuiInstallProblems {
     $s = $Settings
 
     # Source: this release folder, GitHub (built here with Go) or a release zip/folder
+    # Without the SHA-256 check (least safe) a folder only needs idlifecycled.exe and scripts\.
     $isReleaseFolder = {
         param([string]$Dir)
-        (Test-Path -LiteralPath (Join-Path -Path $Dir -ChildPath 'SHA256SUMS') -PathType Leaf) -and
-        (Test-Path -LiteralPath (Join-Path -Path $Dir -ChildPath 'idlifecycled.exe') -PathType Leaf)
+        (Test-Path -LiteralPath (Join-Path -Path $Dir -ChildPath 'idlifecycled.exe') -PathType Leaf) -and
+        (
+            ([bool]$s['SkipIntegrityCheck'] -and (Test-Path -LiteralPath (Join-Path -Path $Dir -ChildPath 'scripts') -PathType Container)) -or
+            (Test-Path -LiteralPath (Join-Path -Path $Dir -ChildPath 'SHA256SUMS') -PathType Leaf)
+        )
+    }
+    $notRelease = {
+        param([string]$Dir)
+        if (-not (Test-Path -LiteralPath (Join-Path -Path $Dir -ChildPath 'idlifecycled.exe') -PathType Leaf)){
+            return "'$Dir' has no idlifecycled.exe. Choose a release folder or zip, or GitHub (which builds it)."
+        }
+
+        return "'$Dir' has no SHA256SUMS, so it is not a release folder. Build one with New-IDLifecycleRelease.ps1, or - least safe, for testing - tick 'Skip the SHA-256 file check' under Options."
     }
     switch ([string]$s.SourceKind){
         'Release'{
@@ -199,7 +211,7 @@ function Get-IDLGuiInstallProblems {
                 ([string]::IsNullOrWhiteSpace($s.SourceDir)) -or
                 (-not (& $isReleaseFolder $s.SourceDir))
             ){
-                $problems.Add((New-IDLGuiProblem -Page 'Source' -Message "'$($s.SourceDir)' is not an IDLifecycle release folder (idlifecycled.exe and SHA256SUMS are missing). Choose GitHub or a release zip instead."))
+                $problems.Add((New-IDLGuiProblem -Page 'Source' -Message (& $notRelease ([string]$s.SourceDir))))
             }
         }
         'GitHub'{
@@ -233,7 +245,7 @@ function Get-IDLGuiInstallProblems {
                 (-not (Test-Path -LiteralPath $path -PathType Container)) -or
                 (-not (& $isReleaseFolder $path))
             ){
-                $problems.Add((New-IDLGuiProblem -Page 'Source' -Message "'$path' is not an IDLifecycle release folder (idlifecycled.exe and SHA256SUMS are missing)."))
+                $problems.Add((New-IDLGuiProblem -Page 'Source' -Message ((Test-Path -LiteralPath $path -PathType Container) ? (& $notRelease $path) : ("Folder not found: $path"))))
             }
         }
         default{
@@ -510,7 +522,7 @@ function New-IDLGuiInstallCommand {
         $display.Add('-Start:$false')
     }
 
-    foreach ($pair in @(@('InstallPrerequisites', $s.InstallPrerequisites), @('RequireSignature', $s.RequireSignature), @('Force', $s.Force))){
+    foreach ($pair in @(@('InstallPrerequisites', $s.InstallPrerequisites), @('RequireSignature', $s.RequireSignature), @('SkipIntegrityCheck', [bool]$s['SkipIntegrityCheck']), @('NoTray', [bool]$s['NoTray']), @('Force', $s.Force))){
         if ($pair[1]){
             & $addSwitch $pair[0]
         }
@@ -583,6 +595,12 @@ function Get-IDLGuiInstallSummary {
     if ($s.RequireSignature){
         $options += 'require a signed idlifecycled.exe'
     }
+
+    if ([bool]$s['SkipIntegrityCheck']){
+        $options += 'SKIP the SHA-256 file check (least safe)'
+    }
+
+    $options += (([bool]$s['NoTray']) ? ('no tray icon') : ('tray icon for everyone who signs in'))
 
     if ($s.Force){
         $options += 'replace changed program files (upgrade)'
@@ -1304,12 +1322,16 @@ $script:Xaml = @'
           <StackPanel>
             <TextBlock Style="{StaticResource H1}" Text="Options"/>
             <CheckBox x:Name="StartCheck" Content="Start the service when the installation is done" IsChecked="True"/>
+            <CheckBox x:Name="TrayCheck" Content="Add the tray icon for everyone who signs in to this server" IsChecked="True"/>
+            <TextBlock Style="{StaticResource Hint}" Margin="20,2,0,0" Text="Shows the service state and opens the admin console; restarting the service and changing the web console settings from it ask for administrator rights."/>
             <CheckBox x:Name="PrereqCheck" Content="Install the Active Directory PowerShell module (RSAT) if it is missing"/>
             <TextBlock Style="{StaticResource Hint}" Margin="20,2,0,0" Text="Runs Install-WindowsFeature RSAT-AD-PowerShell. Without it, a missing module stops the installation with a message."/>
             <CheckBox x:Name="ForceCheck" Content="Upgrade: replace program files that changed"/>
             <TextBlock Style="{StaticResource Hint}" Margin="20,2,0,0" Text="Needed to upgrade an existing installation. It also lets the installer correct the folder paths in an existing config.json and replace a stored connection string. It never bypasses the release checks."/>
             <CheckBox x:Name="SignatureCheck" Content="Require a digitally signed idlifecycled.exe"/>
             <TextBlock Style="{StaticResource Hint}" Margin="20,2,0,0" Text="Only if your organisation signs its builds."/>
+            <CheckBox x:Name="SkipHashCheck" Content="Skip the SHA-256 file check (least safe - for testing only)"/>
+            <TextBlock Style="{StaticResource Hint}" Margin="20,2,0,0" Foreground="#B42318" TextWrapping="Wrap" Text="Installs whatever the folder or zip holds without SHA256SUMS: nothing proves the files are the ones that were built, so a changed or added script would be installed and run by the service. Use it to try out a folder you put together yourself (an idlifecycled.exe next to the scripts folder). The folder permission check, the required files and the signature option still apply. For production, use a release built with New-IDLifecycleRelease.ps1."/>
             <CheckBox x:Name="RestoreCheck" Content="Restore from a backup (recovery, moving servers or databases)" Margin="0,18,0,0"/>
             <Border x:Name="RestorePanel" Style="{StaticResource Card}" Margin="20,8,0,0">
               <StackPanel>
@@ -1661,6 +1683,8 @@ function Get-IDLGuiInstallSettings {
         Start                = [bool]$ui.StartCheck.IsChecked
         InstallPrerequisites = [bool]$ui.PrereqCheck.IsChecked
         RequireSignature     = [bool]$ui.SignatureCheck.IsChecked
+        SkipIntegrityCheck   = [bool]$ui.SkipHashCheck.IsChecked
+        NoTray               = (-not [bool]$ui.TrayCheck.IsChecked)
         Force                = [bool]$ui.ForceCheck.IsChecked
         RestoreFrom          = ((($ui.RestoreCheck.IsChecked)) ? ($ui.RestoreFileBox.Text.Trim()) : (''))
         RestorePassphrase    = ((($ui.RestoreCheck.IsChecked) -and ($ui.RestorePassBox.SecurePassword.Length -gt 0)) ? ($ui.RestorePassBox.SecurePassword) : ($null))
@@ -1802,12 +1826,18 @@ function Initialize-IDLGuiInstallDefaults {
     # Fills the install pages: defaults, or what the existing service uses (upgrade / repair).
     $ui = $script:Ui
     $d = $script:Detected
-    $isRelease = (
-        (Test-Path -LiteralPath (Join-Path -Path $script:ReleaseRoot -ChildPath 'SHA256SUMS') -PathType Leaf) -and
-        (-not $script:RunningFromInstall)
+    $hasManifest = (Test-Path -LiteralPath (Join-Path -Path $script:ReleaseRoot -ChildPath 'SHA256SUMS') -PathType Leaf)
+    $hasExe = (Test-Path -LiteralPath (Join-Path -Path $script:ReleaseRoot -ChildPath 'idlifecycled.exe') -PathType Leaf)
+    $isRelease = ($hasManifest -and (-not $script:RunningFromInstall))
+    # A folder with an exe but no SHA256SUMS can only be installed with 'Skip the SHA-256 file check' (least safe).
+    $usable = (($hasManifest -or $hasExe) -and (-not $script:RunningFromInstall))
+    $ui.SrcReleaseText.Text = $(
+        if ($script:RunningFromInstall){ '(not available: this is the installed copy)' }
+        elseif ($isRelease){ $script:ReleaseRoot }
+        elseif ($hasExe){ "$($script:ReleaseRoot) - no SHA256SUMS: only with 'Skip the SHA-256 file check' under Options (least safe)" }
+        else{ '(not available: this folder is not a release - it has no SHA256SUMS and no idlifecycled.exe)' }
     )
-    $ui.SrcReleaseText.Text = (($isRelease) ? ($script:ReleaseRoot) : ((($script:RunningFromInstall) ? ('(not available: this is the installed copy)') : ('(not available: this folder is not a release - it has no SHA256SUMS)'))))
-    $ui.SrcReleaseRadio.IsEnabled = $isRelease
+    $ui.SrcReleaseRadio.IsEnabled = $usable
     $ui.SrcReleaseRadio.IsChecked = $isRelease
     $ui.SrcGitHubRadio.IsChecked = (-not $isRelease)
     $ui.GitHubRepoBox.Text = $script:DefaultGitHubRepo
@@ -2277,6 +2307,10 @@ function Complete-IDLGuiRun {
     Show-IDLGuiPage
 }
 
+function Get-IDLGuiUnverifiedWarning {
+    return "Install WITHOUT the SHA-256 file check?`n`nThis is the least safe way to install: nothing proves the program and scripts are the ones that were built or reviewed, and the service will run them with its rights in Active Directory.`n`nUse it only for testing. For production, install from a release built with New-IDLifecycleRelease.ps1 (or from GitHub, which checks its own build)."
+}
+
 function Invoke-IDLGuiStartRun {
     # Validates and starts a test run (-DryRun) or a real run of the current flow.
     [CmdletBinding()]
@@ -2306,6 +2340,17 @@ function Invoke-IDLGuiStartRun {
     ){
         $what = (($settings.RemoveData) ? ("`n`nThe data folder will be PERMANENTLY deleted$((($settings.BackupMode -eq 'Backup') ? (' (after the backup)') : (' - without a backup'))).") : (''))
         $answer = Show-IDLGuiMessage -Text "Remove IDLifecycle (service '$($settings.ServiceName)') from this server?$what" -Icon 'Warning' -Buttons 'YesNo'
+        if ($answer -ne [System.Windows.MessageBoxResult]::Yes){
+            return
+        }
+    }
+
+    if (
+        (-not $DryRun) -and
+        ($script:Flow -eq 'Install') -and
+        ([bool]$settings['SkipIntegrityCheck'])
+    ){
+        $answer = Show-IDLGuiMessage -Text (Get-IDLGuiUnverifiedWarning) -Icon 'Warning' -Buttons 'YesNo'
         if ($answer -ne [System.Windows.MessageBoxResult]::Yes){
             return
         }
@@ -2512,6 +2557,28 @@ function Register-IDLGuiHandlers {
         })
 }
 
+function Set-IDLGuiBranding {
+    # Window icon and title from the brand (scripts\branding, or a trusted %ProgramData%\IDLifecycle-Branding).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Window
+    )
+
+    try{
+        $brand = Get-IDLBranding -DefaultDir (Join-Path -Path $PSScriptRoot -ChildPath 'branding')
+        if ($brand.ProductName -ne 'IDLifecycle'){
+            $Window.Title = ([string]$Window.Title).Replace('IDLifecycle', $brand.ProductName)
+        }
+
+        if ($brand.IconPath){
+            $Window.Icon = [System.Windows.Media.Imaging.BitmapFrame]::Create([uri]::new($brand.IconPath))
+        }
+    }
+    catch{
+        Write-Verbose "Branding not applied: $($_.Exception.Message)"
+    }
+}
+
 function Initialize-IDLGuiWindow {
     # Builds the window, fills it from what is installed, wires the handlers and shows the first page.
     [CmdletBinding()]
@@ -2525,6 +2592,8 @@ function Initialize-IDLGuiWindow {
     foreach ($name in (Get-IDLGuiControlNames -Xaml $script:Xaml)){
         $script:Ui[$name] = $script:Window.FindName($name)
     }
+
+    Set-IDLGuiBranding -Window $script:Window
 
     $script:Flows = @{
         Install   = @(

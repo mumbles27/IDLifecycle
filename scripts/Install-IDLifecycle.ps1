@@ -12,6 +12,9 @@
          does not list. SHA256SUMS lives in the same folder, so it gives INTEGRITY (nothing was swapped or added after
          the release was built), not authenticity - the ACL check is the real guard. A signed exe's signer is reported;
          -RequireSignature refuses an unsigned/invalid one.
+         -SkipIntegrityCheck (LEAST SAFE; for testing) skips everything about SHA256SUMS: the files are whatever the folder
+         holds (idlifecycled.exe, Setup.cmd, scripts*), their hashes are taken now and written as the installed manifest.
+         The folder/parent ACL check, the required files and -RequireSignature still apply.
       b. Preflight: elevated (not for -DryRun), Windows + PowerShell 7, the ActiveDirectory module (RSAT-AD-PowerShell;
          installed only with -InstallPrerequisites), Test-ADServiceAccount for an MSA/gMSA, the password of a user
          service account (checked against AD / the local SAM), the IBM ODBC driver for db2.
@@ -150,6 +153,24 @@
 .PARAMETER RequireSignature
     Refuse an idlifecycled.exe without a valid Authenticode signature.
 
+.PARAMETER SkipIntegrityCheck
+    LEAST SAFE - for testing, or a folder you put together yourself (a self-built idlifecycled.exe next to the scripts\n    folder of a checkout) without New-IDLifecycleRelease.ps1. SHA256SUMS is not needed and not read: nothing proves the
+    files are the ones that were built or reviewed, so a changed or added script would be installed and later run by the
+    service. The installer takes idlifecycled.exe, Setup.cmd (if present) and every file below scripts (Logs excluded),
+    hashes them now and writes those hashes as the installed SHA256SUMS (so upgrade and uninstall work as usual). Still
+    enforced: the folder and its parents may only be changed by SYSTEM, Administrators, TrustedInstaller and you,
+    idlifecycled.exe and every required script must be there, and -RequireSignature. A .zip without SHA256SUMS is accepted
+    too (a single top folder in it, as in a GitHub "Download ZIP", is used as the release). Every run with it logs a
+    warning and reports IntegrityCheck = Skipped. Use a release built by New-IDLifecycleRelease.ps1 for production.
+
+.PARAMETER NoTray
+    Do not add the tray icon (Start-IDLifecycleTray.ps1) to the common Startup folder and the Start menu; existing tray
+    shortcuts are removed. Without it, everyone who signs in to this server gets the tray icon (Open admin console,
+    service status, start / stop / restart and basic web console settings - each change asks for administrator
+    rights). Always: <InstallDir>\tray.json (what the tray shows; readable by Users, no secrets), the Start menu entry
+    "IDLifecycle Setup" and the branding folder %ProgramData%\IDLifecycle-Branding (SYSTEM/Administrators full,
+    Users read; files in it replace the logo, icons and product name - see its README.txt).
+
 .PARAMETER InstallPrerequisites
     Run Install-WindowsFeature RSAT-AD-PowerShell when the ActiveDirectory module is missing.
 
@@ -240,6 +261,10 @@ param(
 
     [switch]$RequireSignature,
 
+    [switch]$SkipIntegrityCheck,
+
+    [switch]$NoTray,
+
     [switch]$InstallPrerequisites,
 
     [switch]$NonInteractive,
@@ -268,6 +293,7 @@ $script:StoppedForUpdate = $false
 $script:ConfigChanged = $false
 $script:SetupLogRoot = Join-Path -Path $env:ProgramData -ChildPath 'IDLifecycle-Setup\Logs'
 $script:SetupLogLock = $true
+$script:UnverifiedTempDir = $null # -SkipIntegrityCheck: the generated manifest's folder, removed at the end
 $script:SetupLogOverride = $false
 # Checks of `idlifecycled check -json` that must have run and passed (ad_module is verified by the preflight and
 # skipped with -skip-ad-module).
@@ -379,6 +405,111 @@ function Start-IDLSetupService {
     )
 
     Start-Service -Name $Name
+}
+
+function Get-IDLSetupShortcutRoots {
+    # Where the tray / setup shortcuts go: the common Startup folder and an "IDLifecycle" folder in the common Start menu.
+    return @{
+        Startup  = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::CommonStartup)
+        Programs = Join-Path -Path ([System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::CommonPrograms)) -ChildPath 'IDLifecycle'
+    }
+}
+
+function Get-IDLSetupShortcut {
+    # The shortcut at Path as @{ Target; Arguments; Icon; WorkingDirectory }, or $null when there is none.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)){
+        return $null
+    }
+
+    $shell = New-Object -ComObject WScript.Shell
+    try{
+        $lnk = $shell.CreateShortcut($Path)
+        return @{ Target = [string]$lnk.TargetPath; Arguments = [string]$lnk.Arguments; Icon = [string]$lnk.IconLocation; WorkingDirectory = [string]$lnk.WorkingDirectory }
+    }
+    finally{
+        $null = [System.Runtime.InteropServices.Marshal]::ReleaseComObject($shell)
+    }
+}
+
+function New-IDLSetupShortcut {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Target,
+        [AllowEmptyString()][string]$Arguments = '',
+        [AllowEmptyString()][string]$WorkingDirectory = '',
+        [AllowEmptyString()][string]$Icon = '',
+        [AllowEmptyString()][string]$Description = ''
+    )
+
+    $dir = Split-Path -Parent $Path
+    if (-not (Test-Path -LiteralPath $dir -PathType Container)){
+        $null = New-Item -ItemType Directory -Path $dir -Force
+    }
+
+    $shell = New-Object -ComObject WScript.Shell
+    try{
+        $lnk = $shell.CreateShortcut($Path)
+        $lnk.TargetPath = $Target
+        $lnk.Arguments = $Arguments
+        $lnk.WorkingDirectory = $WorkingDirectory
+        $lnk.Description = $Description
+        $lnk.WindowStyle = 7 # minimised: the tray hides its console at once
+        if ($Icon){
+            $lnk.IconLocation = $Icon
+        }
+
+        $lnk.Save()
+    }
+    finally{
+        $null = [System.Runtime.InteropServices.Marshal]::ReleaseComObject($shell)
+    }
+}
+
+function Remove-IDLSetupShortcut {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    Remove-Item -LiteralPath $Path -Force
+}
+
+function Get-IDLSetupBrandingRoot {
+    return (Get-IDLBrandingRoot)
+}
+
+function Get-IDLSetupBrandingProblem {
+    # Why the existing branding folder would be ignored (it can be changed by others), or $null.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    return (Get-IDLBrandingUntrustedReason -Path $Path -OwnerSidResolver { param($p) Get-IDLPathOwnerSid -Path $p })
+}
+
+function Initialize-IDLSetupBrandingDir {
+    # Creates the branding override folder with its protected ACL (SYSTEM/Administrators full, Users read) and a README.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)){
+        $null = New-Item -ItemType Directory -Path $Path -Force
+    }
+
+    [System.IO.FileSystemAclExtensions]::SetAccessControl([System.IO.DirectoryInfo]::new($Path), (New-IDLBrandingDirSecurity))
+    $readme = Join-Path -Path $Path -ChildPath 'README.txt'
+    if (-not (Test-Path -LiteralPath $readme)){
+        [System.IO.File]::WriteAllText($readme, (Get-IDLBrandingReadme), [System.Text.UTF8Encoding]::new($false))
+    }
 }
 
 function Get-IDLSetupDaemonCommand {
@@ -1160,6 +1291,10 @@ function Get-IDLTrustedRelease {
         throw (New-IDLException -Kind Input -Message "SourceDir '$Root' is not trusted: $reason. $hint")
     }
 
+    if ($SkipIntegrityCheck){
+        return (Get-IDLUnverifiedRelease -Root $Root)
+    }
+
     $manifestPath = Join-Path -Path $Root -ChildPath $script:ManifestName
     if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)){
         throw (New-IDLException -Kind Input -Message "SourceDir '$Root' has no $($script:ManifestName) manifest. $hint")
@@ -1218,7 +1353,77 @@ function Get-IDLTrustedRelease {
         throw (New-IDLException -Kind Input -Message "idlifecycled.exe has no valid Authenticode signature (status: $($signature.Status)) and -RequireSignature was given.")
     }
 
-    return @{ Exe = $exe; Files = $files.ToArray(); Manifest = $manifestPath; Signature = $signature }
+    return @{ Exe = $exe; Files = $files.ToArray(); Manifest = $manifestPath; Signature = $signature; Unverified = $false; TempDir = $null }
+}
+
+function Get-IDLUnverifiedRelease {
+    <#
+      -SkipIntegrityCheck (LEAST SAFE): the release is whatever Root holds - idlifecycled.exe, Setup.cmd (if present) and
+      every file below scripts\ except Logs\. SHA256SUMS is not read. The hashes are taken now and written to a new
+      manifest in a protected staging folder, which is installed as InstallDir\SHA256SUMS (upgrade, uninstall and the
+      change detection use it as usual). Root's ACL was already checked by the caller. Returns the same shape as
+      Get-IDLTrustedRelease plus Unverified and TempDir (removed at the end of the run).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Root
+    )
+
+    $exe = Join-Path -Path $Root -ChildPath 'idlifecycled.exe'
+    if (-not (Test-Path -LiteralPath $exe -PathType Leaf)){
+        throw (New-IDLException -Kind Input -Message "SourceDir '$Root' has no idlifecycled.exe. In a source checkout build it first (go build -trimpath -o idlifecycled.exe .\cmd\idlifecycled), or install with -FromGitHub, which builds it for you.")
+    }
+
+    $scriptsRoot = Join-Path -Path $Root -ChildPath 'scripts'
+    if (-not (Test-Path -LiteralPath $scriptsRoot -PathType Container)){
+        throw (New-IDLException -Kind Input -Message "SourceDir '$Root' has no scripts folder.")
+    }
+
+    $relative = [System.Collections.Generic.List[string]]::new()
+    $relative.Add('idlifecycled.exe')
+    if (Test-Path -LiteralPath (Join-Path -Path $Root -ChildPath 'Setup.cmd') -PathType Leaf){
+        $relative.Add('Setup.cmd')
+    }
+
+    foreach ($item in @(Get-ChildItem -LiteralPath $scriptsRoot -Recurse -File -Force)){
+        $rel = 'scripts\' + $item.FullName.Substring($scriptsRoot.Length).TrimStart('\')
+        if (('\' + $rel + '\') -notmatch '\\Logs\\'){
+            $relative.Add($rel)
+        }
+    }
+
+    $listed = [System.Collections.Generic.HashSet[string]]::new([string[]]$relative.ToArray(), [System.StringComparer]::OrdinalIgnoreCase)
+    $missing = @($script:RequiredScripts | ForEach-Object { "scripts\$_" } | Where-Object { -not $listed.Contains($_) })
+    if ($missing.Count -gt 0){
+        throw (New-IDLException -Kind Input -Message "SourceDir '$Root' is missing: $($missing -join ', ').")
+    }
+
+    $files = [System.Collections.Generic.List[object]]::new()
+    foreach ($rel in ($relative | Sort-Object)){
+        $source = Join-Path -Path $Root -ChildPath $rel
+        $files.Add(@{ Relative = $rel; Source = $source; Hash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash })
+    }
+
+    $signature = Get-IDLExeSignature -Path $exe
+    if (
+        ($RequireSignature) -and
+        ($signature.Status -ne 'Valid')
+    ){
+        throw (New-IDLException -Kind Input -Message "idlifecycled.exe has no valid Authenticode signature (status: $($signature.Status)) and -RequireSignature was given.")
+    }
+
+    $stagingRoot = Get-IDLSetupStagingRoot
+    Initialize-IDLProtectedDir -Path $stagingRoot -Lock:$script:SetupLogLock
+    $tempDir = Join-Path -Path $stagingRoot -ChildPath ('unverified_{0}_{1}' -f (Get-Date -Format 'yyyyMMdd_HHmmss'), [guid]::NewGuid().ToString('N').Substring(0, 8))
+    $null = New-Item -Path $tempDir -ItemType Directory
+    $script:UnverifiedTempDir = $tempDir # removed at the end of the run, whatever happens
+    $manifestPath = Join-Path -Path $tempDir -ChildPath $script:ManifestName
+    $lines = foreach ($f in $files){
+        '{0}  {1}' -f $f.Hash.ToLowerInvariant(), $f.Relative.Replace('\', '/')
+    }
+    [System.IO.File]::WriteAllText($manifestPath, (($lines -join "`n") + "`n"))
+
+    return @{ Exe = $exe; Files = $files.ToArray(); Manifest = $manifestPath; Signature = $signature; Unverified = $true; TempDir = $tempDir }
 }
 
 function Get-IDLChangedProgramFiles {
@@ -1377,7 +1582,7 @@ function Get-IDLHandOffArguments {
     $arguments.Add('-SourceDir')
     $arguments.Add($Release)
     $names = @('InstallDir', 'DataDir', 'ServiceAccount', 'ServiceName', 'DbDriver', 'DbDsnEnvVar', 'Listen', 'TlsCertFile', 'TlsKeyFile',
-        'AdminUser', 'RestoreFrom', 'RestoreConfig', 'Start', 'RequireSignature', 'InstallPrerequisites', 'NonInteractive', 'Force', 'DryRun')
+        'AdminUser', 'RestoreFrom', 'RestoreConfig', 'Start', 'RequireSignature', 'SkipIntegrityCheck', 'NoTray', 'InstallPrerequisites', 'NonInteractive', 'Force', 'DryRun')
     foreach ($name in $names){
         if (-not $Bound.ContainsKey($name)){
             continue
@@ -1484,8 +1689,19 @@ function Invoke-IDLSetupFromStaging {
 
             $hash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash
             $release = Expand-IDLZipSafe -ZipPath $zipPath -Destination (Join-Path -Path $stage -ChildPath 'release')
-            if (-not (Test-Path -LiteralPath (Join-Path -Path $release -ChildPath $script:ManifestName) -PathType Leaf)){
-                throw (New-IDLException -Kind Input -Message "'$zipPath' is not an IDLifecycle release zip (no $($script:ManifestName)). Build one with New-IDLifecycleRelease.ps1 -Zip.")
+            if ($SkipIntegrityCheck){
+                # A zip of a folder (GitHub "Download ZIP", Compress-Archive of a folder) has one top folder: use it.
+                $top = @(Get-ChildItem -LiteralPath $release -Force)
+                if (
+                    ($top.Count -eq 1) -and
+                    ($top[0].PSIsContainer) -and
+                    (Test-Path -LiteralPath (Join-Path -Path $top[0].FullName -ChildPath 'scripts') -PathType Container)
+                ){
+                    $release = $top[0].FullName
+                }
+            }
+            elseif (-not (Test-Path -LiteralPath (Join-Path -Path $release -ChildPath $script:ManifestName) -PathType Leaf)){
+                throw (New-IDLException -Kind Input -Message "'$zipPath' is not an IDLifecycle release zip (no $($script:ManifestName)). Build one with New-IDLifecycleRelease.ps1 -Zip, or - least safe, for testing - add -SkipIntegrityCheck.")
             }
 
             Write-IDLLog "Extracted $zipPath (SHA256 $hash)"
@@ -1501,6 +1717,14 @@ function Invoke-IDLSetupFromStaging {
 
         $phase = Start-IDLPhase -Name 'Hand over'
         $arguments = Get-IDLHandOffArguments -Bound $Bound -Release $release
+        if (
+            ($FromGitHub) -and
+            ($SkipIntegrityCheck)
+        ){
+            # The release was just built here with its own SHA256SUMS: check it as usual.
+            $arguments = [string[]]@($arguments | Where-Object { $_ -ne '-SkipIntegrityCheck' })
+            Write-IDLLog '-SkipIntegrityCheck is not needed with -FromGitHub (the release built here has its own SHA256SUMS); it is checked as usual.'
+        }
         Write-IDLLog "Handing over to $installer (the release's own installer checks the release again and writes its own log in $($script:SetupLogRoot))"
         $code = Invoke-IDLSetupHandOff -ScriptPath $installer -Arguments $arguments -Environment $Secrets
         $keep = ($code -ne 0)
@@ -1654,6 +1878,7 @@ try{
         ServiceAccountPassword = (($null -ne $ServiceAccountPassword) ? ('(set)') : ('(not set)'))
         Start               = [bool]$Start
         RequireSignature     = [bool]$RequireSignature
+        NoTray               = [bool]$NoTray
         InstallPrerequisites = [bool]$InstallPrerequisites
         NonInteractive       = [bool]$NonInteractive
         Force                = [bool]$Force
@@ -1993,7 +2218,14 @@ try{
     $phase = Start-IDLPhase -Name 'Release trust'
     $release = Get-IDLTrustedRelease -Root $SourceDir
     $sourceExe = $release.Exe
-    Write-IDLLog "Release '$SourceDir': folder and parents restricted; $($release.Files.Count) file(s) match $($script:ManifestName)"
+    if ($release.Unverified){
+        Write-IDLLog "UNVERIFIED INSTALL (-SkipIntegrityCheck, least safe): $($script:ManifestName) was not checked, so nothing proves these $($release.Files.Count) file(s) are the ones that were built or reviewed. Use a release built by New-IDLifecycleRelease.ps1 for production." 'WARN'
+        Write-IDLLog "Release '$SourceDir': folder and parents restricted; file list and hashes taken from the folder itself"
+        Add-IDLReportRow -Action 'IntegrityCheck' -Result 'Skipped' -Identity $SourceDir -Details "-SkipIntegrityCheck: $($release.Files.Count) file(s) installed without a manifest check (least safe)"
+    }
+    else{
+        Write-IDLLog "Release '$SourceDir': folder and parents restricted; $($release.Files.Count) file(s) match $($script:ManifestName)"
+    }
     if ($release.Signature.Status -eq 'Valid'){
         Write-IDLLog "idlifecycled.exe is Authenticode-signed by: $($release.Signature.Signer)"
     }
@@ -2388,6 +2620,8 @@ try{
     # Effective settings: from config.json when it exists (always in a live run by now), else what init would write.
     $cfgListen = (($Listen) ? ($Listen) : ('127.0.0.1:8443'))
     $cfgTls = [bool]$TlsCertFile
+    $cfgLogLevel = 'info'
+    $cfgPolicy = 'RemoteSigned'
     $cfgDsn = (($dsnMode -eq 'env') ? ("env:$DbDsnEnvVar") : (''))
     if (Test-Path -LiteralPath $configPath -PathType Leaf){
         $cfg = Get-Content -LiteralPath $configPath -Raw -Encoding utf8 | ConvertFrom-Json -AsHashtable
@@ -2398,6 +2632,15 @@ try{
 
         $cfgTls = -not [string]::IsNullOrWhiteSpace([string](Get-IDLField -Object (Get-IDLField -Object $cfg -Name 'tls') -Name 'cert_file'))
         $cfgDsn = [string](Get-IDLField -Object (Get-IDLField -Object $cfg -Name 'database') -Name 'dsn')
+        $level = [string](Get-IDLField -Object $cfg -Name 'log_level' -Default '')
+        if ($level){
+            $cfgLogLevel = $level
+        }
+
+        $policy = [string](Get-IDLField -Object (Get-IDLField -Object $cfg -Name 'powershell') -Name 'execution_policy')
+        if ($policy){
+            $cfgPolicy = $policy
+        }
     }
 
     if (
@@ -2808,10 +3051,119 @@ try{
 
     Stop-IDLPhase -Phase $phase
 
+    # ---- Phase: tray icon, Start menu, branding folder (none of it is needed for the service to work) ----
+    $phase = Start-IDLPhase -Name 'Tray and shortcuts'
+    $trayInfoPath = Join-Path -Path $InstallDir -ChildPath 'tray.json'
+    $trayInfo = [ordered]@{
+        service_name     = $ServiceName
+        console_url      = $guiUrl
+        listen           = $cfgListen
+        tls              = [bool]$cfgTls
+        log_level        = $cfgLogLevel
+        data_dir         = $DataDir
+        install_dir      = $InstallDir
+        config_path      = $configPath
+        version          = [string]$sourceVersion
+        execution_policy = $cfgPolicy
+    }
+    Invoke-SetupStep -Action 'WriteTrayInfo' -Identity $trayInfoPath -Details "$guiUrl (what the tray shows; no secrets)" `
+        -SatisfiedReason 'up to date' `
+        -IsSatisfied {
+        try{
+            $old = Read-IDLTrayInfo -Path $trayInfoPath
+            $same = $true
+            foreach ($k in $trayInfo.Keys){
+                if ([string]$old[$k] -cne [string]$trayInfo[$k]){
+                    $same = $false
+                }
+            }
+
+            $same
+        }
+        catch{
+            $false
+        }
+    } `
+        -Apply { Write-IDLTrayInfo -Path $trayInfoPath -Info $trayInfo }
+
+    $brandingRoot = Get-IDLSetupBrandingRoot
+    $why = ((Test-Path -LiteralPath $brandingRoot -PathType Container) ? (Get-IDLSetupBrandingProblem -Path $brandingRoot) : ($null))
+    if ($why){
+        Add-SetupSkip -Action 'BrandingFolder' -Identity $brandingRoot -Level 'WARN' `
+            -Reason "it exists but is not protected ($why); its files are ignored. Delete it if you did not create it, then re-run, or restrict it to SYSTEM and Administrators (Users read)"
+    }
+    else{
+        Invoke-SetupStep -Action 'BrandingFolder' -Identity $brandingRoot -Details '(SYSTEM/Administrators full, Users read; README.txt lists the files that replace the default branding)' `
+            -SatisfiedReason 'exists and is protected' `
+            -IsSatisfied { Test-Path -LiteralPath $brandingRoot -PathType Container } `
+            -Apply { Initialize-IDLSetupBrandingDir -Path $brandingRoot }
+    }
+
+    $roots = Get-IDLSetupShortcutRoots
+    # A shortcut for everyone needs a pwsh.exe every user can start: the machine-wide install, not a per-version
+    # Microsoft Store path (which changes with every update).
+    $pwshExe = [System.Environment]::ProcessPath
+    $machinePwsh = Join-Path -Path $env:ProgramFiles -ChildPath 'PowerShell\7\pwsh.exe'
+    if (Test-Path -LiteralPath $machinePwsh -PathType Leaf){
+        $pwshExe = $machinePwsh
+    }
+    elseif ($pwshExe -match '\\WindowsApps\\'){
+        Write-IDLLog "PowerShell 7 runs from the Microsoft Store ($pwshExe); the tray shortcut uses that path, which changes when it updates. Install the MSI version for a stable tray shortcut." 'WARN'
+    }
+
+    $icon = Join-Path -Path $installedScripts -ChildPath 'branding\idlifecycle.ico'
+    $iconLocation = (((Test-Path -LiteralPath $icon -PathType Leaf) -or $DryRun) ? ("$icon,0") : ("$pwshExe,0"))
+    $trayScript = Join-Path -Path $installedScripts -ChildPath 'Start-IDLifecycleTray.ps1'
+    $trayArgs = '-NoProfile -STA -WindowStyle Hidden -ExecutionPolicy {0} -File "{1}"' -f $cfgPolicy, $trayScript
+    $shortcuts = [System.Collections.Generic.List[object]]::new()
+    $setupCmd = Join-Path -Path $InstallDir -ChildPath 'Setup.cmd'
+    if (
+        (Test-Path -LiteralPath $setupCmd -PathType Leaf) -or
+        ($DryRun)
+    ){
+        $shortcuts.Add(@{ Action = 'SetupShortcut'; Path = (Join-Path -Path $roots.Programs -ChildPath 'IDLifecycle Setup.lnk'); Target = $setupCmd; Arguments = ''; Description = 'Install, upgrade or remove IDLifecycle'; Tray = $false })
+    }
+
+    $shortcuts.Add(@{ Action = 'TrayShortcut'; Path = (Join-Path -Path $roots.Programs -ChildPath 'IDLifecycle Tray.lnk'); Target = $pwshExe; Arguments = $trayArgs; Description = 'IDLifecycle tray icon'; Tray = $true })
+    $shortcuts.Add(@{ Action = 'TrayAutostart'; Path = (Join-Path -Path $roots.Startup -ChildPath 'IDLifecycle Tray.lnk'); Target = $pwshExe; Arguments = $trayArgs; Description = 'IDLifecycle tray icon (starts at sign-in)'; Tray = $true })
+    foreach ($s in $shortcuts){
+        if (
+            ($s.Tray) -and
+            ($NoTray)
+        ){
+            $existing = Get-IDLSetupShortcut -Path $s.Path
+            if ($null -eq $existing){
+                Add-SetupSkip -Action $s.Action -Identity $s.Path -Reason 'not wanted (-NoTray)'
+            }
+            else{
+                Invoke-SetupStep -Action ('Remove' + $s.Action) -Identity $s.Path -Details '(-NoTray)' -IsSatisfied { $false } -Apply { Remove-IDLSetupShortcut -Path $s.Path }
+            }
+
+            continue
+        }
+
+        Invoke-SetupStep -Action $s.Action -Identity $s.Path -Details "-> $($s.Target) $($s.Arguments)".TrimEnd() `
+            -SatisfiedReason 'up to date' `
+            -IsSatisfied {
+            $existing = Get-IDLSetupShortcut -Path $s.Path
+            ($null -ne $existing) -and
+            ($existing.Target -ieq $s.Target) -and
+            ($existing.Arguments -ceq $s.Arguments) -and
+            ($existing.Icon -ieq $iconLocation)
+        } `
+            -Apply { New-IDLSetupShortcut -Path $s.Path -Target $s.Target -Arguments $s.Arguments -WorkingDirectory $installedScripts -Icon $iconLocation -Description $s.Description }
+    }
+
+    Assert-NoFailedSteps -Phase 'Tray and shortcuts'
+    Stop-IDLPhase -Phase $phase
+
     Write-IDLLog '---- Next steps ----'
     Write-IDLLog "GUI: $guiUrl $((($started -or $DryRun) ? ('') : ('(after the service is started)')))"
     Write-IDLLog "Sign in as '$AdminUser', then: Settings -> AD (search bases, default OU, UPN suffix) -> Sources (add + Test) -> Mappings -> Roles."
     Write-IDLLog 'Run a sync in DRY-RUN (the default), review the simulated changes, and only then turn dry-run off.'
+    if (-not $NoTray){
+        Write-IDLLog "Tray icon: starts for everyone at their next sign-in; start it now from Start menu -> IDLifecycle -> IDLifecycle Tray."
+    }
     Write-IDLLog "Service account '$ServiceAccount' needs AD delegation on the target OUs and 'Log on as a service' (granted locally; add it to the GPO too if a GPO defines that right)."
     if ($isPasswordAccount){
         Write-IDLLog "'$ServiceAccount' uses a password: when it changes, re-run this installer with -ServiceAccountPassword. Exclude it from password expiry or move to a gMSA."
@@ -2846,6 +3198,14 @@ finally{
         catch{
             Write-IDLLog "Could not restart service '$ServiceName' that this run had stopped: $($_.Exception.Message)" 'ERROR'
         }
+    }
+
+    if ($script:UnverifiedTempDir){
+        if ($exitCode -eq 0){
+            Write-IDLLog 'Reminder: this was an UNVERIFIED install (-SkipIntegrityCheck). Reinstall from a release built by New-IDLifecycleRelease.ps1 before production use.' 'WARN'
+        }
+
+        Remove-Item -LiteralPath $script:UnverifiedTempDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 
     $adminPlain = $null

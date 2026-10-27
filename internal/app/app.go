@@ -136,7 +136,7 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error)
 
 	a := &App{Cfg: cfg, Log: log, Store: st, Engine: eng, Scheduler: sched, cipher: cipher}
 	apiSrv := &api.Server{
-		Store: st, Engine: eng, Cipher: cipher, Config: cfg, Scheduler: sched, Notifier: notifier, Static: web.Handler(), Log: log,
+		Store: st, Engine: eng, Cipher: cipher, Config: cfg, Scheduler: sched, Notifier: notifier, Static: web.Handler(), Branding: web.NewBranding(cfg.BrandingFolder(), log), Log: log,
 		Version: Version, TLS: cfg.TLSEnabled(), BaseCtx: ctx,
 	}
 	a.Server = &http.Server{

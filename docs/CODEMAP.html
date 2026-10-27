@@ -1,0 +1,525 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IDLifecycle Code Map</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Layout: one reading column; each section is a figure with a caption, widest drawings scroll inside their own frame. */
+:root {
+  --bg: #f4f6f7; --surface: #ffffff; --fg: #1a2329; --muted: #5a6872; --line: #c6cfd5; --faint: #e3e8eb;
+  --core: #0d6873;      /* code inside idlifecycled.exe */
+  --ext: #96570f;       /* systems outside the exe: HR, AD, mail, browser */
+  --data: #4b4f9b;      /* where state lives: databases, files */
+  --ok: #2d7a3e; --bad: #b3362b;
+  --display: "IBM Plex Sans Condensed", "Arial Narrow", system-ui, sans-serif;
+  --body: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", Consolas, "Courier New", monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #11171b; --surface: #19222a; --fg: #e2e8ec; --muted: #94a2ad; --line: #34424d; --faint: #222d35;
+  --core: #5ec3cc; --ext: #e2a656; --data: #a4a8f2; --ok: #6cc47f; --bad: #f08a7f; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #11171b; --surface: #19222a; --fg: #e2e8ec; --muted: #94a2ad; --line: #34424d; --faint: #222d35;
+  --core: #5ec3cc; --ext: #e2a656; --data: #a4a8f2; --ok: #6cc47f; --bad: #f08a7f; color-scheme: dark }
+
+body { background: var(--bg); color: var(--fg); font: 15px/1.6 var(--body); }
+.wrap { max-width: 1120px; margin: 0 auto; padding-block: 32px 64px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: grid; gap: 48px; }
+header { display: grid; gap: 10px; max-width: 72ch; }
+.eyebrow { font: 500 12px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--core); }
+h1 { font: 600 clamp(30px, 5vw, 44px)/1.1 var(--display); margin: 0; text-wrap: balance; }
+h2 { font: 600 24px/1.2 var(--display); margin: 0; text-wrap: balance; }
+h3 { font: 600 16px/1.3 var(--body); margin: 0; }
+p { margin: 0; }
+.lede { color: var(--muted); font-size: 16px; }
+section { display: grid; gap: 14px; min-width: 0; }
+section > p { max-width: 72ch; }
+code, .mono { font-family: var(--mono); font-size: .9em; }
+.key { display: flex; flex-wrap: wrap; gap: 8px 20px; font-size: 13px; color: var(--muted); }
+.key span { display: inline-flex; align-items: center; gap: 7px; }
+.key i { width: 14px; height: 14px; border-radius: 3px; border: 2px solid; display: inline-block; }
+
+figure { margin: 0; display: grid; gap: 10px; min-width: 0; }
+.frame { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; overflow-x: auto; padding: 12px; }
+.frame svg { display: block; width: 100%; height: auto; min-width: 760px; }
+figcaption { color: var(--muted); font-size: 13.5px; max-width: 80ch; }
+
+/* SVG vocabulary, all from tokens */
+svg text { fill: var(--fg); font: 12.5px var(--body); }
+svg .t-title { font: 600 13.5px var(--body); }
+svg .t-mono { font: 12px var(--mono); }
+svg .t-sub { fill: var(--muted); font-size: 11.5px; }
+svg .t-edge { fill: var(--muted); font-size: 11.5px; }
+svg .t-frame { fill: var(--core); font: 600 13px var(--mono); }
+svg .box { fill: var(--surface); stroke: var(--line); stroke-width: 1.5; }
+svg .core { stroke: var(--core); }
+svg .ext { stroke: var(--ext); }
+svg .data { stroke: var(--data); }
+svg .tint-core { fill: color-mix(in srgb, var(--core) 7%, var(--surface)); }
+svg .exe { fill: color-mix(in srgb, var(--core) 4%, var(--bg)); stroke: var(--core); stroke-width: 1.5; stroke-dasharray: 6 4; }
+svg .edge { fill: none; stroke: var(--muted); stroke-width: 1.4; }
+svg .edge.ext { stroke: var(--ext); }
+svg .edge.data { stroke: var(--data); }
+svg .arrow { fill: var(--muted); }
+svg .arrow-ext { fill: var(--ext); }
+svg .arrow-data { fill: var(--data); }
+svg .terminal { fill: var(--faint); stroke: var(--line); }
+svg .st-ok { stroke: var(--ok); }
+svg .st-bad { stroke: var(--bad); }
+svg .dot { fill: var(--fg); }
+
+/* package graph */
+.pkg-layout { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 16px; align-items: start; }
+@media (max-width: 900px) { .pkg-layout { grid-template-columns: minmax(0, 1fr); } }
+#pkg svg { min-width: 700px; }
+#pkg .node { cursor: pointer; }
+#pkg .node rect { fill: var(--surface); stroke: var(--line); stroke-width: 1.5; transition: stroke .15s, fill .15s; }
+#pkg .node:focus { outline: none; }
+#pkg .node:focus-visible rect { stroke-width: 3; }
+#pkg .node.sel rect { stroke: var(--core); stroke-width: 2.5; fill: color-mix(in srgb, var(--core) 12%, var(--surface)); }
+#pkg .node.uses rect { stroke: var(--core); }
+#pkg .node.usedby rect { stroke: var(--ext); }
+#pkg .node.dim { opacity: .35; }
+#pkg .pe { fill: none; stroke: var(--line); stroke-width: 1.2; transition: stroke .15s, opacity .15s; }
+#pkg .pe.uses { stroke: var(--core); stroke-width: 2; }
+#pkg .pe.usedby { stroke: var(--ext); stroke-width: 2; }
+#pkg .pe.dim { opacity: .2; }
+#pkg .layer { fill: var(--muted); font: 500 11px var(--mono); letter-spacing: .06em; text-transform: uppercase; }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 16px; display: grid; gap: 10px; min-width: 0; }
+.panel h3 { font-family: var(--mono); font-weight: 500; color: var(--core); }
+.panel .files { font: 12.5px/1.5 var(--mono); color: var(--muted); overflow-wrap: anywhere; }
+.panel dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 4px 10px; font-size: 13px; }
+.panel dt { color: var(--muted); }
+.panel dd { margin: 0; font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere; }
+.panel .u { color: var(--core); } .panel .b { color: var(--ext); }
+
+/* step sequences */
+ol.steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); counter-reset: s; }
+ol.steps li { counter-increment: s; background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
+  padding: 14px 14px 14px 48px; position: relative; display: grid; gap: 4px; min-width: 0; }
+ol.steps li::before { content: counter(s); position: absolute; left: 14px; top: 13px; width: 24px; height: 24px; border-radius: 50%;
+  display: grid; place-items: center; font: 600 12px var(--mono); color: var(--core); border: 1.5px solid var(--core); }
+ol.steps li p { font-size: 13.5px; color: var(--muted); }
+ol.steps li .where { font: 12px var(--mono); color: var(--core); overflow-wrap: anywhere; }
+
+/* reference table */
+.tablewrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
+table { border-collapse: collapse; width: 100%; min-width: 640px; font-size: 13.5px; }
+th, td { text-align: left; padding: 9px 14px; border-bottom: 1px solid var(--faint); vertical-align: top; }
+th { font: 600 12px var(--mono); letter-spacing: .05em; text-transform: uppercase; color: var(--muted); background: var(--faint); }
+td:first-child { font-family: var(--mono); font-size: 12.5px; white-space: nowrap; color: var(--core); }
+td.ps { color: var(--ext); }
+tr:last-child td { border-bottom: 0; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="wrap">
+<header>
+  <div class="eyebrow">idlifecycle · Go 1.27 · Windows service</div>
+  <h1>IDLifecycle Code Map</h1>
+  <p class="lede">How the pieces of the repository connect: one Go executable that reads people from HR systems, works out what Active Directory should look like, queues the differences for approval, and applies them through PowerShell scripts.</p>
+  <div class="key">
+    <span><i style="border-color:var(--core)"></i>Go code inside <code>idlifecycled.exe</code></span>
+    <span><i style="border-color:var(--ext)"></i>Systems outside the exe</span>
+    <span><i style="border-color:var(--data)"></i>Where state is stored</span>
+  </div>
+</header>
+
+<section>
+  <h2>The whole system</h2>
+  <figure>
+    <div class="frame">
+    <svg viewBox="0 0 1100 580" role="img" aria-label="HR sources feed the sources package; the engine plans changes, stores them in the app database, and applies approved changes by running PowerShell scripts against Active Directory. Admins use the browser GUI through the API, and email notifications go out through notify.">
+      <defs>
+        <marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow"/></marker>
+        <marker id="a1e" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow-ext"/></marker>
+        <marker id="a1d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="arrow-data"/></marker>
+      </defs>
+
+      <!-- outside: browser -->
+      <rect class="box ext" x="320" y="10" width="190" height="50" rx="6"/>
+      <text class="t-title" x="415" y="32" text-anchor="middle">Admin's browser</text>
+      <text class="t-sub" x="415" y="49" text-anchor="middle">SPA from internal/web/static</text>
+
+      <!-- outside: Entra ID (optional sign-in) -->
+      <rect class="box ext" x="20" y="10" width="200" height="50" rx="6" stroke-dasharray="5 3"/>
+      <text class="t-title" x="120" y="32" text-anchor="middle">Microsoft Entra ID</text>
+      <text class="t-sub" x="120" y="49" text-anchor="middle">optional sign-in + MFA</text>
+      <path class="edge ext" d="M317 35H223" marker-start="url(#a1e)" marker-end="url(#a1e)" stroke-dasharray="5 3"/>
+      <text class="t-edge" x="270" y="28" text-anchor="middle">redirects</text>
+      <path class="edge ext" d="M288 144H120V63" marker-end="url(#a1e)" stroke-dasharray="5 3"/>
+      <text class="t-edge" x="128" y="100">code → ID token</text>
+      <text class="t-edge" x="128" y="114">(go-oidc verifies)</text>
+
+      <!-- exe frame -->
+      <rect class="exe" x="260" y="88" width="580" height="384" rx="10"/>
+      <text class="t-frame" x="276" y="108">idlifecycled.exe</text>
+      <text class="t-sub" x="824" y="108" text-anchor="end">cmd/idlifecycled → internal/app wires it all</text>
+
+      <!-- row A -->
+      <rect class="box core" x="290" y="120" width="250" height="48" rx="6"/>
+      <text class="t-title" x="415" y="140" text-anchor="middle">api + web</text>
+      <text class="t-sub" x="415" y="157" text-anchor="middle">sign-in, roles, CRUD, approvals, mapper</text>
+      <rect class="box core" x="580" y="120" width="230" height="48" rx="6"/>
+      <text class="t-title" x="695" y="140" text-anchor="middle">scheduler</text>
+      <text class="t-sub" x="695" y="157" text-anchor="middle">interval · daily · cron</text>
+
+      <!-- row B -->
+      <rect class="box core tint-core" x="290" y="208" width="520" height="62" rx="6"/>
+      <text class="t-title" x="550" y="232" text-anchor="middle">engine</text>
+      <text class="t-sub" x="550" y="252" text-anchor="middle">ingest → plan → approval policy &amp; delete limits → execute → audit</text>
+
+      <!-- row C -->
+      <rect class="box core" x="290" y="315" width="115" height="50" rx="6"/>
+      <text class="t-title" x="347" y="337" text-anchor="middle">sources</text>
+      <text class="t-sub" x="347" y="354" text-anchor="middle">CSV · API · SQL</text>
+      <rect class="box core" x="425" y="315" width="115" height="50" rx="6"/>
+      <text class="t-title" x="482" y="337" text-anchor="middle">store</text>
+      <text class="t-sub" x="482" y="354" text-anchor="middle">5 SQL dialects</text>
+      <rect class="box core" x="560" y="315" width="115" height="50" rx="6"/>
+      <text class="t-title" x="617" y="337" text-anchor="middle">notify</text>
+      <text class="t-sub" x="617" y="354" text-anchor="middle">email</text>
+      <rect class="box core" x="695" y="315" width="115" height="50" rx="6"/>
+      <text class="t-title" x="752" y="337" text-anchor="middle">ad</text>
+      <text class="t-sub" x="752" y="354" text-anchor="middle">PowerShellClient</text>
+
+      <!-- row D -->
+      <rect class="box core" x="290" y="400" width="115" height="50" rx="6"/>
+      <text class="t-title" x="347" y="421" text-anchor="middle">config · secrets</text>
+      <text class="t-sub" x="347" y="438" text-anchor="middle">datadir ACLs</text>
+
+      <!-- arrows inside -->
+      <path class="edge" d="M415 168V205" marker-end="url(#a1)"/>
+      <text class="t-edge" x="423" y="191">approve · run now</text>
+      <path class="edge" d="M695 168V205" marker-end="url(#a1)"/>
+      <text class="t-edge" x="703" y="191">start run</text>
+      <path class="edge" d="M347 270V312" marker-end="url(#a1)"/>
+      <text class="t-edge" x="354" y="296">fetch</text>
+      <path class="edge data" d="M482 270V312" marker-start="url(#a1d)" marker-end="url(#a1d)"/>
+      <text class="t-edge" x="489" y="296">read · write</text>
+      <path class="edge" d="M617 270V312" marker-end="url(#a1)"/>
+      <text class="t-edge" x="624" y="296">events</text>
+      <path class="edge" d="M752 270V312" marker-end="url(#a1)"/>
+      <text class="t-edge" x="759" y="296">AD calls</text>
+      <path class="edge" d="M347 365V397" marker-start="url(#a1)"/>
+      <text class="t-edge" x="354" y="386">decrypt DSNs</text>
+
+      <!-- outside left: HR sources -->
+      <text class="t-sub" x="20" y="224">HR SOURCES</text>
+      <rect class="box ext" x="20" y="232" width="200" height="44" rx="6"/>
+      <text class="t-title" x="32" y="259">Paylocity API</text>
+      <rect class="box ext" x="20" y="288" width="200" height="44" rx="6"/>
+      <text class="t-title" x="32" y="315">CSV file</text>
+      <rect class="box ext" x="20" y="344" width="200" height="60" rx="6"/>
+      <text class="t-title" x="32" y="366">SQL table / view</text>
+      <text class="t-sub" x="32" y="384">SQL Server · Postgres · MySQL</text>
+      <text class="t-sub" x="32" y="398">SQLite · Db2 · any ODBC</text>
+      <path class="edge ext" d="M220 254C255 254 255 334 287 336" marker-end="url(#a1e)"/>
+      <path class="edge ext" d="M220 310C250 310 255 340 287 340"/>
+      <path class="edge ext" d="M220 374C255 374 255 344 287 344"/>
+      <text class="t-edge" x="226" y="440">read-only pulls</text>
+
+      <!-- browser <-> api -->
+      <path class="edge ext" d="M415 63V117" marker-start="url(#a1e)" marker-end="url(#a1e)"/>
+      <text class="t-edge" x="423" y="93">HTTPS · JSON</text>
+
+      <!-- outside right: powershell + AD -->
+      <rect class="box ext" x="880" y="304" width="200" height="76" rx="6"/>
+      <text class="t-title" x="980" y="325" text-anchor="middle">scripts\*.ps1</text>
+      <text class="t-sub" x="980" y="343" text-anchor="middle">Get-IDLSnapshot · Get-IDLSchema</text>
+      <text class="t-sub" x="980" y="357" text-anchor="middle">New/Set/Disable/Enable/</text>
+      <text class="t-sub" x="980" y="371" text-anchor="middle">Remove-IDLUser</text>
+      <rect class="box ext" x="880" y="420" width="200" height="50" rx="6"/>
+      <text class="t-title" x="980" y="442" text-anchor="middle">Active Directory</text>
+      <text class="t-sub" x="980" y="459" text-anchor="middle">via ActiveDirectory module</text>
+      <path class="edge ext" d="M810 340H877" marker-start="url(#a1e)" marker-end="url(#a1e)"/>
+      <text class="t-edge" x="845" y="300" text-anchor="middle">pwsh child process</text>
+      <text class="t-edge" x="845" y="388" text-anchor="middle">JSON on stdin</text>
+      <text class="t-edge" x="845" y="402" text-anchor="middle">JSON on stdout</text>
+      <path class="edge ext" d="M980 380V417" marker-end="url(#a1e)"/>
+      <text class="t-edge" x="988" y="402">as the gMSA</text>
+
+      <!-- below: storage + mail -->
+      <rect class="box data" x="250" y="500" width="150" height="60" rx="6"/>
+      <text class="t-title" x="325" y="522" text-anchor="middle">Data folder</text>
+      <text class="t-sub" x="325" y="538" text-anchor="middle">config.json · secret.key</text>
+      <text class="t-sub" x="325" y="552" text-anchor="middle">ProgramData, locked down</text>
+      <path class="edge data" d="M347 450V497" marker-end="url(#a1d)"/>
+      <rect class="box data" x="410" y="500" width="160" height="60" rx="6"/>
+      <text class="t-title" x="490" y="522" text-anchor="middle">App database</text>
+      <text class="t-sub" x="490" y="538" text-anchor="middle">SQLite · Postgres · SQL Server</text>
+      <text class="t-sub" x="490" y="552" text-anchor="middle">MySQL · Db2 (ODBC)</text>
+      <path class="edge data" d="M482 365V497" marker-end="url(#a1d)"/>
+      <rect class="box ext" x="560" y="500" width="170" height="60" rx="6" transform="translate(20 0)"/>
+      <text class="t-title" x="665" y="522" text-anchor="middle">Mail</text>
+      <text class="t-sub" x="665" y="538" text-anchor="middle">SMTP · M365 SMTP OAuth</text>
+      <text class="t-sub" x="665" y="552" text-anchor="middle">M365 Graph sendMail</text>
+      <path class="edge ext" d="M617 365V497" marker-end="url(#a1e)"/>
+    </svg>
+    </div>
+    <figcaption>Everything that changes AD goes through one door: the engine hands approved changes to <code>ad.PowerShellClient</code>, which runs a script as the service account. The API runs only the read-only schema script, for the field mapper. The API also reads and writes the store directly for settings, sources, mappings, roles and users; that line is left out to keep the picture readable. Dashed lines are optional: Entra ID sign-in is off until an admin turns it on.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>Go packages and who imports whom</h2>
+  <p>Imports only point downward, so each layer can be tested without the ones above it. Select a package to see what it uses and what uses it. Test-only imports are left out.</p>
+  <div class="pkg-layout">
+    <figure>
+      <div class="frame" id="pkg">
+        <svg viewBox="0 0 900 430" role="img" aria-label="Package import graph in six layers: cmd, then app, then api and scheduler, then engine and backup, then ad, sources, store and notify, then the leaf packages model, config, connstr, secrets, datadir and web.">
+          <g id="pkg-edges"></g>
+          <g id="pkg-nodes"></g>
+        </svg>
+      </div>
+      <figcaption><span style="color:var(--core)">Teal</span> marks packages the selected one imports; <span style="color:var(--ext)">amber</span> marks packages that import it.</figcaption>
+    </figure>
+    <aside class="panel" id="panel" aria-live="polite"></aside>
+  </div>
+</section>
+
+<section>
+  <h2>One sync run, start to finish</h2>
+  <p>A run starts from the scheduler or from <strong>Run now</strong> in the GUI. Only one run happens at a time. The steps below are the order in <code>engine.sync</code> and <code>engine.Execute</code>.</p>
+  <ol class="steps">
+    <li><h3>Fetch every enabled source</h3><p>Each source returns normalized records. A failing or suddenly empty source is skipped, and its people are left alone rather than treated as leavers.</p><span class="where">engine/ingest.go → sources/*</span></li>
+    <li><h3>Update identities</h3><p>Records are saved as identities, keyed by source and external ID. Terminated status or repeated absence marks someone inactive.</p><span class="where">engine/ingest.go → store/entities.go</span></li>
+    <li><h3>Snapshot AD</h3><p>The managed accounts, their attributes and group memberships come back as JSON. With matching on, accounts without an ID come back too. An empty snapshot while accounts are linked aborts the run.</p><span class="where">ad/powershell.go → Get-IDLSnapshot.ps1</span></li>
+    <li><h3>Match people to existing accounts</h3><p>People without an account by ID are compared with existing accounts by the matching rules (names, department). A clear match becomes a link; a partial or several matches wait for a person. Admin accounts are never matched.</p><span class="where">engine/correlate.go · identity_pass.go</span></li>
+    <li><h3>Plan the differences</h3><p>Mappings and role rules render the desired attributes, groups and OU, then a diff against AD gives link, create, update, disable, enable or delete. New account names are checked in AD (sAMAccountName, UPN, mail, CN); a taken name waits for a person or gets a suffix, depending on the conflict mode.</p><span class="where">engine/plan.go · naming.go · identity_pass.go → Test-IDLNames.ps1</span></li>
+    <li><h3>Decide each change's status</h3><p>The approval policy per change type, the dry-run switch and the delete limits set it to pending, approved or simulated. Old changes no longer planned are superseded.</p><span class="where">engine/engine.go</span></li>
+    <li><h3>Apply approved changes</h3><p>Grouped by type in a fixed order (links first), at most 50 per PowerShell call. A link sets the ID attribute, can rename the account, and retires the old record. The rolling 24-hour delete cap defers extra deletes.</p><span class="where">engine/executor.go → Set-IDLLink.ps1, New/Set/Disable/Enable/Remove-IDLUser.ps1</span></li>
+    <li><h3>Record and notify</h3><p>Every transition writes a hash-chained audit row. Failures, pending approvals, tripped limits and identity issues (usernames to choose, matches to verify, accounts nobody matches) trigger email. The matching report is saved for the Matching page.</p><span class="where">engine/audit.go · engine/notify.go → notify/*</span></li>
+  </ol>
+</section>
+
+<section>
+  <h2>Life of a change</h2>
+  <figure>
+    <div class="frame">
+    <svg viewBox="0 0 900 320" role="img" aria-label="Change state machine: new changes start pending, approved or simulated; pending can be approved, rejected or superseded; approved goes to applying or superseded; applying ends applied or failed; failed can be retried back to approved.">
+      <defs>
+        <marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="arrow"/></marker>
+      </defs>
+      <circle class="dot" cx="30" cy="150" r="6"/>
+      <!-- states -->
+      <rect class="box terminal" x="150" y="22" width="110" height="36" rx="18"/><text x="205" y="45" text-anchor="middle" class="t-mono">simulated</text>
+      <rect class="box core" x="150" y="132" width="110" height="36" rx="18"/><text x="205" y="155" text-anchor="middle" class="t-mono">pending</text>
+      <rect class="box terminal" x="150" y="242" width="110" height="36" rx="18"/><text x="205" y="265" text-anchor="middle" class="t-mono">rejected</text>
+      <rect class="box core" x="380" y="132" width="110" height="36" rx="18"/><text x="435" y="155" text-anchor="middle" class="t-mono">approved</text>
+      <rect class="box terminal" x="380" y="242" width="110" height="36" rx="18"/><text x="435" y="265" text-anchor="middle" class="t-mono">superseded</text>
+      <rect class="box core" x="580" y="132" width="110" height="36" rx="18"/><text x="635" y="155" text-anchor="middle" class="t-mono">applying</text>
+      <rect class="box terminal st-ok" x="770" y="72" width="110" height="36" rx="18"/><text x="825" y="95" text-anchor="middle" class="t-mono">applied</text>
+      <rect class="box core st-bad" x="770" y="192" width="110" height="36" rx="18"/><text x="825" y="215" text-anchor="middle" class="t-mono">failed</text>
+      <!-- edges -->
+      <path class="edge" d="M36 150H147" marker-end="url(#a2)"/><text class="t-edge" x="92" y="143" text-anchor="middle">manual policy</text>
+      <path class="edge" d="M30 144V40H147" marker-end="url(#a2)"/><text class="t-edge" x="90" y="33" text-anchor="middle">dry run</text>
+      <path class="edge" d="M30 95H435V129" marker-end="url(#a2)"/><text class="t-edge" x="320" y="88" text-anchor="middle">auto policy</text>
+      <path class="edge" d="M260 150H377" marker-end="url(#a2)"/><text class="t-edge" x="320" y="143" text-anchor="middle">approve</text>
+      <path class="edge" d="M205 168V239" marker-end="url(#a2)"/><text class="t-edge" x="212" y="208">reject + note</text>
+      <path class="edge" d="M258 162L380 248" marker-end="url(#a2)"/><text class="t-edge" x="300" y="226" text-anchor="end">replanned</text>
+      <path class="edge" d="M435 168V239" marker-end="url(#a2)"/><text class="t-edge" x="442" y="208">replanned</text>
+      <path class="edge" d="M490 150H577" marker-end="url(#a2)"/><text class="t-edge" x="535" y="143" text-anchor="middle">executor</text>
+      <path class="edge" d="M690 144L768 98" marker-end="url(#a2)"/><text class="t-edge" x="722" y="110" text-anchor="end">script ok</text>
+      <path class="edge" d="M690 156L768 202" marker-end="url(#a2)"/><text class="t-edge" x="738" y="166">error</text>
+      <path class="edge" d="M825 228V300H530V160H493" marker-end="url(#a2)"/><text class="t-edge" x="680" y="293" text-anchor="middle">retry (approver)</text>
+    </svg>
+    </div>
+    <figcaption>Grey states are final. A service restart that finds a change stuck in <code>applying</code> marks it failed with "interrupted, verify in AD". Too many deletes in one run forces all of that run's deletes to pending, whatever the policy says.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>How people sign in</h2>
+  <p>Every page and API call needs a session. A <strong>local account</strong> signs in with a password at <code>POST /api/auth/login</code> (bcrypt, lockout after 5 failures). <strong>Entra ID sign-in</strong> is optional and follows the steps below. Either way the result is the same server-side session cookie.</p>
+  <figure>
+    <div class="frame">
+    <svg viewBox="0 0 900 470" role="img" aria-label="Entra ID sign-in sequence: the browser starts at IDLifecycle, is redirected to Entra ID for sign-in and MFA, returns with a code, IDLifecycle exchanges the code for an ID token, finds or creates the user from the token's tenant and object ID, and sets a session cookie.">
+      <defs>
+        <marker id="a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="arrow"/></marker>
+        <marker id="a3e" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="arrow-ext"/></marker>
+        <marker id="a3d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" class="arrow-data"/></marker>
+      </defs>
+      <!-- lifelines -->
+      <rect class="box ext" x="50" y="10" width="140" height="40" rx="6"/><text class="t-title" x="120" y="35" text-anchor="middle">Browser</text>
+      <rect class="box core tint-core" x="300" y="10" width="160" height="40" rx="6"/><text class="t-title" x="380" y="35" text-anchor="middle">IDLifecycle API</text>
+      <rect class="box ext" x="550" y="10" width="140" height="40" rx="6"/><text class="t-title" x="620" y="35" text-anchor="middle">Entra ID</text>
+      <rect class="box data" x="750" y="10" width="140" height="40" rx="6"/><text class="t-title" x="820" y="35" text-anchor="middle">App database</text>
+      <line class="edge" x1="120" y1="50" x2="120" y2="460" stroke-dasharray="3 4"/>
+      <line class="edge" x1="380" y1="50" x2="380" y2="460" stroke-dasharray="3 4"/>
+      <line class="edge" x1="620" y1="50" x2="620" y2="460" stroke-dasharray="3 4"/>
+      <line class="edge" x1="820" y1="50" x2="820" y2="460" stroke-dasharray="3 4"/>
+      <!-- messages -->
+      <text class="t-edge" x="250" y="80" text-anchor="middle">1  GET /api/auth/oidc/start</text>
+      <path class="edge" d="M120 88H377" marker-end="url(#a3)"/>
+      <text class="t-edge" x="250" y="122" text-anchor="middle">2  302 to Entra ID + state cookie</text>
+      <path class="edge" d="M380 130H123" marker-end="url(#a3)"/>
+      <text class="t-edge" x="250" y="146" text-anchor="middle">(state, nonce and PKCE kept on the server)</text>
+      <text class="t-edge" x="370" y="178" text-anchor="middle">3  sign in + MFA (Conditional Access)</text>
+      <path class="edge ext" d="M120 186H617" marker-end="url(#a3e)"/>
+      <text class="t-edge" x="370" y="220" text-anchor="middle">4  302 back to /callback with a code</text>
+      <path class="edge ext" d="M620 228H123" marker-end="url(#a3e)"/>
+      <text class="t-edge" x="250" y="262" text-anchor="middle">5  GET /callback?code&amp;state + cookie</text>
+      <path class="edge" d="M120 270H377" marker-end="url(#a3)"/>
+      <text class="t-edge" x="500" y="296" text-anchor="middle">6  code + PKCE verifier + secret</text>
+      <path class="edge ext" d="M380 304H617" marker-end="url(#a3e)"/>
+      <text class="t-edge" x="500" y="330" text-anchor="middle">7  ID token with roles</text>
+      <path class="edge ext" d="M620 338H383" marker-end="url(#a3e)"/>
+      <text class="t-edge" x="600" y="370" text-anchor="middle">8  find or create user by tenant:object ID, set role</text>
+      <path class="edge data" d="M380 378H817" marker-end="url(#a3d)"/>
+      <text class="t-edge" x="250" y="412" text-anchor="middle">9  session cookie + refresh to the app</text>
+      <path class="edge" d="M380 420H123" marker-end="url(#a3)"/>
+      <text class="t-edge" x="250" y="446" text-anchor="middle">GET /api/auth/me → signed in</text>
+    </svg>
+    </div>
+    <figcaption>Between steps 7 and 8 the API checks the token's issuer, audience, expiry and signature (go-oidc), plus the nonce and the tenant ID. Someone whose app roles or groups match no IDLifecycle role is refused, and no account is created. An Entra ID account never takes over a local account with the same name. Settings can limit password sign-in to local admins, as a break-glass path; everyone else then has to come through Entra ID and its MFA.</figcaption>
+  </figure>
+</section>
+
+<section>
+  <h2>Field mapper</h2>
+  <p>On the Attribute mappings page, admins see a source's fields next to AD's user attributes. <code>POST /api/mapper/sources/{id}/fields</code> fetches the source once and reports each field's fill rate and samples. <code>engine.TemplateFields</code> reads every mapping and role-rule template to show which fields are used, and flags the ones the source no longer sends. <code>GET /api/mapper/ad-attributes</code> runs the read-only <code>Get-IDLSchema.ps1</code>, cached for 30 minutes, and falls back to a built-in list. <code>engine.ClassifyAttribute</code> decides which attributes can be mapped.</p>
+</section>
+
+<section>
+  <h2>Install, upgrade and remove</h2>
+  <p>The PowerShell scripts in <code>scripts\</code> split into two groups. Six run at the service's request against AD. The rest set the machine up, and they call the exe's own <code>init</code>, <code>lockdown</code> and <code>check</code> commands so the rules live in one place.</p>
+  <ol class="steps">
+    <li><h3>Build a release</h3><p>Copies the exe, the scripts and the Setup.cmd launcher into a protected folder and writes a SHA-256 manifest of every file.</p><span class="where">New-IDLifecycleRelease.ps1 · Setup.cmd</span></li>
+    <li><h3>Open the setup window (optional)</h3><p>Double-clicking Setup.cmd opens a WPF wizard. It asks for admin rights, checks each page, and runs the installer or uninstaller in a child pwsh, following its log live. Secrets reach the child only through its environment.</p><span class="where">Start-IDLifecycleSetup.ps1 → Install-/Uninstall-IDLifecycle.ps1</span></li>
+    <li><h3>Or get it from GitHub or a zip</h3><p>-FromGitHub downloads a branch or tag and builds the exe with Go on the server; a release zip is extracted safely. Either goes into a locked staging folder, then that version's own installer takes over.</p><span class="where">Install-IDLifecycle.ps1 -FromGitHub | -SourceDir x.zip</span></li>
+    <li><h3>Run that release's installer</h3><p>Checks the folder and every hash (or, with -SkipIntegrityCheck, the least safe testing mode, takes the files as they are and writes their hashes itself), copies to Program Files, writes config, locks down the data folder, optionally restores a backup, and creates the first admin.</p><span class="where">Install-IDLifecycle.ps1 → idlifecycled init · lockdown · user add</span></li>
+    <li><h3>Register and verify</h3><p>Registers the Windows service under the gMSA, starts it, and runs the readiness checks.</p><span class="where">Install-IDLifecycleService.ps1 · idlifecycled check</span></li>
+    <li><h3>Tray icon and shortcuts</h3><p>Writes tray.json, creates the protected branding folder, and adds the Setup and Tray shortcuts. The tray runs as the signed-in user; Settings, Restart, Stop and Start go through an elevated helper that re-checks the service and runs idlifecycled config set.</p><span class="where">Start-IDLifecycleTray.ps1 → Invoke-IDLTrayAction.ps1 → idlifecycled config set</span></li>
+    <li><h3>Upgrade</h3><p>Re-run a newer release's installer. It is idempotent, keeps the data folder and restarts the service.</p><span class="where">Install-IDLifecycle.ps1</span></li>
+    <li><h3>Remove</h3><p>Deletes the service and the installed files listed in the manifest. The data folder stays unless you ask for it, with a backup.</p><span class="where">Uninstall-IDLifecycle.ps1</span></li>
+  </ol>
+</section>
+
+<section>
+  <h2>Where to look</h2>
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>Area</th><th>Main files</th><th>What it does</th></tr></thead>
+    <tbody id="ref"></tbody>
+    <tbody>
+      <tr><td class="ps">scripts\ (AD)</td><td class="mono">IDLifecycle.Common.psm1, Get-IDLSnapshot.ps1, Get-IDLSchema.ps1, Get-IDLOUs.ps1, Test-IDLNames.ps1, Set-IDLLink.ps1, New/Set/Disable/Enable/Remove-IDLUser.ps1</td><td>Read and change AD. Each reads one JSON request on stdin, writes one JSON result on stdout, logs to <code>scripts\Logs</code> and checks the account's ID attribute before touching it. Get-IDLSchema and Get-IDLOUs are read-only and used only by the field mapper and the OU picker.</td></tr>
+      <tr><td class="ps">scripts\ (setup)</td><td class="mono">New-IDLifecycleRelease.ps1, Install-IDLifecycle.ps1, Install-IDLifecycleService.ps1, Uninstall-IDLifecycle.ps1, Start-IDLifecycleSetup.ps1, Setup.cmd</td><td>Package, install, register and remove the service. Start-IDLifecycleSetup is the setup window Setup.cmd opens; it only collects input and runs the install or uninstall script.</td></tr>
+      <tr><td class="ps">scripts\ (tray, branding)</td><td class="mono">Start-IDLifecycleTray.ps1, Invoke-IDLTrayAction.ps1, branding\ (logo.svg, idlifecycle.ico, New-IDLBrandAssets.ps1)</td><td>The tray icon and its elevated helper, and the default brand files with the script that draws them.</td></tr>
+      <tr><td class="ps">tests\powershell</td><td class="mono">StubAD\, *.Tests.ps1, SetupFakes.ps1, FakeDaemon.ps1</td><td>Pester tests run the real scripts against an in-memory fake ActiveDirectory module, so they can never reach a real domain.</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+</div>
+
+<script>
+const P = {
+  cmd:      { label: 'cmd/idlifecycled', layer: 0, x: 450, w: 170, files: 'main.go, check.go, service_windows.go',
+              text: 'The executable. Commands: run (console), service (Windows SCM), init, lockdown, check, user list/add/passwd, backup, restore, version.' },
+  app:      { label: 'app', layer: 1, x: 450, files: 'app.go',
+              text: 'Wiring. Loads config, opens and migrates the store, checks the data folder ACL, builds the cipher, PowerShell client, engine, scheduler and HTTP server, then runs them, plus the scheduled-backup check every 15 minutes.' },
+  api:      { label: 'api', layer: 2, x: 330, files: 'server.go, auth.go, oidc.go, oidc_settings.go, mapper.go, handlers.go, backups.go, placement.go, identity.go',
+              text: 'HTTP JSON API. Local accounts with bcrypt, plus optional Entra ID sign-in (OIDC with PKCE, accounts created on first sign-in with roles from app roles). Sessions, CSRF header, lockout, viewer/approver/admin roles. CRUD for sources, mappings, roles, settings and users; approvals (with Change OU), runs, history search with CSV export, audit verify, test email; field mapper, OU list, placement values and backup endpoints; Set username, name checks, link choices, the matching report and the Add person (manual entry) endpoints.' },
+  scheduler:{ label: 'scheduler', layer: 2, x: 570, files: 'scheduler.go',
+              text: 'Works out the next run time from the schedule settings (interval, daily, cron, time zone) and starts an engine run. Reloads when settings change.' },
+  engine:   { label: 'engine', layer: 3, x: 450, files: 'engine.go, ingest.go, plan.go, naming.go, correlate.go, identity_pass.go, setname.go, placement.go, setou.go, roles.go, template.go, fields.go, attrclass.go, executor.go, audit.go, notify.go, preview.go',
+              text: 'The core. Fetches sources, updates identities, snapshots AD, plans changes from mappings and role rules, applies approval policy and delete limits, executes approved changes in chunks of 50, writes the audit chain and raises notification events. OU placement picks the OU by department (with a person’s choice, role rules and an unmapped hold), templates add regex helpers and an initial-password template, naming checks names in AD with a conflict mode (ask a person, number, random, template), and correlation links people to existing accounts (first rollout, contractor to employee, rehire) and writes the matching report. For the field mapper, it also works out which source fields each template reads and which AD attributes can be mapped.' },
+  ad:       { label: 'ad', layer: 4, x: 180, files: 'types.go, powershell.go, schema.go, ous.go, names.go, fake.go',
+              text: 'The Client interface for AD. PowerShellClient runs the scripts with JSON on stdin and stdout; FakeClient is the in-memory version the engine tests use. schema.go reads the user-class schema through Get-IDLSchema.ps1 and holds the built-in attribute list; ous.go lists OUs for the picker through Get-IDLOUs.ps1; names.go checks names (Test-IDLNames.ps1) and links accounts (Set-IDLLink.ps1).' },
+  sources:  { label: 'sources', layer: 4, x: 360, files: 'sources.go, csv.go, paylocity.go, sql.go, sql_odbc_windows.go, manual.go',
+              text: 'The Source interface and registry, plus the CSV, Paylocity and SQL sources. SQL covers SQL Server, Postgres, MySQL, SQLite, Db2 and generic ODBC, with query validation and a read-only transaction. The manual source serves people typed into the console (Add person) with a configurable form and end dates.' },
+  store:    { label: 'store', layer: 4, x: 540, files: 'store.go, migrate.go, entities.go, activity.go, people.go, backup.go, query.go, odbc_windows.go',
+              text: 'All database access through database/sql, with a dialect layer for SQLite, Postgres, SQL Server, MySQL and Db2. Schema migrations (2: local or Entra ID sign-in; 3: an OU chosen per person; 4: merged records, link decisions, chosen names and manual people), every query, audit log append and search (query syntax parser), table export and import for backups.' },
+  backup:   { label: 'backup', layer: 3, x: 680, files: 'backup.go, files.go, run.go',
+              text: 'Backups (.idlbak): every table as JSON lines, config.json and the master key in a tar, encrypted with a passphrase (scrypt, chunked AES-256-GCM bound to the header). Restores into any database driver in one transaction, puts the key in place, and runs the scheduled backups with pruning.' },
+  notify:   { label: 'notify', layer: 4, x: 720, files: 'notify.go, smtp.go, oauth.go, config.go',
+              text: 'Email. Generic SMTP (STARTTLS, TLS, none), M365 SMTP with OAuth2 XOAUTH2, and M365 Graph sendMail.' },
+  model:    { label: 'model', layer: 5, x: 75, files: 'model.go, settings.go',
+              text: 'Plain shared types: Settings (including sign-in, naming conflicts and correlation), User, Source, Identity, ManualPerson, link candidates, Mapping, RoleRule, Change, Run, Notification. Settings validation lives here too.' },
+  config:   { label: 'config', layer: 5, x: 225, files: 'config.go, pathpolicy.go',
+              text: 'Loads and validates config.json: listen address, TLS, database driver and DSN, PowerShell paths, data folder.' },
+  connstr:  { label: 'connstr', layer: 5, x: 375, files: 'connstr.go, connect.go',
+              text: 'Connection-string helpers: scrubbing passwords out of errors, ODBC value parsing, Db2 defaults, and a connect with a time limit.' },
+  secrets:  { label: 'secrets', layer: 5, x: 525, files: 'secrets.go, secrets_windows.go',
+              text: 'AES-GCM encryption for stored secrets (source DSNs, API keys, mail passwords). The key lives in secret.key, wrapped with DPAPI on Windows.' },
+  datadir:  { label: 'datadir', layer: 5, x: 675, files: 'datadir.go, datadir_windows.go',
+              text: 'Checks and locks down the data folder ACL and owner; checks that the program and scripts folders cannot be changed by non-admins.' },
+  web:      { label: 'web', layer: 5, x: 825, files: 'web.go, branding.go, static/ (index.html, app.js, api.js, brand.js, branding/, views/*)',
+              text: 'Embeds the browser app into the exe. branding.go serves the product name, logo and favicon from a trusted override folder (%ProgramData%\\IDLifecycle-Branding) or the built-in defaults; brand.js applies them. app.js is the shell and hash router, api.js wraps fetch with the CSRF token, views/ has one file per page (login.js offers Sign in with Microsoft when it is enabled; mapper.js is the field mapper; placement.js is OU placement; audit.js is the History search; manual.js is Add person; matching.js is Matching).' },
+};
+const E = {
+  cmd: ['ad','api','app','backup','config','datadir','model','secrets','store'],
+  app: ['ad','api','backup','config','datadir','engine','notify','scheduler','secrets','sources','store','web'],
+  api: ['ad','backup','config','engine','model','notify','secrets','sources','store'],
+  backup: ['config','model','secrets','store'],
+  scheduler: ['engine','model','store'],
+  engine: ['ad','model','secrets','sources','store'],
+  ad: ['model'], sources: ['connstr','model','secrets'], store: ['connstr','model'], notify: ['model','secrets'],
+};
+const LAYERS = ['entry', 'wiring', 'interfaces', 'core', 'adapters', 'leaves'];
+const NS = 'http://www.w3.org/2000/svg', H = 38, Y0 = 18, DY = 70;
+const el = (n, a) => { const e = document.createElementNS(NS, n); for (const k in a) e.setAttribute(k, a[k]); return e; };
+const ny = id => Y0 + P[id].layer * DY;
+const nw = id => P[id].w || 120;
+const usedBy = id => Object.keys(E).filter(k => E[k].includes(id));
+
+const gE = document.getElementById('pkg-edges'), gN = document.getElementById('pkg-nodes');
+LAYERS.forEach((l, i) => { const t = el('text', { x: 6, y: Y0 + i * DY - 4, class: 'layer' }); t.textContent = l; gE.appendChild(t); });
+const edges = [];
+for (const from in E) for (const to of E[from]) {
+  const x1 = P[from].x, y1 = ny(from) + H, x2 = P[to].x, y2 = ny(to), m = (y2 - y1) / 2;
+  const p = el('path', { class: 'pe', d: `M${x1} ${y1}C${x1} ${y1 + m} ${x2} ${y2 - m} ${x2} ${y2}` });
+  p.dataset.from = from; p.dataset.to = to; gE.appendChild(p); edges.push(p);
+}
+const nodes = {};
+for (const id in P) {
+  const g = el('g', { class: 'node', tabindex: 0, role: 'button', 'aria-label': P[id].label });
+  g.appendChild(el('rect', { x: P[id].x - nw(id) / 2, y: ny(id), width: nw(id), height: H, rx: 6 }));
+  const t = el('text', { x: P[id].x, y: ny(id) + 24, 'text-anchor': 'middle', class: 't-mono' }); t.textContent = P[id].label;
+  g.appendChild(t);
+  g.addEventListener('click', () => select(id));
+  g.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); select(id); } });
+  gN.appendChild(g); nodes[id] = g;
+}
+const panel = document.getElementById('panel');
+function select(id) {
+  const uses = E[id] || [], by = usedBy(id);
+  for (const k in nodes) {
+    nodes[k].classList.toggle('sel', k === id);
+    nodes[k].classList.toggle('uses', uses.includes(k));
+    nodes[k].classList.toggle('usedby', by.includes(k));
+    nodes[k].classList.toggle('dim', k !== id && !uses.includes(k) && !by.includes(k));
+  }
+  for (const p of edges) {
+    const u = p.dataset.from === id, b = p.dataset.to === id;
+    p.classList.toggle('uses', u); p.classList.toggle('usedby', b); p.classList.toggle('dim', !u && !b);
+    if (u || b) p.parentNode.appendChild(p);
+  }
+  const path = id === 'cmd' ? 'cmd/idlifecycled' : id === 'web' ? 'internal/web' : 'internal/' + id;
+  panel.innerHTML = '';
+  const h = document.createElement('h3'); h.textContent = path;
+  const t = document.createElement('p'); t.textContent = P[id].text;
+  const f = document.createElement('div'); f.className = 'files'; f.textContent = P[id].files;
+  const dl = document.createElement('dl');
+  dl.innerHTML = '<dt>uses</dt><dd class="u"></dd><dt>used by</dt><dd class="b"></dd>';
+  dl.children[1].textContent = uses.join(', ') || 'nothing internal';
+  dl.children[3].textContent = by.join(', ') || 'nothing (top level)';
+  panel.append(h, t, f, dl);
+}
+select('engine');
+
+const ref = document.getElementById('ref');
+for (const id in P) {
+  const tr = document.createElement('tr');
+  const path = id === 'cmd' ? 'cmd/idlifecycled' : 'internal/' + id;
+  [path, P[id].files, P[id].text].forEach((v, i) => { const td = document.createElement('td'); td.textContent = v; if (i === 1) td.className = 'mono'; tr.appendChild(td); });
+  ref.appendChild(tr);
+}
+</script>
+
+

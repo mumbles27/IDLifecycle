@@ -100,7 +100,7 @@ func TestGUIEndToEndInHeadlessBrowser(t *testing.T) {
 	})
 	static.Handle("/", web.Handler())
 
-	srv := httptest.NewServer((&api.Server{Store: st, Engine: eng, Cipher: cipher, Static: static, Log: log, Version: "e2e", BaseCtx: ctx}).Handler())
+	srv := httptest.NewServer((&api.Server{Store: st, Engine: eng, Cipher: cipher, Static: static, Branding: web.NewBranding("", log), Log: log, Version: "e2e", BaseCtx: ctx}).Handler())
 	defer srv.Close()
 
 	q := url.Values{"user": {"admin"}, "pass": {"e2e-admin-password"}, "csvpath": {uiCSV}, "report": {"/__report"}}

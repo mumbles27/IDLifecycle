@@ -184,6 +184,16 @@ code,
   font-size: 1.15rem;
   text-decoration: none;
   letter-spacing: 0.02em;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.topbar .brand-logo {
+  width: 1.6rem;
+  height: 1.6rem;
+  border-radius: 0.3rem;
+  flex: none;
 }
 
 .topbar .btn {
@@ -1262,6 +1272,14 @@ fieldset.plain {
 
 .login-card {
   width: min(24rem, 100%);
+}
+
+.login-logo {
+  display: block;
+  width: 4rem;
+  height: 4rem;
+  margin: 0 0 0.75rem;
+  border-radius: 0.8rem;
 }
 
 .login-card h1 {

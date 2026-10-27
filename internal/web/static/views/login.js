@@ -2,6 +2,7 @@
 
 import { login, signInOptions } from '../api.js';
 import { h, replaceContent, field, notice } from '../ui.js';
+import { productName, brandLogo } from '../brand.js';
 
 export function renderLogin(root, { message, onSuccess }) {
   const error = h('div', { class: 'login-error', 'aria-live': 'assertive' });
@@ -41,7 +42,8 @@ export function renderLogin(root, { message, onSuccess }) {
 
   replaceContent(root, h('div', { class: 'login-wrap', 'data-view': 'login' },
     h('div', { class: 'card login-card' },
-      h('h1', null, 'IDLifecycle'),
+      brandLogo('login-logo', { decorative: true }),
+      h('h1', { 'data-test': 'login-title' }, productName()),
       h('p', { class: 'muted' }, 'Active Directory identity lifecycle - sign in to continue.'),
       message ? notice('warn', message) : null,
       sso,
@@ -56,7 +58,7 @@ export function renderLogin(root, { message, onSuccess }) {
     // A full-page navigation: the server redirects to Entra ID and back.
     replaceContent(sso,
       h('a', { class: 'btn btn-primary btn-block', href: '/api/auth/oidc/start', 'data-test': 'login-oidc' }, oidc.label || 'Sign in with Microsoft'),
-      h('p', { class: 'login-divider muted small' }, 'or use an IDLifecycle account'));
+      h('p', { class: 'login-divider muted small' }, `or use a ${productName()} account`));
     sso.hidden = false;
     submit.classList.remove('btn-primary');
     if (opts.local_login === 'admins_only') {

@@ -21,7 +21,7 @@ embedded web GUI.
 
 | Path | Purpose |
 |---|---|
-| `cmd/idlifecycled` | Entry point: `run` (console), `service` (SCM), `install`/`uninstall`, `user add/passwd`, `version` |
+| `cmd/idlifecycled` | Entry point: `run` (console), `service` (SCM), `init`, `lockdown`, `check`, `user add/passwd`, `backup`/`restore`, `config get/set` (basic `config.json` fields for the tray; never prints the DSN), `version` |
 | `internal/config` | Bootstrap config file (DB connection, listen addr, TLS, PowerShell paths) |
 | `internal/store` | DB access, dialect layer (sqlite/postgres/mssql/mysql/db2), migrations, all queries |
 | `internal/secrets` | AES-GCM encryption for source secrets; key wrapped by DPAPI on Windows |
@@ -34,9 +34,11 @@ embedded web GUI.
 | `internal/ad` | `Client` interface; `PowerShellClient` (real) and `FakeClient` (tests) |
 | `internal/scheduler` | Interval / daily / cron scheduling, hot-reloaded from settings |
 | `internal/api` | HTTP handlers, auth, sessions, CSRF, audit hooks |
-| `internal/web` | `go:embed` of `static/` SPA |
-| `scripts/` | PowerShell: `IDLifecycle.Common.psm1`, `Get-IDLSnapshot.ps1`, `Get-IDLSchema.ps1` (field mapper only), `Get-IDLOUs.ps1` (OU picker only), `New/Set/Disable/Enable/Remove-IDLUser.ps1`, `Install-IDLifecycleService.ps1`; setup: `New-IDLifecycleRelease.ps1`, `Install-IDLifecycle.ps1`, `Uninstall-IDLifecycle.ps1` and the setup window `Start-IDLifecycleSetup.ps1` (WPF; only collects input and runs the two scripts in a child `pwsh`) |
+| `internal/web` | `go:embed` of `static/` SPA; `branding.go` serves `/branding/brand.json`, `/branding/logo`, `/branding/favicon.ico` (no auth) from the trusted override folder `branding_dir` (default `%ProgramData%IDLifecycle-Branding`, checked with `datadir.CheckTrustedFolder`, re-read at most every 60 s, files ≤ 1 MiB and format-checked) or the embedded defaults in `static/branding/`; SVG gets a sandboxing CSP |
+| `scripts/` | PowerShell: `IDLifecycle.Common.psm1`, `Get-IDLSnapshot.ps1`, `Get-IDLSchema.ps1` (field mapper only), `Get-IDLOUs.ps1` (OU picker only), `Test-IDLNames.ps1` (name checks), `Set-IDLLink.ps1` (account links), `New/Set/Disable/Enable/Remove-IDLUser.ps1`, `Install-IDLifecycleService.ps1`; setup: `New-IDLifecycleRelease.ps1`, `Install-IDLifecycle.ps1` (checks the release against `SHA256SUMS`; `-SkipIntegrityCheck` = least safe, no manifest), `Uninstall-IDLifecycle.ps1` and the setup window `Start-IDLifecycleSetup.ps1` (WPF; only collects input and runs the two scripts in a child `pwsh`) |
 | `Setup.cmd` | The release folder's double-click launcher for the setup window (at the repo and release root; listed in `SHA256SUMS`) |
+| `scripts/branding/` | Default brand files (`logo.svg`, `idlifecycle.ico`, `logo-256.png`, `brand.json`) and `New-IDLBrandAssets.ps1`, which draws them (and the web copies) with System.Drawing |
+| `scripts/Start-IDLifecycleTray.ps1`, `Invoke-IDLTrayAction.ps1` | Tray icon (WinForms NotifyIcon + WPF settings window, runs as the signed-in user, reads `<InstallDir>	ray.json`) and its elevated helper (Start/Stop/Restart/SetConfig; re-checks elevation and that the service is this install's `idlifecycled.exe service`; `config set`; rewrites `tray.json`) |
 | `tests/powershell` | Stub ActiveDirectory module + Pester tests for the scripts |
 
 ## 2. Key design decisions (ADR summary)
@@ -310,6 +312,7 @@ Lists: `{"items":[...],"total":N}` with `?limit=&offset=` (default 50, max 500).
 | `POST /api/ad/check-names` `{names:[{field,value,ou?}]}` | approver | ≤ 20 names → `{taken:[NameConflict]}` (AD + open creates) |
 | `POST /api/changes/{id}/link` `{object_guid}` | `{create_new:true}` | approver | pending link: choose a candidate (planned like the next sync, remembered as `link_decision`), or reject it and set `link_decision=new`; audited `change.set_link` |
 | `POST /api/identities/{id}/link` `{object_guid}` | `{clear:true}` | approver | sets/clears `link_decision` of a record without an account; audited `identity.link_decision` |
+| `GET /branding/brand.json` · `GET /branding/logo` · `GET /branding/favicon.ico` | none | `{product_name,accent,custom}`; the logo (svg or png) and icon from the override folder or the defaults; `no-cache`, `nosniff`; SVG with `default-src 'none'; style-src 'unsafe-inline'; sandbox` |
 | `GET /api/correlation/report` | viewer | `{run_id,generated_at,enabled,uncorrelated:[{object_guid,dn,sam,upn,display,enabled,external_id}],verify:[{change_id,identity_id,display,external_id,candidates}],needs_name:[...],unmatched_people}`; accounts ignored since the run are filtered out |
 | `GET /api/manual/sources` · `GET /api/manual/sources/{sid}/people` | viewer | `[{id,name,enabled,id_prefix,fields:[{name,label,required,kind:"text|date|email|select",options,default}]}]`; people `[{id,source_id,external_id,attrs,ended,created_by,created_at,updated_by,updated_at,state,ad_sam}]` |
 | `POST /api/manual/sources/{sid}/preview` `{attrs}` | approver | `{names,needs_name,ou,ou_reason,needs_ou,conflicts,warnings}`; nothing stored |
@@ -363,6 +366,10 @@ The executor sends at most 50 changes to one PowerShell invocation.
  "log_level":"info"}
 ```
 `dsn` may be `env:VAR_NAME`. Non-loopback `listen` without TLS is refused at startup.
+Optional `"branding_dir"` (default `%ProgramData%IDLifecycle-Branding` on Windows) points at the branding override folder.
+`idlifecycled config get -config <path>` prints `{listen, tls_cert_file, tls_key_file, log_level, data_dir, db_driver, scripts_dir,
+console_url}`; `config set -config <path> [-listen] [-tls-cert] [-tls-key] [-log-level]` changes only those fields with the start-up
+validation (exit 2, nothing written, when invalid; empty `-tls-cert`/`-tls-key` = HTTPS off) and writes through a temp file + rename.
 
 ## 10. Testing strategy
 

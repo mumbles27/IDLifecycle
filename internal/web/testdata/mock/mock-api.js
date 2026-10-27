@@ -877,8 +877,14 @@ function route(method, path, params, body) {
 
 const realFetch = window.fetch.bind(window);
 
+window.__IDL_MOCK = true;
+
 window.fetch = async (input, init = {}) => {
   const url = new URL(typeof input === 'string' ? input : input.url, location.href);
+  if (url.pathname === '/branding/brand.json') {
+    // A replaced brand, as an override folder on the server would give.
+    return new Response(JSON.stringify({ product_name: 'Acme Identity (mock)', accent: '#0a7d5a', custom: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  }
   if (!url.pathname.startsWith('/api/')) {
     return realFetch(input, init);
   }

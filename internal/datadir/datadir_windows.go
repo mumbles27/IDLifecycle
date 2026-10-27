@@ -141,6 +141,30 @@ func untrustedOwner(path string) (string, error) {
 // broadWriters lists broad principals with an allow ACE that lets them create, modify or delete objects.
 // Inherit-only ACEs on a directory are skipped (the children's own ACLs carry them and are walked too).
 func broadWriters(path string, isDir bool) ([]Problem, error) {
+	return broadWritersMask(path, isDir, writeMask)
+}
+
+// replaceMask is what lets someone replace or rename a folder's entries or take the folder over: adding files or
+// subfolders (which Users may do in ProgramData) is not enough to swap an existing folder.
+const replaceMask = fileDelChild | writeDAC | writeOwner | genericWrite | genericAll
+
+// broadReplacers is broadWriters for a parent folder, with replaceMask.
+func broadReplacers(path string) ([]Problem, error) { return broadWritersMask(path, true, replaceMask) }
+
+// isReparsePoint reports a symbolic link, junction or other reparse point.
+func isReparsePoint(path string) (bool, error) {
+	p, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return false, err
+	}
+	attrs, err := windows.GetFileAttributes(p)
+	if err != nil {
+		return false, err
+	}
+	return attrs&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0, nil
+}
+
+func broadWritersMask(path string, isDir bool, mask uint32) ([]Problem, error) {
 	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
 	if err != nil {
 		return nil, err
@@ -158,7 +182,7 @@ func broadWriters(path string, isDir bool) ([]Problem, error) {
 		if err := windows.GetAce(dacl, i, &ace); err != nil {
 			return nil, err
 		}
-		if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE || ace.Mask&writeMask == 0 {
+		if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE || uint32(ace.Mask)&mask == 0 {
 			continue
 		}
 		if isDir && ace.Header.AceFlags&inheritOnly != 0 {

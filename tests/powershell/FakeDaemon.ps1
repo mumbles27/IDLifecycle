@@ -44,10 +44,10 @@ function Save-State {
 $password = [string]$env:IDL_PASSWORD
 $op = (($argv.Count -gt 0) ? ($argv[0]) : (''))
 if (
-    ($op -eq 'user') -and
+    ($op -in @('user', 'config')) -and
     ($argv.Count -gt 1)
 ){
-    $op = 'user ' + $argv[1]
+    $op = $op + ' ' + $argv[1]
 }
 
 $state['calls'] = @($state['calls']) + @(@{
@@ -248,6 +248,75 @@ switch ($op){
         $state['restoredWithConfig'] = ($argv -contains '-with-config')
         Save-State
         Write-Output 'Restored: users 1 rows'
+        exit 0
+    }
+
+    { $_ -in @('config get', 'config set') } {
+        # The `config get|set` contract of the real binary (section 3 of the tray design): get prints the web console
+        # settings as JSON; set changes only the given fields, refuses a non-loopback listen without TLS and a bad log
+        # level (exit 2, nothing written). State knob: configSetExit (forces an exit code for set).
+        $cfgPath = Get-Flag -Name 'config'
+        if (-not (Test-Path -LiteralPath $cfgPath -PathType Leaf)){
+            [Console]::Error.WriteLine("error: read config: $cfgPath not found")
+            exit 1
+        }
+
+        $cfg = [System.IO.File]::ReadAllText($cfgPath) | ConvertFrom-Json -AsHashtable
+        if ($null -eq $cfg['tls']){
+            $cfg['tls'] = @{}
+        }
+
+        if ($op -eq 'config set'){
+            if ($null -ne $state['configSetExit']){
+                [Console]::Error.WriteLine('error: fake config set failure')
+                exit ([int]$state['configSetExit'])
+            }
+
+            $flags = @{ 'listen' = $null; 'tls-cert' = $null; 'tls-key' = $null; 'log-level' = $null }
+            for ($i = 2; $i -lt $argv.Count - 1; $i++){
+                $name = ([string]$argv[$i]).TrimStart('-')
+                if ($flags.ContainsKey($name)){
+                    $flags[$name] = [string]$argv[$i + 1]
+                    $i++
+                }
+            }
+
+            if ($null -ne $flags['listen']){ $cfg['listen'] = $flags['listen'] }
+            if ($null -ne $flags['tls-cert']){ $cfg['tls']['cert_file'] = $flags['tls-cert'] }
+            if ($null -ne $flags['tls-key']){ $cfg['tls']['key_file'] = $flags['tls-key'] }
+            if ($null -ne $flags['log-level']){
+                if ($flags['log-level'] -notin @('debug', 'info', 'warn', 'error')){
+                    [Console]::Error.WriteLine("error: log_level must be debug, info, warn or error")
+                    exit 2
+                }
+
+                $cfg['log_level'] = $flags['log-level']
+            }
+
+            $h = ([string]$cfg['listen'] -replace ':\d+$', '').Trim('[', ']')
+            if (($h -notin @('127.0.0.1', 'localhost', '::1')) -and [string]::IsNullOrEmpty([string]$cfg['tls']['cert_file'])){
+                [Console]::Error.WriteLine("error: listen $($cfg['listen']) is not a loopback address; configure tls.cert_file and tls.key_file")
+                exit 2
+            }
+
+            [System.IO.File]::WriteAllText($cfgPath, (ConvertTo-Json -InputObject $cfg -Depth 5), [System.Text.UTF8Encoding]::new($false))
+        }
+
+        $tls = -not [string]::IsNullOrEmpty([string]$cfg['tls']['cert_file'])
+        $listen = [string]$cfg['listen']
+        $hostPart = ($listen -replace ':\d+$', '')
+        $port = ($listen -replace '^.*:', '')
+        $urlHost = (($hostPart -in @('127.0.0.1', 'localhost', '[::1]')) ? ('localhost') : ((($hostPart -in @('0.0.0.0', '', '[::]')) ? ('server.test') : ($hostPart))))
+        Write-Output (ConvertTo-Json -Compress -InputObject ([ordered]@{
+                    listen        = $listen
+                    tls_cert_file = [string]$cfg['tls']['cert_file']
+                    tls_key_file  = [string]$cfg['tls']['key_file']
+                    log_level     = (($cfg['log_level']) ? ([string]$cfg['log_level']) : ('info'))
+                    data_dir      = [string]$cfg['data_dir']
+                    db_driver     = [string]$cfg['database']['driver']
+                    scripts_dir   = [string]$cfg['powershell']['scripts_dir']
+                    console_url   = ('{0}://{1}:{2}/' -f ((($tls)) ? ('https') : ('http')), $urlHost, $port)
+                }))
         exit 0
     }
 

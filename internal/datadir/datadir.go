@@ -4,6 +4,7 @@
 package datadir
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -180,6 +181,12 @@ type WritableError struct {
 }
 
 func (e *WritableError) Error() string {
+	return fmt.Sprintf("%s can be changed by non-administrators (%s); anyone who can write there can make the service account run their code. "+
+		"Install into a protected folder such as C:\\Program Files\\IDLifecycle (Install-IDLifecycle.ps1 does this)", e.Dir, e.list())
+}
+
+// list names who can change what (at most five entries).
+func (e *WritableError) list() string {
 	parts := make([]string, 0, min(len(e.Problems), 5))
 	for i, p := range e.Problems {
 		if i == 5 {
@@ -188,6 +195,48 @@ func (e *WritableError) Error() string {
 		}
 		parts = append(parts, strings.Replace(p.String(), " can read ", " can change ", 1))
 	}
-	return fmt.Sprintf("%s can be changed by non-administrators (%s); anyone who can write there can make the service account run their code. "+
-		"Install into a protected folder such as C:\\Program Files\\IDLifecycle (Install-IDLifecycle.ps1 does this)", e.Dir, strings.Join(parts, "; "))
+	return strings.Join(parts, "; ")
+}
+
+// CheckTrustedFolder returns an error unless dir is a real folder (no symbolic link or junction, also nothing below it)
+// that only SYSTEM, Administrators, TrustedInstaller and the current account can change, with a trusted owner on
+// everything, in a parent folder nobody else can replace it in. Used for optional override folders (branding) that
+// sit in ProgramData, where any user may create folders.
+func CheckTrustedFolder(dir string) error {
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rp, err := isReparsePoint(path)
+		if err != nil {
+			return err
+		}
+		if rp {
+			return fmt.Errorf("%s is a symbolic link or junction", path)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	var we *WritableError
+	if err := CheckNotWritable(dir); errors.As(err, &we) {
+		return errors.New(we.list())
+	} else if err != nil {
+		return err
+	}
+	parent := filepath.Dir(filepath.Clean(dir))
+	problems, err := broadReplacers(parent)
+	if err != nil {
+		return fmt.Errorf("read ACL of %s: %w", parent, err)
+	}
+	if owner, err := untrustedOwner(parent); err != nil {
+		return fmt.Errorf("read owner of %s: %w", parent, err)
+	} else if owner != "" {
+		problems = append(problems, Problem{Path: parent, Principal: owner + " (owner)"})
+	}
+	if len(problems) > 0 {
+		return errors.New((&WritableError{Dir: parent, Problems: problems}).list() + " (in the parent folder, so the folder could be replaced)")
+	}
+	return nil
 }

@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -39,6 +40,9 @@ type Config struct {
 	LogLevel   string     `json:"log_level"`
 	// CSVAllowedDirs restricts where CSV sources may read from. Empty means anywhere except the data directory.
 	CSVAllowedDirs []string `json:"csv_allowed_dirs"`
+	// BrandingDir holds optional replacement branding (brand.json, logo.svg|png, favicon.ico, tray.ico). It is used only
+	// while non-administrators cannot change it. Empty = DefaultBrandingDir (see BrandingFolder).
+	BrandingDir string `json:"branding_dir,omitempty"`
 
 	path string
 }
@@ -62,12 +66,37 @@ func Default(dataDir string) Config {
 	}
 }
 
+// DefaultBrandingDir is %ProgramData%\IDLifecycle-Branding on Windows and "" elsewhere.
+func DefaultBrandingDir() string {
+	if runtime.GOOS != "windows" {
+		return ""
+	}
+	pd := os.Getenv("ProgramData")
+	if pd == "" {
+		pd = `C:\ProgramData`
+	}
+	return filepath.Join(pd, "IDLifecycle-Branding")
+}
+
+// BrandingFolder is branding_dir, or the default when it is not set.
+func (c Config) BrandingFolder() string {
+	if c.BrandingDir != "" {
+		return c.BrandingDir
+	}
+	return DefaultBrandingDir()
+}
+
 // Load reads and validates path. Missing fields take defaults.
 func Load(path string) (Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return Config{}, fmt.Errorf("read config: %w", err)
 	}
+	return Parse(raw, path)
+}
+
+// Parse decodes and validates a config.json document as Load does (path is where it lives; defaults are rooted there).
+func Parse(raw []byte, path string) (Config, error) {
 	c := Default(filepath.Dir(path))
 	dec := json.NewDecoder(strings.NewReader(string(raw)))
 	dec.DisallowUnknownFields()

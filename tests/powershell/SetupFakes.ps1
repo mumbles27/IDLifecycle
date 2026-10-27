@@ -369,3 +369,74 @@ function Read-IDLSetupPassword {
 
     throw "SetupFakes: unexpected password prompt '$Prompt'"
 }
+
+# Tray / Start menu shortcuts and the branding folder: never the real Start menu or %ProgramData%. Shortcuts live in
+# state shortcuts{ path: {Target, Arguments, Icon, WorkingDirectory} }; the roots are folders below the test log dir.
+# state brandingUntrusted = the reason Get-IDLSetupBrandingProblem returns for an existing branding folder ('' = fine).
+$script:FakeTrayRoot = Join-Path -Path (Split-Path -Parent $env:IDL_FAKE_STATE) -ChildPath 'desktop' # per fixture: re-runs see the same folders
+
+function Get-IDLSetupShortcutRoots {
+    return @{ Startup = (Join-Path -Path $script:FakeTrayRoot -ChildPath 'Startup'); Programs = (Join-Path -Path $script:FakeTrayRoot -ChildPath 'Programs\IDLifecycle') }
+}
+
+function Get-IDLSetupShortcut {
+    param([string]$Path)
+
+    $all = (Read-FakeState)['shortcuts']
+    if (
+        ($null -eq $all) -or
+        (-not $all.Contains($Path))
+    ){
+        return $null
+    }
+
+    return $all[$Path]
+}
+
+function New-IDLSetupShortcut {
+    param([string]$Path, [string]$Target, [string]$Arguments = '', [string]$WorkingDirectory = '', [string]$Icon = '', [string]$Description = '')
+
+    Add-FakeCall -Op 'newShortcut' -Data @{ path = $Path; target = $Target; arguments = $Arguments; icon = $Icon }
+    $s = Read-FakeState
+    if ($null -eq $s['shortcuts']){
+        $s['shortcuts'] = @{}
+    }
+
+    $s['shortcuts'][$Path] = @{ Target = $Target; Arguments = $Arguments; Icon = $Icon; WorkingDirectory = $WorkingDirectory }
+    Save-FakeState -State $s
+}
+
+function Remove-IDLSetupShortcut {
+    param([string]$Path)
+
+    Add-FakeCall -Op 'removeShortcut' -Data $Path
+    $s = Read-FakeState
+    $null = $s['shortcuts'].Remove($Path)
+    Save-FakeState -State $s
+}
+
+function Get-IDLSetupBrandingRoot {
+    return (Join-Path -Path $script:FakeTrayRoot -ChildPath 'IDLifecycle-Branding')
+}
+
+function Get-IDLSetupBrandingProblem {
+    param([string]$Path)
+
+    $why = [string](Read-FakeState)['brandingUntrusted']
+    return (($why) ? ($why) : ($null))
+}
+
+function Initialize-IDLSetupBrandingDir {
+    param([string]$Path)
+
+    Add-FakeCall -Op 'brandingDir' -Data $Path
+    $null = New-Item -ItemType Directory -Path $Path -Force
+    [System.IO.File]::WriteAllText((Join-Path -Path $Path -ChildPath 'README.txt'), (Get-IDLBrandingReadme), [System.Text.UTF8Encoding]::new($false))
+}
+
+function Remove-IDLSetupBrandingDir {
+    param([string]$Path)
+
+    Add-FakeCall -Op 'removeBrandingDir' -Data $Path
+    Remove-Item -LiteralPath $Path -Recurse -Force
+}

@@ -1,6 +1,12 @@
 # IDLifecycle
 
+<img src="scripts/branding/logo-256.png" alt="IDLifecycle" width="96" align="right">
+
 A Windows service that keeps Active Directory in step with your HR system.
+
+**Documentation:** [Install and initial setup guide](docs/SETUP-GUIDE.md) (step by step, for the people installing it) ·
+[Architecture and interface contracts](docs/ARCHITECTURE.md) · [Web UI notes](docs/UI.md) · [Code map](docs/CODEMAP.html) (a diagram of how the
+packages, scripts and web UI connect; open the file in a browser) · this README (reference).
 
 * **Sources**: Paylocity (API), a CSV file, or a SQL database table/view (SQL Server, PostgreSQL, MySQL/MariaDB,
   SQLite) filled by your own HR export job; more can be added by implementing one small Go interface.
@@ -76,7 +82,7 @@ are possible. The window shows what is already installed, then walks through:
 | **Service account**: gMSA/MSA, user account + password, or built-in | **Review** with the equivalent command |
 | **Database**: SQLite, SQL Server, PostgreSQL, MySQL, Db2 + connection string (examples shown) | **Run** |
 | **Web console**: address, HTTPS certificate/key, first administrator | |
-| **Options**: start the service, install the AD module, upgrade (`-Force`), require a signed exe, **restore from a backup** (`.idlbak` + passphrase, optionally its settings) | |
+| **Options**: start the service, install the AD module, upgrade (`-Force`), add the tray icon (default on), require a signed exe, skip the SHA-256 check (least safe, asks to confirm), **restore from a backup** (`.idlbak` + passphrase, optionally its settings) | |
 | **Review** with the equivalent PowerShell command, then **Test run (no changes)** or **Install** | |
 | **Run**: the script's log live (WOULD blue, DONE green, warnings amber, errors red), the result, *Open the web console*, *Open log folder* | |
 
@@ -94,6 +100,42 @@ Removing the data folder is sent with `-Force` only after the window has checked
 `Setup.cmd` is also copied into the program folder, so the window can be started there later: to uninstall, or to
 upgrade from GitHub or a newer release zip.
 
+### Tray icon
+
+The tray icon (`scripts\Start-IDLifecycleTray.ps1`) starts when someone signs in to the server (or from Start menu ->
+IDLifecycle -> IDLifecycle Tray). Its tooltip shows the service state (checked every 10 seconds; a notification appears
+when the service stops on its own). Right-click:
+
+| Menu item | What it does |
+|---|---|
+| **Open admin console** (also double-click) | opens the web console's address in the browser |
+| Service: *state* - *version* | status line |
+| **Settings...** | a window with the service, state, version, console address and data folder, where you change the web console address, the HTTPS certificate and key (or switch HTTPS off for an address on this server) and the log level, optionally restarting the service to apply them |
+| **Restart service**, **Stop service** / **Start service** | depending on the current state |
+| **Open log folder** | the service's log folder when you can read it, else the setup log folder |
+| **Exit** | closes the tray icon only - the service keeps running |
+
+The tray runs as the signed-in user and changes nothing itself: Save, Restart, Stop and Start run
+`scripts\Invoke-IDLTrayAction.ps1` elevated (one UAC prompt per action). That helper checks again that it is elevated and
+that the service really is this installation's `idlifecycled.exe service`, validates the settings with the same rules as
+the service (`idlifecycled config set`: a network address needs HTTPS, the certificate and key must load), changes only
+those fields in `config.json`, updates `tray.json`, and logs to the setup log folder. It uses the execution policy from
+`config.json` (never `Bypass`). Everything else is set in the web console. One tray runs per signed-in user; it closes
+itself when `tray.json` disappears (uninstall). `-NoTray` (or unticking the option in the setup window) leaves it out.
+
+The same settings from an elevated command line:
+
+```powershell
+$exe = 'C:\Program Files\IDLifecycle\idlifecycled.exe'; $cfg = 'C:\ProgramData\IDLifecycle\config.json'
+& $exe config get -config $cfg
+& $exe config set -config $cfg -listen 0.0.0.0:8443 -tls-cert C:\certs\idl.pem -tls-key C:\certs\idl.key -log-level info
+Restart-Service IDLifecycle
+```
+
+`config get` prints the basic settings as JSON (never the database connection string); `config set` changes only the
+fields given, checks them as the service does at start-up (exit 2 and nothing written when they are invalid) and keeps
+every other setting.
+
 ### Scripts
 
 `scripts\Install-IDLifecycle.ps1` is the guided, idempotent setup (elevated; `-DryRun` previews every step without
@@ -105,6 +147,7 @@ from:
 | Release folder | default `-SourceDir` = the folder the script sits in (`New-IDLifecycleRelease.ps1`) | checked in place (release trust below) |
 | GitHub | `-FromGitHub [-GitHubRepo owner/name] [-GitHubRef main\|v1.2.0\|<commit>] [-GitHubToken <SecureString>]` | the ref is resolved to a commit (logged), its source zip downloaded over HTTPS, `idlifecycled.exe` built with Go on this server (`go build -trimpath -mod=readonly`, CGO off; module downloads need internet access), and a release laid out (exe, `scripts\`, `Setup.cmd`, `SHA256SUMS`). Go missing → exit 3. A private repository needs a fine-grained read-only *Contents* token (`-GitHubToken` or `IDL_GITHUB_TOKEN`); it is used only in the download requests |
 | Release zip | `-SourceDir <file>.zip` (`New-IDLifecycleRelease.ps1 -Zip`) | the zip must sit where only SYSTEM, Administrators, TrustedInstaller and you can change it; entries that would land outside the folder are refused |
+| Any folder or zip, unchecked (**least safe**) | `-SourceDir <folder or zip> -SkipIntegrityCheck` | for testing, or a folder you put together yourself: no `SHA256SUMS` needed (see below) |
 
 GitHub and zip sources are put into a **new folder below the protected staging root** (`%ProgramData%\IDLifecycle-Setup\Staging`;
 a non-elevated `-DryRun` uses `%LOCALAPPDATA%`), and then **that version's own** `Install-IDLifecycle.ps1` is run with
@@ -123,12 +166,30 @@ removed when that run succeeds and kept (for inspection) when it fails.
 | Database + admin | `check` confirms the data dir ACL and creates/migrates the schema; the first admin is created when none exists (`-AdminPassword`, `IDL_PASSWORD`, or a prompt; not needed when a restored backup brings administrators) |
 | Service | `Install-IDLifecycleService.ps1` from the installed scripts |
 | Verify + start | every required `check -json` entry (incl. `program_files_acl`) must have run and passed (a skipped `ad_module` is fine - the preflight covers it; else nothing is started); start (restart when this run changed `config.json`), wait for Running, probe `http(s)://<listen>/` for HTTP 200, print the GUI URL |
+| Tray and shortcuts | writes `<InstallDir>\tray.json` (service name, console URL, listen address, log level - no secrets), creates `%ProgramData%\IDLifecycle-Branding` (protected, with a README; see *Branding*), a Start menu entry *IDLifecycle Setup*, and - unless `-NoTray` - *IDLifecycle Tray* in the Start menu and in the common Startup folder (the tray then starts for everyone who signs in) |
 
 `SHA256SUMS` sits in the release folder it describes, so it gives **integrity** (nothing was swapped or added after
 the release was built), not authenticity: the ACL check is the real guard, which is why a folder that users can write
 to (e.g. a clone of this repository below `C:\`) is refused. Sign the exe and use `-RequireSignature` if you need to
 prove who built it. The installer's own log and CSV report go to `%ProgramData%\IDLifecycle-Setup\Logs` (SYSTEM and
 Administrators only; a non-elevated `-DryRun` uses `%LOCALAPPDATA%\IDLifecycle-Setup\Logs`).
+
+**Installing without `SHA256SUMS` (`-SkipIntegrityCheck`, least safe).** For testing, or when you have an
+`idlifecycled.exe` (e.g. `go build -trimpath -o idlifecycled.exe .\cmd\idlifecycled` in a checkout) next to the
+`scripts\` folder but no release built with `New-IDLifecycleRelease.ps1`. The installer then reads no manifest: it takes
+`idlifecycled.exe`, `Setup.cmd` (if present) and every file below `scripts\` (except `Logs\`), hashes them at that
+moment and installs those hashes as `SHA256SUMS`, so upgrades and uninstall work as usual. A zip without `SHA256SUMS` is
+accepted too (a single top folder, as in GitHub's *Download ZIP*, is used as the release). Nothing proves the files are
+the ones that were built or reviewed - a changed or extra script is installed and later run by the service with its AD
+rights - so every such run logs `UNVERIFIED INSTALL` warnings and reports `IntegrityCheck,Skipped`, and the setup window
+asks for confirmation. Still enforced: the folder's permissions (copy it to e.g. `C:\Install` if it is refused),
+`idlifecycled.exe` and every required script, and `-RequireSignature`. With `-FromGitHub` it is not needed and ignored
+(that build has its own `SHA256SUMS`). For production, reinstall from a release built with `New-IDLifecycleRelease.ps1`.
+
+```powershell
+# least safe - testing only: a self-built exe next to the scripts of a checkout, no SHA256SUMS
+C:\Install\IDLifecycle\scripts\Install-IDLifecycle.ps1 -SourceDir C:\Install\IDLifecycle -SkipIntegrityCheck -ServiceAccount 'CORP\svc-idl$'
+```
 
 ```powershell
 # SQL Server: the DSN is stored as database.dsn in config.json inside the locked-down data dir
@@ -457,6 +518,29 @@ entries (`/api/audit?q=...&format=csv`; the export itself is recorded).
   **This path is unit/statement-tested but has not been run against a live Db2 server** — run the store suite against one first
   (`$env:IDL_TEST_DB2_DSN='...'; go test ./internal/store/`).
 * **Logs**: `<data_dir>\logs\idlifecycle.log` (JSON, rotated), PowerShell logs and CSV reports in `scripts\Logs`.
+
+## Branding (logo, name, colour)
+
+The default mark - a person inside a lifecycle arrow - is in `scripts\branding\` (`logo.svg`, `idlifecycle.ico` with
+16-256 px, `logo-256.png`, `brand.json`); `New-IDLBrandAssets.ps1` there redraws them (and the web console's embedded
+copies) if you want to restyle it. It appears in the web console (browser tab, top bar, sign-in page), the tray icon and
+its settings window, the setup window and the shortcuts.
+
+To use **your own branding**, put any of these files into `%ProgramData%\IDLifecycle-Branding` on the server (the
+installer creates the folder with a README; everything is optional and each file is at most 1 MiB):
+
+| File | Changes |
+|---|---|
+| `brand.json` | `{"product_name": "Acme Identity", "accent": "#0a7d5a"}` - the name in the top bar, sign-in page, page titles, tray tooltip and window titles (1-40 characters), and the web accent colour (`#rrggbb`, optional) |
+| `logo.svg` or `logo.png` | the logo in the web console (SVG wins) and the tray settings window (PNG) |
+| `favicon.ico` | the browser tab icon |
+| `tray.ico` | the tray icon and the desktop windows (falls back to `favicon.ico`, then the default) |
+
+The web console picks changes up within a minute (no restart); the tray and windows on their next start. The folder is
+used only when nobody but SYSTEM, Administrators and TrustedInstaller can change it (Windows lets every user create
+folders in `ProgramData`, so a folder someone else planted is ignored and a warning is logged). An invalid file (bad
+JSON, wrong format, too big) is ignored on its own; SVG logos are served with a sandboxing content security policy. The
+`branding_dir` setting in `config.json` points the service at another folder.
 
 ## Sign-in: local accounts and optional Microsoft Entra ID
 

@@ -47,9 +47,11 @@ type Server struct {
 	Scheduler Scheduler
 	Notifier  *notify.Service // optional; a default one is built from Store/Cipher when nil
 	Static    http.Handler
-	Log       *slog.Logger
-	Version   string
-	TLS       bool
+	// Branding serves /branding/* (web.Branding); unauthenticated, the login page uses it. Optional.
+	Branding http.Handler
+	Log      *slog.Logger
+	Version  string
+	TLS      bool
 	// BaseCtx outlives individual requests; background sync runs use it.
 	BaseCtx context.Context
 	// OIDCAuthority and OIDCHTTPClient default to Entra ID's login host and a client with a timeout;
@@ -97,6 +99,9 @@ func (s *Server) Handler() http.Handler {
 
 		mux := http.NewServeMux()
 		s.routes(mux)
+		if s.Branding != nil {
+			mux.Handle("/branding/", s.Branding) // only its three paths; everything else below /branding/ is a 404
+		}
 		if s.Static != nil {
 			mux.Handle("/", s.Static)
 		}

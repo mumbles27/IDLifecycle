@@ -47,3 +47,23 @@ func broadWriters(path string, _ bool) ([]Problem, error) {
 }
 
 func setOwnerAdministrators(string) error { return nil }
+
+// broadReplacers reports group/other write bits on a parent folder (without the sticky bit).
+func broadReplacers(path string) ([]Problem, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if fi.Mode().Perm()&0o022 != 0 && fi.Mode()&os.ModeSticky == 0 {
+		return []Problem{{Path: path, Principal: fmt.Sprintf("group/other (mode %v)", fi.Mode().Perm())}}, nil
+	}
+	return nil, nil
+}
+
+func isReparsePoint(path string) (bool, error) {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return false, err
+	}
+	return fi.Mode()&os.ModeSymlink != 0, nil
+}

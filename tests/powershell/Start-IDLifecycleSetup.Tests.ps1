@@ -50,6 +50,8 @@ Describe 'Start-IDLifecycleSetup.ps1: input checks, command lines, log following
             Start                = $true
             InstallPrerequisites = $false
             RequireSignature     = $false
+            SkipIntegrityCheck   = $false
+            NoTray               = $false
             Force                = $false
             RestoreWanted        = $false
             RestoreFrom          = ''
@@ -76,7 +78,7 @@ Describe 'Start-IDLifecycleSetup.ps1: input checks, command lines, log following
     It 'accepts the defaults (gMSA, SQLite, loopback) and reports each mistake on its own page' {
         @(Get-Problems).Count | Should Be 0
 
-        (Get-Problems -Change @{ SourceDir = $script:StateDir } -Page 'Source')[0].Message | Should Match 'not an IDLifecycle release folder'
+        (Get-Problems -Change @{ SourceDir = $script:StateDir } -Page 'Source')[0].Message | Should Match 'has no idlifecycled.exe'
         (Get-Problems -Change @{ InstallDir = 'C:\' } -Page 'Locations')[0].Message | Should Match "program folder 'C:\\' cannot be used"
         (Get-Problems -Change @{ DataDir = (Join-Path $script:StateDir 'gui\Program Files\IDLifecycle\data') } -Page 'Locations')[0].Message | Should Match 'must be separate'
         (Get-Problems -Change @{ ServiceName = 'bad name!' } -Page 'Locations').Count | Should Be 1
@@ -112,7 +114,7 @@ Describe 'Start-IDLifecycleSetup.ps1: input checks, command lines, log following
         (Get-Problems -Change @{ SourceKind = 'GitHub'; GoVersion = '' } -Page 'Source')[0].Message | Should Match 'Go is not installed'
         (Get-Problems -Change @{ SourceKind = 'Local'; SourceDir = '' } -Page 'Source')[0].Message | Should Match 'Choose the release zip'
         (Get-Problems -Change @{ SourceKind = 'Local'; SourceDir = (Join-Path $release 'nope.zip') } -Page 'Source')[0].Message | Should Match 'File not found'
-        (Get-Problems -Change @{ SourceKind = 'Local'; SourceDir = $script:StateDir } -Page 'Source')[0].Message | Should Match 'not an IDLifecycle release folder'
+        (Get-Problems -Change @{ SourceKind = 'Local'; SourceDir = $script:StateDir } -Page 'Source')[0].Message | Should Match 'has no idlifecycled.exe'
         @(Get-Problems -Change @{ SourceKind = 'Local'; SourceDir = $release }).Count | Should Be 0
         $zip = Join-Path $release 'r.zip'
         Set-Content -LiteralPath $zip -Value 'x'
@@ -130,6 +132,54 @@ Describe 'Start-IDLifecycleSetup.ps1: input checks, command lines, log following
         ((Get-IDLGuiInstallSummary -Settings (Get-Settings -Change @{ SourceKind = 'GitHub' })) -join "`n") | Should Match 'GitHub mumbles27/IDLifecycle @ main, built here with go1\.27\.3'
         $l = New-IDLGuiInstallCommand -Settings (Get-Settings -Change @{ SourceKind = 'Local'; SourceDir = $zip }) -ScriptsDir 'C:\R\scripts'
         @($l.Arguments)[[array]::IndexOf(@($l.Arguments), '-SourceDir') + 1] | Should Be $zip
+    }
+
+    It 'skip the SHA-256 check (least safe): a folder without SHA256SUMS is accepted only with the option; it is passed on and shown' {
+        $loose = Join-Path $script:StateDir ('guiloose_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $null = New-Item -ItemType Directory -Force -Path (Join-Path $loose 'scripts')
+        Set-Content -LiteralPath (Join-Path $loose 'idlifecycled.exe') -Value 'x'
+
+        (Get-Problems -Change @{ SourceKind = 'Local'; SourceDir = $loose } -Page 'Source')[0].Message | Should Match "has no SHA256SUMS.*Skip the SHA-256 file check"
+        (Get-Problems -Change @{ SourceKind = 'Release'; SourceDir = $loose } -Page 'Source')[0].Message | Should Match 'has no SHA256SUMS'
+        @(Get-Problems -Change @{ SourceKind = 'Local'; SourceDir = $loose; SkipIntegrityCheck = $true }).Count | Should Be 0
+        @(Get-Problems -Change @{ SourceKind = 'Release'; SourceDir = $loose; SkipIntegrityCheck = $true }).Count | Should Be 0
+        # The option does not make a folder without the program acceptable.
+        (Get-Problems -Change @{ SourceKind = 'Local'; SourceDir = $script:StateDir; SkipIntegrityCheck = $true } -Page 'Source')[0].Message | Should Match 'has no idlifecycled.exe'
+
+        $c = New-IDLGuiInstallCommand -Settings (Get-Settings -Change @{ SourceKind = 'Local'; SourceDir = $loose; SkipIntegrityCheck = $true }) -ScriptsDir 'C:\R\scripts'
+        @($c.Arguments) -contains '-SkipIntegrityCheck' | Should Be $true
+        $c.Display | Should Match '-SkipIntegrityCheck'
+        @((New-IDLGuiInstallCommand -Settings (Get-Settings) -ScriptsDir 'C:\R\scripts').Arguments) -contains '-SkipIntegrityCheck' | Should Be $false
+        ((Get-IDLGuiInstallSummary -Settings (Get-Settings -Change @{ SkipIntegrityCheck = $true })) -join "`n") | Should Match 'SKIP the SHA-256 file check \(least safe\)'
+        (Get-IDLGuiUnverifiedWarning) | Should Match 'least safe'
+        Remove-Item -LiteralPath $loose -Recurse -Force
+
+        # As built, the command really installs a folder without SHA256SUMS (fakes) and the installer warns.
+        $fx = New-SetupFixture
+        Remove-Item -LiteralPath (Join-Path $fx.Source 'SHA256SUMS') -Force
+        $s = Get-Settings -Change @{ SourceKind = 'Local'; SourceDir = $fx.Source; InstallDir = $fx.Install; DataDir = $fx.Data; ServiceName = 'IDLGuiSkip'; SkipIntegrityCheck = $true; Start = $false }
+        $c = New-IDLGuiInstallCommand -Settings $s -ScriptsDir $script:ScriptsDir -DryRun
+        $argList = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $c.Script) + @($c.Arguments) + @('-TestHook', $script:SetupHook)
+        $childEnv = @{ IDL_FAKE_STATE = $fx.State; IDL_SETUP_TEST = '1'; IDL_SETUP_TEST_LOGDIR = (Join-Path $fx.Root 'logs') }
+        $r = Invoke-ChildProcess -Psi (New-ChildProcessInfo -Arguments $argList -StatePath (New-StubStateFile) -ExtraEnv $childEnv) -TimeoutSec 300
+        $log = (Get-ChildItem -LiteralPath (Join-Path $fx.Root 'logs') -Filter 'Install-IDLifecycle_2*.log' | Select-Object -First 1).FullName
+        $r.ExitCode | Should Be 0
+        [System.IO.File]::ReadAllText($log) | Should Match 'UNVERIFIED INSTALL'
+        Remove-SetupFixture -Fixture $fx
+    }
+
+    It 'tray option: on by default (no -NoTray); off sends -NoTray; the summary says which' {
+        $on = New-IDLGuiInstallCommand -Settings (Get-Settings) -ScriptsDir 'C:\R\scripts'
+        @($on.Arguments) -contains '-NoTray' | Should Be $false
+        ((Get-IDLGuiInstallSummary -Settings (Get-Settings)) -join "`n") | Should Match 'tray icon for everyone who signs in'
+        $off = New-IDLGuiInstallCommand -Settings (Get-Settings -Change @{ NoTray = $true }) -ScriptsDir 'C:\R\scripts'
+        @($off.Arguments) -contains '-NoTray' | Should Be $true
+        $off.Display | Should Match '-NoTray'
+        ((Get-IDLGuiInstallSummary -Settings (Get-Settings -Change @{ NoTray = $true })) -join "`n") | Should Match 'no tray icon'
+        # Settings without the key (an older caller) mean the default: tray on.
+        $s = Get-Settings
+        $s.Remove('NoTray')
+        @((New-IDLGuiInstallCommand -Settings $s -ScriptsDir 'C:\R\scripts').Arguments) -contains '-NoTray' | Should Be $false
     }
 
     It 'restore: needs an existing backup file and (for a real run) its passphrase, which goes only into the child environment; no admin password needed' {
@@ -391,6 +441,11 @@ Describe 'Start-IDLifecycleSetup.ps1: input checks, command lines, log following
             Initialize-IDLGuiAssemblies | Should Be $true
             $window = [System.Windows.Markup.XamlReader]::Load([System.Xml.XmlReader]::Create([System.IO.StringReader]::new($script:Xaml)))
             @($names | Where-Object { $null -eq $window.FindName($_) }) -join ',' | Should Be ''
+            # The brand icon becomes the window icon (scripts\branding\idlifecycle.ico when it is there).
+            Set-IDLGuiBranding -Window $window
+            if (Test-Path -LiteralPath (Join-Path $script:ScriptsDir 'branding\idlifecycle.ico')){
+                $null -ne $window.Icon | Should Be $true
+            }
         }
     }
 

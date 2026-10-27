@@ -12,6 +12,9 @@
          NOTHING is removed (the run stops).
       3. sc.exe delete the service and wait until it is gone.
       4. Remove the "IDLifecycle" Application event log source - unless another service still runs idlifecycled.exe.
+         Then the tray: InstallDir\tray.json (running tray icons notice and close), the "IDLifecycle Tray" shortcuts in
+         the common Startup folder and Start menu and "IDLifecycle Setup" (only shortcuts that point into InstallDir),
+         and - with -RemoveData, when no other IDLifecycle service is left - %ProgramData%\IDLifecycle-Branding.
       5. Remove InstallDir (default: yes; -RemoveProgramFiles:$false keeps it). With the SHA256SUMS install manifest
          that Install-IDLifecycle.ps1 copies there, only the listed files (plus the generated *.log/*.csv in
          scripts\Logs) are deleted, then empty folders; anything else is left and reported.
@@ -234,6 +237,69 @@ function Get-IDLPathOwnerSid {
     )
 
     return (Get-IDLOwnerSid -Path $Path)
+}
+
+function Get-IDLSetupShortcutRoots {
+    # The same folders Install-IDLifecycle.ps1 puts the tray / setup shortcuts into.
+    return @{
+        Startup  = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::CommonStartup)
+        Programs = Join-Path -Path ([System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::CommonPrograms)) -ChildPath 'IDLifecycle'
+    }
+}
+
+function Get-IDLSetupShortcut {
+    # The shortcut at Path as @{ Target; Arguments; Icon; WorkingDirectory }, or $null when there is none.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)){
+        return $null
+    }
+
+    $shell = New-Object -ComObject WScript.Shell
+    try{
+        $lnk = $shell.CreateShortcut($Path)
+        return @{ Target = [string]$lnk.TargetPath; Arguments = [string]$lnk.Arguments; Icon = [string]$lnk.IconLocation; WorkingDirectory = [string]$lnk.WorkingDirectory }
+    }
+    finally{
+        $null = [System.Runtime.InteropServices.Marshal]::ReleaseComObject($shell)
+    }
+}
+
+function Remove-IDLSetupShortcut {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    Remove-Item -LiteralPath $Path -Force
+}
+
+function Get-IDLSetupBrandingRoot {
+    return (Get-IDLBrandingRoot)
+}
+
+function Remove-IDLSetupBrandingDir {
+    # Removes %ProgramData%\IDLifecycle-Branding (plain files only: the installer creates no sub-folders or links).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    foreach ($item in @(Get-ChildItem -LiteralPath $Path -Force)){
+        if (
+            ($item.PSIsContainer) -or
+            ((($item.Attributes) -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)
+        ){
+            throw "'$($item.FullName)' is not a plain file; remove the branding folder by hand."
+        }
+
+        Remove-Item -LiteralPath $item.FullName -Force
+    }
+
+    Remove-Item -LiteralPath $Path -Force
 }
 
 function Read-IDLSetupText {
@@ -1018,6 +1084,61 @@ try{
     }
 
     Assert-NoFailedSteps -Phase 'Delete service'
+    Stop-IDLPhase -Phase $phase
+
+    # ---- Phase: tray icon and shortcuts (tray.json going away also closes running trays within 10 seconds) ----
+    $phase = Start-IDLPhase -Name 'Tray and shortcuts'
+    $trayInfoPath = Join-Path -Path $InstallDir -ChildPath 'tray.json'
+    if (Test-Path -LiteralPath $trayInfoPath -PathType Leaf){
+        Invoke-SetupStep -Action 'RemoveTrayInfo' -Identity $trayInfoPath -Details '(running tray icons close themselves)' `
+            -IsSatisfied { $false } `
+            -Apply { Remove-Item -LiteralPath $trayInfoPath -Force }
+    }
+    else{
+        Add-SetupSkip -Action 'RemoveTrayInfo' -Identity $trayInfoPath -Reason 'not present'
+    }
+
+    $roots = Get-IDLSetupShortcutRoots
+    foreach ($lnk in @(
+            (Join-Path -Path $roots.Startup -ChildPath 'IDLifecycle Tray.lnk'),
+            (Join-Path -Path $roots.Programs -ChildPath 'IDLifecycle Tray.lnk'),
+            (Join-Path -Path $roots.Programs -ChildPath 'IDLifecycle Setup.lnk')
+        )){
+        $existing = Get-IDLSetupShortcut -Path $lnk
+        if ($null -eq $existing){
+            Add-SetupSkip -Action 'RemoveShortcut' -Identity $lnk -Reason 'not present'
+        }
+        elseif ((([string]$existing.Target) + ' ' + ([string]$existing.Arguments)) -notmatch [regex]::Escape($InstallDir)){
+            Add-SetupSkip -Action 'RemoveShortcut' -Identity $lnk -Reason 'kept: it belongs to another installation'
+        }
+        else{
+            Invoke-SetupStep -Action 'RemoveShortcut' -Identity $lnk -IsSatisfied { $false } -Apply { Remove-IDLSetupShortcut -Path $lnk }
+        }
+    }
+
+    if (
+        (Test-Path -LiteralPath $roots.Programs -PathType Container) -and
+        (@(Get-ChildItem -LiteralPath $roots.Programs -Force).Count -eq 0) -and
+        (-not $DryRun)
+    ){
+        Remove-Item -LiteralPath $roots.Programs -Force
+    }
+
+    $brandingRoot = Get-IDLSetupBrandingRoot
+    if (-not (Test-Path -LiteralPath $brandingRoot -PathType Container)){
+        Add-SetupSkip -Action 'RemoveBrandingDir' -Identity $brandingRoot -Reason 'not present'
+    }
+    elseif (-not $RemoveData){
+        Add-SetupSkip -Action 'RemoveBrandingDir' -Identity $brandingRoot -Reason 'kept (your branding files; removed together with -RemoveData)'
+    }
+    elseif (@(Get-IDLSetupDaemonServices | Where-Object { $_ -ne $ServiceName }).Count -gt 0){
+        Add-SetupSkip -Action 'RemoveBrandingDir' -Identity $brandingRoot -Reason 'kept: another IDLifecycle service still uses it'
+    }
+    else{
+        Invoke-SetupStep -Action 'RemoveBrandingDir' -Identity $brandingRoot -IsSatisfied { $false } -Apply { Remove-IDLSetupBrandingDir -Path $brandingRoot }
+    }
+
+    Assert-NoFailedSteps -Phase 'Tray and shortcuts'
     Stop-IDLPhase -Phase $phase
 
     # ---- Phase: program files ----

@@ -77,6 +77,35 @@ Describe 'Uninstall-IDLifecycle.ps1 (fakes for every system change; temp folders
         Remove-SetupFixture -Fixture $fx
     }
 
+    It 'tray: tray.json and this installation''s shortcuts are removed; another installation''s shortcut and the branding folder are kept' {
+        $fx = New-InstalledFixture
+        [System.IO.File]::WriteAllText((Join-Path $fx.Install 'tray.json'), '{}')
+        $desktop = Join-Path (Split-Path -Parent $fx.State) 'desktop'
+        $mine = '-NoProfile -STA -WindowStyle Hidden -ExecutionPolicy RemoteSigned -File "{0}"' -f (Join-Path $fx.Install 'scripts\Start-IDLifecycleTray.ps1')
+        $startup = Join-Path $desktop 'Startup\IDLifecycle Tray.lnk'
+        $menuTray = Join-Path $desktop 'Programs\IDLifecycle\IDLifecycle Tray.lnk'
+        $menuSetup = Join-Path $desktop 'Programs\IDLifecycle\IDLifecycle Setup.lnk'
+        $null = New-Item -ItemType Directory -Force -Path (Join-Path $desktop 'IDLifecycle-Branding')
+        Update-FakeSetupState -Path $fx.State -Change {
+            param($s)
+            $s['shortcuts'] = @{
+                $startup   = @{ Target = 'C:\pwsh.exe'; Arguments = $mine; Icon = ''; WorkingDirectory = '' }
+                $menuTray  = @{ Target = 'C:\pwsh.exe'; Arguments = $mine; Icon = ''; WorkingDirectory = '' }
+                $menuSetup = @{ Target = 'D:\Other\IDLifecycle\Setup.cmd'; Arguments = ''; Icon = ''; WorkingDirectory = '' }
+            }
+        }
+
+        $r = Invoke-SetupScript -Script 'Uninstall-IDLifecycle' -Params @{ ServiceName = $serviceName } -StatePath $fx.State
+        $r.ExitCode | Should Be 0
+        $r.ReportText | Should Match '"RemoveTrayInfo","Applied"'
+        @(Get-FakeCalls -Path $fx.State -Op 'removeShortcut' | ForEach-Object { $_['data'] }) -join '|' | Should Be "$startup|$menuTray"
+        (Read-FakeSetupState -Path $fx.State)['shortcuts'].Contains($menuSetup) | Should Be $true
+        $r.ReportText | Should Match '"RemoveShortcut","Skipped",.*another installation'
+        $r.ReportText | Should Match '"RemoveBrandingDir","Skipped",.*kept \(your branding files'
+        (Test-Path -LiteralPath (Join-Path $desktop 'IDLifecycle-Branding')) | Should Be $true
+        Remove-SetupFixture -Fixture $fx
+    }
+
     It 'manifest-based removal leaves unknown files (reported) and a re-run skips them' {
         $fx = New-InstalledFixture
         Set-Content -LiteralPath (Join-Path $fx.Install 'notes.txt') -Value 'not ours'

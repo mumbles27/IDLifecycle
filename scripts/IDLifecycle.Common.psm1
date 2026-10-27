@@ -2923,6 +2923,388 @@ function Test-IDLLoopbackHost {
 
 #endregion
 
+#region Web console settings, branding and the tray (Start-IDLifecycleTray.ps1, Invoke-IDLTrayAction.ps1, the installer)
+
+$script:IDLLogLevels = @('debug', 'info', 'warn', 'error')
+$script:IDLExecutionPolicies = @('AllSigned', 'RemoteSigned', 'Unrestricted', 'Bypass', 'Restricted', 'Default', 'Undefined')
+
+function Get-IDLConsoleSettingsProblems {
+    <#
+    .SYNOPSIS
+        Checks web console settings the way the service will (and the setup window does): listen = host:port; a
+        non-loopback address needs HTTPS (certificate AND key); both files must exist; log level debug|info|warn|error
+        (empty = leave as is). Returns the problems as strings (none = fine).
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()][string]$Listen = '',
+        [AllowEmptyString()][string]$TlsCertFile = '',
+        [AllowEmptyString()][string]$TlsKeyFile = '',
+        [AllowEmptyString()][string]$LogLevel = ''
+    )
+
+    $problems = [System.Collections.Generic.List[string]]::new()
+    $Listen = $Listen.Trim()
+    $hasCert = -not [string]::IsNullOrWhiteSpace($TlsCertFile)
+    $hasKey = -not [string]::IsNullOrWhiteSpace($TlsKeyFile)
+    if ($Listen){
+        $parts = Split-IDLListen -Value $Listen
+        if ($null -eq $parts){
+            $problems.Add("Web console address '$Listen' must be host:port, e.g. 127.0.0.1:8443 or 0.0.0.0:8443.")
+        }
+        elseif (
+            (-not (Test-IDLLoopbackHost -HostName $parts.Host)) -and
+            ((-not $hasCert) -or (-not $hasKey))
+        ){
+            $problems.Add("'$Listen' can be reached from the network, so the console needs HTTPS: choose a certificate file and its key file (PEM).")
+        }
+    }
+
+    if ($hasCert -ne $hasKey){
+        $problems.Add('Choose both the certificate file and the key file (or neither).')
+    }
+
+    foreach ($file in @($TlsCertFile, $TlsKeyFile)){
+        if (
+            (-not [string]::IsNullOrWhiteSpace($file)) -and
+            (-not (Test-Path -LiteralPath $file -PathType Leaf))
+        ){
+            $problems.Add("File not found: $file")
+        }
+    }
+
+    if (
+        ($LogLevel) -and
+        ($LogLevel -notin $script:IDLLogLevels)
+    ){
+        $problems.Add("Log level '$LogLevel' must be one of: $($script:IDLLogLevels -join ', ').")
+    }
+
+    return [string[]]$problems.ToArray()
+}
+
+function Get-IDLBrandingRoot {
+    # The override folder for branding (all files optional): %ProgramData%\IDLifecycle-Branding.
+    return (Join-Path -Path $env:ProgramData -ChildPath 'IDLifecycle-Branding')
+}
+
+function Get-IDLBrandingUntrustedReason {
+    <#
+    .SYNOPSIS
+        Why a branding override folder must not be used, or $null: it, a file or folder in it, or one of its parent
+        folders can be changed (or is owned) by an account other than SYSTEM, Administrators or TrustedInstaller. The
+        current user is NOT trusted here (unlike for a release folder): the tray runs as every signed-in user.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [scriptblock]$OwnerSidResolver = $null
+    )
+
+    $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $isAdminSid = { param($sid) $sid -in @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464') }
+    $reason = Get-IDLUntrustedTreeReason -Path $Path -ParentChain -RefuseReparsePoints -OwnerSidResolver $OwnerSidResolver
+    if ($reason){
+        return $reason
+    }
+
+    # Get-IDLUntrustedTreeReason trusts the current user; check that the current user is not what makes it pass.
+    $write = [System.Security.AccessControl.FileSystemRights]'WriteData, AppendData, WriteExtendedAttributes, WriteAttributes, Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership'
+    $items = @(Get-Item -LiteralPath $Path -Force) + @(Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue)
+    foreach ($item in $items){
+        $owner = (($null -ne $OwnerSidResolver) ? ([string](& $OwnerSidResolver $item.FullName)) : (Get-IDLOwnerSid -Path $item.FullName))
+        if (-not (& $isAdminSid $owner)){
+            return "'$($item.FullName)' is owned by $(ConvertTo-IDLAccountName -Sid $owner)"
+        }
+
+        $acl = Get-Acl -LiteralPath $item.FullName
+        foreach ($rule in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])){
+            if (
+                ($rule.AccessControlType -eq 'Allow') -and
+                ($rule.IdentityReference.Value -eq $me) -and
+                (-not (& $isAdminSid $me)) -and
+                (($rule.FileSystemRights -band $write) -ne 0)
+            ){
+                return "'$($item.FullName)' can be changed by $(ConvertTo-IDLAccountName -Sid $me)"
+            }
+        }
+    }
+
+    return $null
+}
+
+function Get-IDLBranding {
+    <#
+    .SYNOPSIS
+        The product name and icon/logo files to show: from the override folder (Get-IDLBrandingRoot) when it can be
+        trusted (Get-IDLBrandingUntrustedReason), else the defaults in DefaultDir (scripts\branding).
+        Returns @{ ProductName; IconPath; LogoPngPath; Custom; Warning }; IconPath / LogoPngPath are $null when no
+        such file exists (callers fall back to a system icon / no logo).
+    .DESCRIPTION
+        Override files (all optional, at most 1 MiB each): brand.json {"product_name": "1-40 characters"},
+        tray.ico (else favicon.ico), logo.png. Invalid values and oversized files are ignored.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$DefaultDir,
+        [AllowEmptyString()][string]$OverrideDir = (Get-IDLBrandingRoot),
+        [scriptblock]$OwnerSidResolver = $null
+    )
+
+    $result = [ordered]@{ ProductName = 'IDLifecycle'; IconPath = $null; LogoPngPath = $null; Custom = $false; Warning = '' }
+    $pick = {
+        param([string]$Dir, [string[]]$Names)
+        if (-not $Dir){
+            return $null
+        }
+
+        foreach ($n in $Names){
+            $p = Join-Path -Path $Dir -ChildPath $n
+            if (
+                (Test-Path -LiteralPath $p -PathType Leaf) -and
+                ((Get-Item -LiteralPath $p -Force).Length -le 1MB)
+            ){
+                return $p
+            }
+        }
+
+        return $null
+    }
+    $readName = {
+        param([string]$Dir)
+        $p = & $pick $Dir @('brand.json')
+        if (-not $p){
+            return $null
+        }
+
+        try{
+            $doc = [System.IO.File]::ReadAllText($p) | ConvertFrom-Json -AsHashtable
+            $name = ([string]$doc['product_name']).Trim()
+            if (
+                ($name.Length -ge 1) -and
+                ($name.Length -le 40) -and
+                ($name -notmatch '[\x00-\x1f\x7f]')
+            ){
+                return $name
+            }
+        }
+        catch{
+            return $null
+        }
+
+        return $null
+    }
+
+    $defaultName = & $readName $DefaultDir
+    if ($defaultName){
+        $result.ProductName = $defaultName
+    }
+
+    $result.IconPath = & $pick $DefaultDir @('idlifecycle.ico')
+    $result.LogoPngPath = & $pick $DefaultDir @('logo-256.png')
+
+    if (
+        ($OverrideDir) -and
+        (Test-Path -LiteralPath $OverrideDir -PathType Container)
+    ){
+        $reason = $null
+        try{
+            $reason = Get-IDLBrandingUntrustedReason -Path $OverrideDir -OwnerSidResolver $OwnerSidResolver
+        }
+        catch{
+            $reason = "it cannot be checked ($($_.Exception.Message))"
+        }
+
+        if ($reason){
+            $result.Warning = "Branding folder '$OverrideDir' ignored: $reason. Only SYSTEM, Administrators and TrustedInstaller may be able to change it."
+        }
+        else{
+            $name = & $readName $OverrideDir
+            $icon = & $pick $OverrideDir @('tray.ico', 'favicon.ico')
+            $logo = & $pick $OverrideDir @('logo.png')
+            if ($name){
+                $result.ProductName = $name
+                $result.Custom = $true
+            }
+
+            if ($icon){
+                $result.IconPath = $icon
+                $result.Custom = $true
+            }
+
+            if ($logo){
+                $result.LogoPngPath = $logo
+                $result.Custom = $true
+            }
+        }
+    }
+
+    return [pscustomobject]$result
+}
+
+function New-IDLBrandingDirSecurity {
+    # The branding folder's ACL: SYSTEM + Administrators FullControl, Users ReadAndExecute, inheritance off, owner
+    # Administrators.
+    $sec = [System.Security.AccessControl.DirectorySecurity]::new()
+    $sec.SetAccessRuleProtection($true, $false)
+    $sec.SetOwner([System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))
+    $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    foreach ($pair in @(@('S-1-5-18', 'FullControl'), @('S-1-5-32-544', 'FullControl'), @('S-1-5-32-545', 'ReadAndExecute'))){
+        $sec.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+                [System.Security.Principal.SecurityIdentifier]::new($pair[0]),
+                [System.Security.AccessControl.FileSystemRights]$pair[1],
+                $inherit, [System.Security.AccessControl.PropagationFlags]::None,
+                [System.Security.AccessControl.AccessControlType]::Allow))
+    }
+
+    return $sec
+}
+
+function Get-IDLBrandingReadme {
+    # README.txt the installer puts into a new branding folder.
+    return @'
+IDLifecycle branding (optional): replace the product's look with your company's.
+
+Put any of these files in this folder; anything you leave out keeps the default.
+
+  brand.json   {"product_name": "Acme Identity", "accent": "#0a7d5a"}
+               product_name (1-40 characters): top bar, sign-in page, page titles, tray tooltip, window titles.
+               accent (#rrggbb): the web console's accent colour.
+  logo.svg     web console logo (top bar and sign-in page). logo.png is used when there is no logo.svg,
+  logo.png     and by the tray's settings window.
+  favicon.ico  browser tab icon.
+  tray.ico     tray icon and the setup / settings windows (falls back to favicon.ico, then the default).
+
+Each file at most 1 MiB. The files are used only while this folder can be changed by nobody but SYSTEM and
+Administrators (as the installer created it); otherwise the defaults are shown and a warning is logged.
+Restart the IDLifecycle service, and the tray (Exit, then start it again), to see changes.
+'@
+}
+
+function ConvertTo-IDLTrayInfo {
+    <#
+    .SYNOPSIS
+        Validates the tray information document (<InstallDir>\tray.json) and returns it as an ordered hashtable.
+        Throws when a field is missing or not what it must be. The tray only ever opens console_url and starts the
+        helper that sits next to it, so nothing in this file can make it run something else.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Doc
+    )
+
+    $get = { param($n) (($Doc -is [System.Collections.IDictionary]) ? ($Doc[$n]) : ($Doc.$n)) }
+    $info = [ordered]@{}
+    foreach ($n in @('service_name', 'console_url', 'listen', 'log_level', 'data_dir', 'install_dir', 'config_path', 'version', 'execution_policy', 'written_at')){
+        $v = & $get $n
+        # ConvertFrom-Json turns ISO time stamps into DateTime values.
+        $info[$n] = (($v -is [datetime]) ? ($v.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')) : ([string]$v))
+    }
+
+    $info['tls'] = [bool](& $get 'tls')
+    if ($info['service_name'] -notmatch '^[A-Za-z0-9_.\-]{1,80}$'){
+        throw "tray.json: service_name '$($info['service_name'])' is not a service name."
+    }
+
+    if ($info['console_url'] -notmatch '^https?://(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.\-]+)(:\d{1,5})?/?$'){
+        throw "tray.json: console_url '$($info['console_url'])' is not an http(s)://host:port/ address."
+    }
+
+    foreach ($n in @('install_dir', 'config_path', 'data_dir')){
+        if (
+            ([string]::IsNullOrWhiteSpace($info[$n])) -or
+            (-not [System.IO.Path]::IsPathFullyQualified($info[$n]))
+        ){
+            throw "tray.json: $n must be a full path."
+        }
+    }
+
+    if (
+        ($info['log_level']) -and
+        ($info['log_level'] -notin $script:IDLLogLevels)
+    ){
+        throw "tray.json: log_level '$($info['log_level'])' is not a log level."
+    }
+
+    if (-not $info['execution_policy']){
+        $info['execution_policy'] = 'RemoteSigned'
+    }
+
+    if ($info['execution_policy'] -notin $script:IDLExecutionPolicies){
+        throw "tray.json: execution_policy '$($info['execution_policy'])' is not a PowerShell execution policy."
+    }
+
+    return $info
+}
+
+function Read-IDLTrayInfo {
+    # Reads and validates <InstallDir>\tray.json (ConvertTo-IDLTrayInfo); throws when it is missing or invalid.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)){
+        throw "$Path not found (IDLifecycle is not installed here, or was removed)."
+    }
+
+    return (ConvertTo-IDLTrayInfo -Doc ([System.IO.File]::ReadAllText($Path) | ConvertFrom-Json -AsHashtable))
+}
+
+function Write-IDLTrayInfo {
+    # Validates Info and writes it to Path atomically (temp file + move); sets written_at.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Info
+    )
+
+    $Info['written_at'] = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $doc = ConvertTo-IDLTrayInfo -Doc $Info
+    $tmp = "$Path.tmp"
+    [System.IO.File]::WriteAllText($tmp, (ConvertTo-Json -InputObject $doc -Depth 3), [System.Text.UTF8Encoding]::new($false))
+    Move-Item -LiteralPath $tmp -Destination $Path -Force
+}
+
+function Get-IDLConsoleUrl {
+    # The address people open: https when TLS is on; localhost for a loopback listen, this server's DNS name for a
+    # wildcard (0.0.0.0, [::], empty host), else the listen host.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Listen,
+        [bool]$Tls = $false
+    )
+
+    $parts = Split-IDLListen -Value $Listen
+    if ($null -eq $parts){
+        $parts = @{ Host = '127.0.0.1'; Port = 8443 }
+    }
+
+    $h = $parts.Host
+    if (
+        ([string]::IsNullOrEmpty($h)) -or
+        ($h -in @('0.0.0.0', '::'))
+    ){
+        try{
+            $h = [System.Net.Dns]::GetHostEntry('').HostName
+        }
+        catch{
+            $h = $env:COMPUTERNAME
+        }
+    }
+    elseif (Test-IDLLoopbackHost -HostName $h){
+        $h = 'localhost'
+    }
+
+    if ($h -match ':'){
+        $h = "[$h]"
+    }
+
+    return ('{0}://{1}:{2}/' -f ((($Tls)) ? ('https') : ('http')), $h, $parts.Port)
+}
+
+#endregion
+
 #region Service account
 
 function Get-IDLServiceAccountKind {
@@ -3134,5 +3516,7 @@ Export-ModuleMember -Function @(
     'Get-IDLTestHookRefusal',
     'Get-IDLBlockedFiles', 'Unblock-IDLScriptFiles',
     'Split-IDLListen', 'Test-IDLLoopbackHost',
+    'Get-IDLConsoleSettingsProblems', 'Get-IDLBrandingRoot', 'Get-IDLBrandingUntrustedReason', 'Get-IDLBranding', 'New-IDLBrandingDirSecurity',
+    'Get-IDLBrandingReadme', 'ConvertTo-IDLTrayInfo', 'Read-IDLTrayInfo', 'Write-IDLTrayInfo', 'Get-IDLConsoleUrl',
     'ConvertTo-IDLSidSafe', 'Get-IDLServiceAccountKind', 'ConvertTo-IDLServiceAccountName', 'Test-IDLServiceLogonRight', 'Grant-IDLServiceLogonRight'
 )

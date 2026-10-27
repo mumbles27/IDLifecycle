@@ -7,6 +7,7 @@ import {
   h, clear, replaceContent, toast, reportError, formModal, field, inputText, errorBox, loading, pill,
 } from './ui.js';
 import { renderLogin } from './views/login.js';
+import { loadBrand, productName, brandLogo, pageTitle } from './brand.js';
 
 const ROUTES = [
   { name: 'dashboard', label: 'Dashboard', group: 'Operate', min: 'viewer', load: () => import('./views/dashboard.js') },
@@ -156,7 +157,7 @@ function buildShell() {
 
   const topbar = h('header', { class: 'topbar' },
     menuBtn,
-    h('a', { href: '#/dashboard', class: 'brand' }, 'IDLifecycle'),
+    h('a', { href: '#/dashboard', class: 'brand', 'data-test': 'brand' }, brandLogo('brand-logo', { decorative: true }), h('span', { class: 'brand-name' }, productName())),
     modeBadge,
     h('span', { class: 'spacer' }),
     h('span', { class: 'whoami', 'data-test': 'whoami' },
@@ -256,11 +257,11 @@ async function route() {
   }
 
   if (!def) {
-    document.title = 'Not found - IDLifecycle';
+    document.title = pageTitle('Not found');
     replaceContent(main, h('div', { class: 'view' }, h('h1', null, 'Page not found'), h('p', null, `There is no page called "${name}". `, h('a', { href: '#/dashboard' }, 'Back to the dashboard'), '.')));
     return;
   }
-  document.title = `${def.label} - IDLifecycle`;
+  document.title = pageTitle(def.label);
   if (!hasRole(def.min)) {
     replaceContent(main, h('div', { class: 'view', 'data-test': 'forbidden' }, h('h1', null, 'Not allowed'), h('p', null, `Your role (${getUser().role}) cannot open ${def.label}.`)));
     return;
@@ -341,6 +342,8 @@ export async function boot(root) {
   });
   window.addEventListener('hashchange', route);
   replaceContent(root, loading('Starting…'));
+  await loadBrand();
+  document.title = pageTitle();
   try {
     const user = await restoreSession();
     if (user) {
@@ -351,7 +354,7 @@ export async function boot(root) {
     }
   }
   catch (e) {
-    replaceContent(root, h('div', { class: 'login-wrap' }, h('div', { class: 'card' }, h('h1', null, 'IDLifecycle'), errorBox(e),
+    replaceContent(root, h('div', { class: 'login-wrap' }, h('div', { class: 'card' }, h('h1', null, productName()), errorBox(e),
       h('button', { type: 'button', class: 'btn', onclick: () => location.reload() }, 'Retry'))));
     reportError(e);
   }

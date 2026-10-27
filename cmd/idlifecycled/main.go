@@ -57,6 +57,12 @@ Usage:
                                                       also takes its config.json except data_dir, database and
                                                       powershell.scripts_dir. -force replaces a database that has data
   idlifecycled restore  -in FILE -inspect             show a backup's header (no passphrase needed)
+  idlifecycled config get [-config FILE]           print the basic settings as JSON (listen, tls_cert_file, tls_key_file,
+                                                      log_level, data_dir, db_driver, scripts_dir, console_url; never the DSN)
+  idlifecycled config set [-config FILE] [-listen ADDR] [-tls-cert F] [-tls-key F] [-log-level L]
+                                                      change only those fields (an empty -tls-cert or -tls-key turns HTTPS
+                                                      off), checked like at startup; other fields are kept. Restart the
+                                                      service to apply. Exit 2 = invalid, nothing written
   idlifecycled version
 
 Passwords are read from the IDL_PASSWORD environment variable, or prompted for (hidden) on a terminal,
@@ -90,6 +96,8 @@ func realMain(args []string, stdout, stderr io.Writer) int {
 		return cmdBackup(args[1:], stdout, stderr)
 	case "restore":
 		return cmdRestore(args[1:], stdout, stderr)
+	case "config":
+		return cmdConfig(args[1:], stdout, stderr)
 	case "version", "-v", "--version":
 		fmt.Fprintln(stdout, "idlifecycled", app.Version)
 		return 0
