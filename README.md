@@ -5,7 +5,7 @@
 A Windows service that keeps Active Directory in step with your HR system.
 
 **Documentation:** [Install and initial setup guide](docs/SETUP-GUIDE.md) (step by step, for the people installing it) ·
-[Architecture and interface contracts](docs/ARCHITECTURE.md) · [Web UI notes](docs/UI.md) · [Code map]([docs/CODEMAP.html](https://mumbles27.github.io/IDLifecycle/CODEMAP.html)) (a diagram of how the
+[Architecture and interface contracts](docs/ARCHITECTURE.md) · [Web UI notes](docs/UI.md) · [Code map](https://mumbles27.github.io/IDLifecycle/CODEMAP.html) (a diagram of how the
 packages, scripts and web UI connect; open the file in a browser) · this README (reference).
 
 * **Sources**: Paylocity (API), a CSV file, or a SQL database table/view (SQL Server, PostgreSQL, MySQL/MariaDB,
