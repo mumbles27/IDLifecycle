@@ -464,4 +464,19 @@ Describe 'New-IDLUser.ps1' {
         $r.Json.results[0].status | Should Be 'applied'
         $r.LogText | Should Match "server='dc01.stub.test'"
     }
+
+    It 'refuses to put a new account into a protected administrative group: the item fails and nothing is created' {
+        $groups = @(
+            @{ dn = "CN=GG-AllStaff,OU=Groups,$script:Root"; sam = 'GG-AllStaff' },
+            @{ dn = "CN=Ops Admins,OU=Groups,$script:Root"; sam = 'Ops Admins'; adminCount = 1 }
+        )
+        $state = New-StubStateFile -Groups $groups -Ous @("OU=Staff,$script:Root", "OU=Groups,$script:Root")
+        $r = Invoke-IDLScript -Script 'New-IDLUser' -Request (New-Request @(New-Item1 -Groups @('GG-AllStaff', 'Ops Admins'))) -StatePath $state
+
+        $r.ExitCode | Should Be 1
+        $r.Json.results[0].status | Should Be 'failed'
+        $r.Json.results[0].error | Should Match 'refusing to add Ops Admins: it is a protected administrative group \(adminCount=1\)'
+        (Get-StubCalls -Path $state).Count | Should Be 0
+        ($r.StdOut + $r.StdErr + $r.LogText + $r.ReportText) | Should Not Match ([regex]::Escape($secret))
+    }
 }

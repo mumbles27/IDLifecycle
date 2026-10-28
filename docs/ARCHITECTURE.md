@@ -1,12 +1,12 @@
 # IDLifecycle – Architecture & Interface Contracts
 
-A Windows service (Go) that reads people from an HR source (Paylocity API, CSV, ...), computes the
+A Windows service (Go) that reads people from an HR source (any REST/JSON HR API, CSV, SQL, people entered by hand), computes the
 desired Active Directory state from DB-held mapping + role rules, routes changes through an approval
 queue (or auto-applies), and executes them through PowerShell scripts. Admins operate it through an
 embedded web GUI.
 
 ```
- Sources (CSV, Paylocity, SQL)   +------------------ idlifecycled.exe ------------------+
+ Sources (CSV, REST API, SQL)    +------------------ idlifecycled.exe ------------------+
         |  fetch                 |  scheduler -> engine(plan) -> approvals -> executor  |
         v                        |        |           |                      |          |
    normalized records  --------> |      store (SQLite | Postgres | MSSQL | MySQL)       |
@@ -29,16 +29,16 @@ embedded web GUI.
 | `internal/datadir` | Data-directory ACL check (service refuses to start when broad principals can read it) and `lockdown` |
 | `internal/notify` | E-mail notifications: generic SMTP, M365 SMTP AUTH (OAuth2 XOAUTH2), M365 Graph sendMail |
 | `internal/model` | Plain data types shared by store/engine/api (JSON = snake_case) |
-| `internal/sources` | `Source` interface + CSV + Paylocity + SQL (table/view) implementations + registry |
+| `internal/sources` | `Source` interface + registry; CSV, SQL (table/view), manual entry and the generic `rest` HR API connector (auth modes, pagination modes, `Flatten`/`RecordsAt`, `NewHTTPClient` with retries/size cap/same-host redirects); `example_connector_test.go` shows a dedicated connector |
 | `internal/engine` | Template rendering, role resolution, planner (diff), approval policy, executor, run orchestration |
 | `internal/ad` | `Client` interface; `PowerShellClient` (real) and `FakeClient` (tests) |
 | `internal/scheduler` | Interval / daily / cron scheduling, hot-reloaded from settings |
 | `internal/api` | HTTP handlers, auth, sessions, CSRF, audit hooks |
 | `internal/web` | `go:embed` of `static/` SPA; `branding.go` serves `/branding/brand.json`, `/branding/logo`, `/branding/favicon.ico` (no auth) from the trusted override folder `branding_dir` (default `%ProgramData%IDLifecycle-Branding`, checked with `datadir.CheckTrustedFolder`, re-read at most every 60 s, files ≤ 1 MiB and format-checked) or the embedded defaults in `static/branding/`; SVG gets a sandboxing CSP |
-| `scripts/` | PowerShell: `IDLifecycle.Common.psm1`, `Get-IDLSnapshot.ps1`, `Get-IDLSchema.ps1` (field mapper only), `Get-IDLOUs.ps1` (OU picker only), `Test-IDLNames.ps1` (name checks), `Set-IDLLink.ps1` (account links), `New/Set/Disable/Enable/Remove-IDLUser.ps1`, `Install-IDLifecycleService.ps1`; setup: `New-IDLifecycleRelease.ps1`, `Install-IDLifecycle.ps1` (checks the release against `SHA256SUMS`; `-SkipIntegrityCheck` = least safe, no manifest), `Uninstall-IDLifecycle.ps1` and the setup window `Start-IDLifecycleSetup.ps1` (WPF; only collects input and runs the two scripts in a child `pwsh`) |
+| `scripts/` | PowerShell: `IDLifecycle.Common.psm1`, `Get-IDLSnapshot.ps1`, `Get-IDLSchema.ps1` (field mapper only), `Get-IDLOUs.ps1` (OU picker only), `Search-IDLGroups.ps1` (group search only), `Test-IDLNames.ps1` (name checks), `Set-IDLLink.ps1` (account links), `New/Set/Disable/Enable/Remove-IDLUser.ps1`, `Install-IDLifecycleService.ps1`; setup: `New-IDLifecycleRelease.ps1`, `Install-IDLifecycle.ps1` (checks the release against `SHA256SUMS`; `-SkipIntegrityCheck` = least safe, no manifest), `Uninstall-IDLifecycle.ps1` and the setup window `Start-IDLifecycleSetup.ps1` (WPF; only collects input and runs the two scripts in a child `pwsh`) |
 | `Setup.cmd` | The release folder's double-click launcher for the setup window (at the repo and release root; listed in `SHA256SUMS`) |
 | `scripts/branding/` | Default brand files (`logo.svg`, `idlifecycle.ico`, `logo-256.png`, `brand.json`) and `New-IDLBrandAssets.ps1`, which draws them (and the web copies) with System.Drawing |
-| `scripts/Start-IDLifecycleTray.ps1`, `Invoke-IDLTrayAction.ps1` | Tray icon (WinForms NotifyIcon + WPF settings window, runs as the signed-in user, reads `<InstallDir>	ray.json`) and its elevated helper (Start/Stop/Restart/SetConfig; re-checks elevation and that the service is this install's `idlifecycled.exe service`; `config set`; rewrites `tray.json`) |
+| `scripts/Start-IDLifecycleTray.ps1`, `Start-IDLifecycleTrayLauncher.ps1`, `Invoke-IDLTrayAction.ps1` | Tray icon (WinForms NotifyIcon + WPF settings window, runs as the signed-in user, reads `<InstallDir>	ray.json`; promotes its own HKCU NotifyIconSettings entry into the taskbar once per user; the installer starts it at once through Explorer, unelevated), its Windows PowerShell 5.1 launcher (used by the shortcuts when PowerShell 7 is not installed machine-wide: finds the user's pwsh.exe at sign-in) and its elevated helper (Start/Stop/Restart/SetConfig; re-checks elevation and that the service is this install's `idlifecycled.exe service`; `config set`; rewrites `tray.json`) |
 | `tests/powershell` | Stub ActiveDirectory module + Pester tests for the scripts |
 
 ## 2. Key design decisions (ADR summary)
@@ -160,7 +160,7 @@ Each transition writes an `audit_log` row. Approval policy is per type: `setting
    chosen for two records is chosen for neither. `link_decision = guid:X` ⇒ that account only, chosen. Records owning an account under
    discussion get no plan this run (`held_for_link`). Merged records are skipped (`merged`).
 5. For each identity compute desired state: attributes (global mappings overlaid by matching role-rule
-   attribute grants, higher `priority` wins), groups (union of matched rules), OU (`engine.ResolvePlacement`: the
+   attribute grants, higher `priority` wins), groups (union of matched rules plus `lifecycle_groups.active_add`; a disable removes groups by `lifecycle_groups.disabled_remove` - `all_except` the `disabled_keep` and `disabled_add` groups, only `managed` groups, or `none` - and adds `disabled_add`, which an enable removes again), OU (`engine.ResolvePlacement`: the
    identity's `ou_override` while its placement value is unchanged → highest-priority role rule with an OU → `placement.rules`
    for the placement field (exact, then `*` wildcards) → `placement.unmapped`: `hold` = `needs_ou` or `default` = `ad.default_ou`;
    with placement off: role rule OU, else `ad.default_ou`), then diff vs AD (§1 decision 5) → `create|update|disable|enable|delete`.
@@ -248,6 +248,13 @@ Used by the name check, *Set username* and the manual-entry preview. Request `{"
 "exclude":["<objectGUID>"]}`; sam and upn are looked up directory-wide on every object class, mail as `mail` or `proxyAddresses=smtp:<value>` (also
 contacts and groups), cn one level below `ou`; objects in `exclude` never count. Response `{"ok":true,"taken":[{"field","value","dn","objectGuid"}]}`.
 
+### 6.1d `Search-IDLGroups.ps1` (report-only)
+Used only by the group picker (`GET /api/ad/groups`). Request `{"server":"","query":"fin","max":25}`; query 2-64 characters, `*` is the only
+wildcard (every other LDAP special character is escaped and matched literally), matched as `*query*` against cn, sAMAccountName,
+displayName and description across the whole domain. Response `{"ok":true,"groups":[{"dn","sam","name","description",
+"category":"security|distribution","scope":"global|universal|domainlocal","privileged":bool}],"truncated":bool}` sorted by name;
+`privileged` = adminCount=1 or a protected well-known RID (512/518/519/544/548/549/550/551). Never changes anything.
+
 ### 6.2 Action scripts. Common request envelope
 ```json
 {"server":"", "idAttribute":"employeeID", "items":[ {...} ]}
@@ -265,10 +272,10 @@ equals externalId** and fails the item otherwise.
 
 * **`New-IDLUser.ps1`** item: `{"changeId","externalId","ou":"OU=...","candidates":[{"sam","upn","cn","mail"?}],"attributes":{"givenName":"Jane","sn":"Doe","displayName":"Jane Doe","title":"..."},"groups":["GG-AllStaff"],"password":"<generated>","enabled":true,"changePasswordAtLogon":true}`.
   Idempotent: if an account with `idAttribute == externalId` already exists ⇒ `status:"skipped"`, `message:"exists"`, returns its guid/dn/sam/upn (no changes). Otherwise picks the first candidate whose sam AND upn are free (and whose `mail`, when given, is not used as `mail` or `proxyAddresses` by any object)
-  directory-wide (and whose `mail`, when given, is not used as `mail` or `proxyAddresses` by any object) and whose cn is free in the OU; creates the user (attributes applied via `-OtherAttributes`, the `idAttribute` set to `externalId`), then adds groups (an unresolvable group ⇒ item `failed` after creation with message listing it, account kept; result still includes guid/dn).
-* **`Set-IDLUser.ps1`** item: `{"changeId","externalId","objectGuid","set":{"title":"New"},"clear":["telephoneNumber"],"addGroups":["..."],"removeGroups":["..."],"moveTo":"OU=...|"" }`. Uses `-Replace`/`-Clear` with LDAP names. No-ops are `skipped`. Returns the new dn.
-* **`Disable-IDLUser.ps1`** item: `{"changeId","externalId","objectGuid","moveTo":"","removeGroups":[],"description":"Disabled by IDLifecycle 2026-10-16"}`. Idempotent (already disabled ⇒ still applies move/groups/description, status `applied` or `skipped` if nothing to do). The account is **disabled first**, before anything else can fail: an invalid/nonexistent `moveTo` ⇒ `failed` with `message:"failed after: disabled; ..."`. Privileged (adminCount=1 / well-known RID) and ambiguous groups in `removeGroups` are **kept**, never a failure: WARN log, `Skipped` report row, and `message` ends with `kept privileged group(s): <names>` (or `kept ambiguous group(s): ...`).
-* **`Enable-IDLUser.ps1`** item: `{"changeId","externalId","objectGuid","moveTo":"","addGroups":[]}`.
+  directory-wide (and whose `mail`, when given, is not used as `mail` or `proxyAddresses` by any object) and whose cn is free in the OU; creates the user (attributes applied via `-OtherAttributes`, the `idAttribute` set to `externalId`), then adds groups (an unresolvable group ⇒ item `failed` after creation with message listing it, account kept; result still includes guid/dn). A privileged or ambiguous group in `groups` fails the item **before** the account is created (`refusing to add <group>: it is a protected administrative group`).
+* **`Set-IDLUser.ps1`** item: `{"changeId","externalId","objectGuid","set":{"title":"New"},"clear":["telephoneNumber"],"addGroups":["..."],"removeGroups":["..."],"moveTo":"OU=...|"" }`. Uses `-Replace`/`-Clear` with LDAP names. No-ops are `skipped`. Returns the new dn. A privileged or ambiguous group in `addGroups` or `removeGroups` fails the item before any change.
+* **`Disable-IDLUser.ps1`** item: `{"changeId","externalId","objectGuid","moveTo":"","removeGroups":[],"addGroups":[] (applied after the account is disabled),"description":"Disabled by IDLifecycle 2026-10-16"}`. Idempotent (already disabled ⇒ still applies move/groups/description, status `applied` or `skipped` if nothing to do). The account is **disabled first**, before anything else can fail: an invalid/nonexistent `moveTo` ⇒ `failed` with `message:"failed after: disabled; ..."`. Privileged (adminCount=1 / well-known RID) and ambiguous groups in `removeGroups` are **kept**, never a failure: WARN log, `Skipped` report row, and `message` ends with `kept privileged group(s): <names>` (or `kept ambiguous group(s): ...`).
+* **`Enable-IDLUser.ps1`** item: `{"changeId","externalId","objectGuid","moveTo":"","addGroups":[],"removeGroups":[]}` (`removeGroups` = the `disabled_add` groups of a rehire). A privileged or ambiguous `addGroups` entry fails the item before any change. A privileged or ambiguous `removeGroups` entry is kept (WARN log, `Skipped` row, "kept ... group(s)" note), and unknown ones are ignored, so removals never block the enable. Disable `addGroups` likewise reports privileged, ambiguous and unknown groups but never fails.
 * **`Set-IDLLink.ps1`** item: `{"changeId","objectGuid","externalId","expectedExternalId","rename":{"sam","upn","cn","mail"}|null}`. Finds the account by GUID;
   refuses (`failed`) when its `idAttribute` is not `expectedExternalId` (`""` = must be empty), when another object already has `externalId`, when
   the account is privileged (adminCount=1 or a protected group), or when a new name is taken by another object. Sets `idAttribute`, then renames:
@@ -289,22 +296,24 @@ Lists: `{"items":[...],"total":N}` with `?limit=&offset=` (default 50, max 500).
 | `GET /api/auth/oidc/start` · `GET /api/auth/oidc/callback` | none (browser navigation) | 302 to Entra ID / HTML page; errors are HTML pages, refusals are audited as `auth.login_failed` with `method:"oidc"` |
 | `POST /api/auth/oidc/test` `{auth:{...}}` | admin | unsaved settings: discovery for the tenant, then a client-credentials token request (validates client ID + secret, needs no API permission) → `{ok,error}`; stores nothing |
 | `GET /api/status` | viewer | `{version,db_driver,mode:"live|dry_run",scheduler:{enabled,next_run},running_run,pending_changes,last_run}` |
-| `GET /api/source-types` | viewer | `[{type,label,fields:[{name,label,type:"string|password|int|bool|text",required,default,help}]}]` |
+| `GET /api/source-types` | viewer | `[{type,label,fields:[{name,label,type:"string|password|int|bool|text|select",required,default,help,options:[..] (select),show_if:{field,values} (shown only when that field has one of the values)}]}]`; `rest` = the generic HR API connector, `manual` = people entered in the console |
 | `GET/POST /api/sources`, `GET/PUT/DELETE /api/sources/{id}` | admin (GET viewer) | source: `{id,name,type,enabled,options,config,last_sync_at,last_status,last_error}`; `options:{external_id_field,status_field,terminated_values:[],missing_means_terminated,missing_grace_runs}`; secrets returned as `"********"`, sending `"********"` back keeps stored value |
-| `POST /api/sources/{id}/test` | admin | fetches; → `{ok,count,attributes:[names],sample:[{...}] (first 5),error}` |
+| `POST /api/sources/{id}/test` · `POST /api/sources/test` | admin | the second tests unsaved settings (same body as a save, optional `id` whose stored secrets fill masked fields; nothing stored; audited `source.test`);  fetches; → `{ok,count,attributes:[names],sample:[{...}] (first 5),error}` |
 | `GET/POST /api/mappings`, `GET/PUT/DELETE /api/mappings/{id}` | admin (GET viewer) | `{id,name,target_attr,template,mode:"create_only|sync|immutable",on_empty:"skip|clear",value_type:"string|user_ref",enabled,sort_order,description}` |
 | `POST /api/templates/preview` | admin | `{template, record:{...}, kind?:"password"}` → `{ok,output,error}` (+ `check`: why AD would refuse a password, `"` = fine); the record is typed by the admin, never a real identity |
 | `POST /api/mapper/sources/{id}/fields` | admin | fetches the source once → `{ok,error,count,id_field,status_field,fields:[{name,filled,samples:[≤3, ≤60 chars],used_by:[ref],role:"external_id|status"}],references:[{kind:"mapping|role",id,name,target_attr,enabled,fields,dynamic,error,missing:[],suggestions:{missing:"OtherCase"}}]}` (audited as `source.fields`) |
 | `GET /api/mapper/references` | admin | `{references:[{kind,id,name,target_attr,enabled,fields,dynamic,error}]}` — the source fields each mapping / role rule reads (`engine.TemplateFields`: `.X`, `$.X`, `index . "k"`; `dynamic` when a key is computed), no source fetch |
 | `GET /api/mapper/ad-attributes?refresh=1` | admin | `{source:"live|builtin",live_error,fetched_at,attributes:[{name,description,syntax,single_valued,mappable,reason,hint}]}`; live schema cached 30 min per `ad.server` |
-| `GET/POST /api/roles`, `GET/PUT/DELETE /api/roles/{id}` | admin (GET viewer) | `{id,name,description,enabled,priority,match:"all|any",conditions:[{attr,op,value}],grants:{groups:[],ou,attributes:[{target_attr,template,mode,on_empty,value_type}]}}`, ops: `eq ne in contains starts_with regex exists` |
-| `POST /api/roles/preview` | admin | `{record:{...}}` → `{matched:[{id,name}],groups:[],ou,attributes:{attr:value}}` |
+| `GET/POST /api/roles`, `GET/PUT/DELETE /api/roles/{id}` | admin (GET viewer) | `{id,name,description,enabled,priority,match:"all|any",conditions:[{attr,op,value,conditions?}],grants:{groups:[],ou,attributes:[{target_attr,template,mode,on_empty,value_type}]}}`; ops: `eq ne in not_in contains not_contains starts_with ends_with regex not_regex exists empty gt gte lt lte older_than_days newer_than_days template` (attr `*`, value = a template that renders true/yes/1) and the groups `all_of` / `any_of` (children in `conditions`, depth <= 3, <= 50 conditions per rule); validation errors name the path (`conditions[1].conditions[0].value`) |
+| `POST /api/roles/preview` | admin | `{record:{...}, rule?:{...unsaved rule...}}` → also `explain:[{path,attr,op,value,actual,matched}]` and `rule_matched` for the unsaved rule; otherwise → `{matched:[{id,name}],groups:[],ou,attributes:{attr:value}}` |
 | `GET/PUT /api/settings` | admin (GET viewer) | see §8; notification secrets are returned as `"********"` (sending it back keeps the stored value) |
 | `POST /api/notifications/test` `{notifications:{...}}` | admin | sends a test message with the unsaved form values (masked secrets fall back to stored ones) → `{ok,error}` |
 | `GET /api/changes?status=&type=&q=` · `GET /api/changes/{id}` | viewer | change: `{id,run_id,identity_id,external_id,display,type,status,payload,summary:[strings],created_at,decided_by,decided_at,decision_note,applied_at,error,attempts}` |
 | `POST /api/changes/{id}/approve|reject|retry` `{note}` | approver | reject requires note |
 | `POST /api/changes/bulk` `{ids:[],action:"approve|reject",note}` | approver | → `{results:[{id,ok,error}]}` |
 | `POST /api/changes/{id}/ou` `{ou,add_rule}` | approver (`add_rule`: admin) | pending/simulated create, update or enable: sets the OU / move target, clears `needs_ou`, remembers it for the person (`SetIdentityOU`); `add_rule` also adds the placement rule for the person's value; audited `change.set_ou` |
+| `GET /api/ad/groups?q=&max=` | admin | live group search (`Search-IDLGroups.ps1`): q 2-64 characters, max 1-100 (default 25) → `{groups:[{dn,sam,name,description,category,scope,privileged}],truncated}`; when AD cannot be asked: 200 with `error` and no groups |
+| `POST /api/preview/impact` | admin | impact preview: body `{roles?,mappings?,settings? (partial, read over the saved settings; AD scope fields are kept as saved),refresh,q,only_changed (default true),type,offset,limit (<= 500)}` → `{generated_at,snapshot_at,people,names_checked:false,notes,summary:{changed_people,baseline,proposed,groups_added:[{group,people}],groups_removed,attributes:[{attr,people}]},items:[{identity_id,external_id,display,ad_sam,state,difference:"new|changed|gone|same",baseline,proposed,lines:[{op:"+|-",text}]}],total}`; plans everyone with the saved and the proposed configuration on one AD snapshot (reused <= 15 min, `refresh` forces one), writes nothing, never checks names; 409 `busy` (another preview) or `running` (a sync); audited `preview.impact` |
 | `GET /api/ad/ous?refresh=1` | approver | `{ous:[{dn,name}],read_at,error}` below `ad.search_bases`; cached 30 min |
 | `GET /api/placement/values?field=` | viewer | `{field,values:[{value,people,ou}]}` over active identities, unmapped first |
 | `GET /api/changes/{id}/names` | approver | pending create: `{current:Candidate,conflicts:[{field,value,dn,with}],suggestions:[{mode:"number|random|template",candidate}]}` (≤ 6, checked free) |
@@ -338,6 +347,7 @@ Static SPA served at `/` (any non-`/api` path ⇒ `index.html`).
  "naming":{"sam_template":"{{ first .FirstName 1 | lower }}{{ .LastName | lower }}","upn_template":"{{ .FirstName | lower }}.{{ .LastName | lower }}","cn_template":"{{ .FirstName }} {{ .LastName }}","max_candidates":9,"mail_template":"","mail_domain":"",
    "conflict_mode":"manual|number|random|template","conflict_random_digits":3,"conflict_suffix_template":"{{ last .EmployeeID 4 }}"},
  "new_user":{"password_mode":"random|template","password_length":20,"password_template":"{{ upper (first .LastName 1) }}{{ last .EmployeeID 4 }}!{{ random 6 }}","change_password_at_logon":true,"enabled":true},
+ "lifecycle_groups":{"active_add":["ALLUSERS"],"disabled_add":["Disabled Users"],"disabled_remove":"all_except|managed|none","disabled_keep":["Mailbox-Retention"]},
  "placement":{"enabled":false,"field":"Department","unmapped":"hold|default","move_on_change":true,"rules":[{"match":"Finance","ou":"OU=Finance,OU=Staff,DC=..."},{"match":"Sales*","ou":"..."}]},
  "backup":{"enabled":false,"interval_hours":24,"keep":14,"folder":"","passphrase":"(secret)"},
  "correlation":{"enabled":false,"rules":[{"field":"FirstName","ad_attr":"givenName","compare":"exact|ci|name","required":true},{"field":"LastName","ad_attr":"sn","compare":"name","required":true},{"field":"Department","ad_attr":"department","compare":"ci","required":false}],
@@ -377,7 +387,7 @@ validation (exit 2, nothing written, when invalid; empty `-tls-cert`/`-tls-key` 
 |---|---|
 | store | table tests on in-memory SQLite; Postgres/MSSQL/MySQL/Db2 suites run when `IDL_TEST_POSTGRES_DSN` / `IDL_TEST_MSSQL_DSN` / `IDL_TEST_MYSQL_DSN` / `IDL_TEST_DB2_DSN` are set (same shared suite); server-less Db2 dialect tests and a statement-recording fake driver audit every query for Db2 rules |
 | templates/roles/mappings/planner | pure unit tests |
-| sources | CSV fixtures; Paylocity against `httptest` server; SQL against a temp SQLite DB (plus query-validation table) |
+| sources | CSV fixtures; the REST connector against `httptest` servers (every auth and pagination mode, retries, refused cross-host links); SQL against a temp SQLite DB (plus query-validation table) |
 | engine | end-to-end with SQLite + `ad.FakeClient` (create/update/disable/delete flows, approvals, dry-run, guards, crash recovery) |
 | api | `httptest` server: auth, CSRF, RBAC, CRUD, approval flow |
 | PowerShell | Pester tests run the real scripts in a child `pwsh` with `PSModulePath` pointing **only** at `tests/powershell/StubAD` (in-memory-JSON fake `ActiveDirectory` module), so tests can never reach a real domain; Go integration test drives `PowerShellClient` through the same stub |
@@ -388,7 +398,7 @@ validation (exit 2, nothing written, when invalid; empty `-tls-cert`/`-tls-key` 
 * Single-valued string attributes only (`proxyAddresses` is only touched by a link rename). Manager via `value_type:"user_ref"`.
 * Correlation compares whole normalized values (no similarity scores, nicknames or initials); a merged record cannot be un-merged in the console.
 * Single service instance (no HA/leader election).
-* Paylocity field names were written from public API docs and are configurable; validate against your tenant.
+* The generic REST connector was tested against simulated APIs only; check a real HR API with "Test these settings" first.
 
 ## SQL source (`internal/sources/sql.go`)
 For customers whose own job writes HR data into a database table/view. Config: `driver` (`sqlserver|postgres|mysql|sqlite|db2|odbc`;

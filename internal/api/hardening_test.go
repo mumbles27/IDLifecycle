@@ -54,14 +54,14 @@ func TestChangingEndpointRequiresSecretReentry(t *testing.T) {
 	e := newTenv(t)
 	admin := e.login("admin")
 	var s model.Source
-	body := map[string]any{"name": "p", "type": "paylocity", "enabled": true,
+	body := map[string]any{"name": "p", "type": "rest", "enabled": true,
 		"options": map[string]any{"external_id_field": "employeeId"},
-		"config":  map[string]any{"base_url": "https://api.paylocity.com", "company_id": "C", "client_id": "i", "client_secret": "s3cret"}}
+		"config":  map[string]any{"base_url": "https://hr.example.com", "auth": "bearer", "bearer_token": "s3cret"}}
 	want(t, "create", admin.do("POST", "/api/sources", body, &s), 201)
 
 	s.Config["base_url"] = "https://attacker.example"
 	want(t, "redirect with masked secret refused", admin.do("PUT", "/api/sources/"+s.ID, s, nil), 400)
-	s.Config["client_secret"] = "new-secret"
+	s.Config["bearer_token"] = "new-secret"
 	want(t, "redirect with fresh secret allowed", admin.do("PUT", "/api/sources/"+s.ID, s, nil), 200)
 }
 

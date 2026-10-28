@@ -417,6 +417,15 @@ async function scenarioSource() {
   if (!$$('option', typeSel).some((o) => o.value === 'csv')) {
     throw new Error('source type "csv" is not offered by /api/source-types');
   }
+  // The HR system API form: select fields, and fields that only show for the chosen authentication.
+  if ($$('option', typeSel).some((o) => o.value === 'rest')) {
+    setValue(typeSel, 'rest');
+    const authSel = await waitFor(() => $('[data-test="source-config"] select[data-field="auth"]'), 'the authentication select');
+    const keyField = () => $('[data-test="source-config"] [data-field="api_key"]');
+    await waitFor(() => keyField() && keyField().closest('.field').hidden, 'the API key field hidden while auth is none');
+    setValue(authSel, 'api_key');
+    await waitFor(() => !keyField().closest('.field').hidden, 'the API key field shown for api_key authentication');
+  }
   setValue(typeSel, 'csv');
   setValue($('[data-test="source-name"]'), name);
   await waitFor(() => $$('[data-test="source-config"] [data-field]').length > 0, 'generated config fields');
@@ -434,7 +443,15 @@ async function scenarioSource() {
       setValue(el, 'selftest');
     }
   }
-  setValue($('[data-test="opt-extid"]'), 'EmployeeId');
+  setValue($('[data-test="opt-extid"]'), 'EmployeeID');
+  // Test the settings before saving them.
+  $('[data-test="source-test-form"]').click();
+  const result = await waitFor(() => $('[data-test="test-result"]'), 'the test result of the unsaved settings');
+  if (!text(result).includes('Connection OK')) {
+    throw new Error(`testing the unsaved settings failed: ${text(result)}`);
+  }
+  $('[data-test="test-close"]').click();
+  await waitFor(() => !$('[data-test="test-result"]'), 'the test result to close');
   await submitModal('source editor');
   const row = await waitFor(() => rowWith(name), 'the new source in the table');
   if (!text(row).toLowerCase().includes('csv')) {
@@ -586,7 +603,7 @@ async function scenarioViewer() {
     if ($('.sidebar a[data-route="users"]')) {
       throw new Error('viewer can see the Users navigation entry');
     }
-    const views = ['dashboard', 'approvals', 'runs', 'identities', 'manual', 'audit', 'mappings', 'roles', 'placement', 'matching', 'sources', 'settings', 'tables'];
+    const views = ['dashboard', 'approvals', 'runs', 'identities', 'manual', 'audit', 'mappings', 'roles', 'lifecycle', 'placement', 'matching', 'sources', 'settings', 'tables'];
     for (const v of views) {
       await go(`#/${v}`, v);
       const mutating = $$('[data-mutating]');
@@ -605,6 +622,13 @@ async function scenarioViewer() {
         }
       }
     }
+    if ($('.sidebar a[data-route="preview"]')) {
+      throw new Error('viewer can see the Preview changes navigation entry');
+    }
+    location.hash = '#/preview';
+    await waitFor(() => $('[data-test="forbidden"]'), 'the "not allowed" page for #/preview');
+    location.hash = '#/dashboard';
+    await waitFor(() => !$('[data-test="forbidden"]'), 'leaving the "not allowed" page');
     location.hash = '#/users';
     await waitFor(() => $('[data-test="forbidden"]'), 'the "not allowed" page for #/users');
   }
@@ -624,6 +648,211 @@ async function scenarioViewer() {
   }
 }
 
+function key(el, k) {
+  el.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true }));
+}
+
+// Role editor: live AD group search (GG-All is seeded in the fake AD of the real E2E), a nested condition group, the
+// explain view of "Test this rule", the impact preview of the unsaved rule, and the nested rule saved and reloaded.
+async function scenarioRoleRule() {
+  const name = `selftest-role-${rand}`;
+  await go('#/roles', 'roles');
+  $('[data-test="new-role"]').click();
+  const modal = await waitFor(() => topModal(), 'the role editor');
+  setValue($('[data-test="role-name"]', modal), name);
+
+  // Group picker: type, arrow down, Enter -> chip.
+  const input = $('[data-test="role-groups-input"]', modal);
+  input.focus();
+  setValue(input, 'GG-Al');
+  const option = await waitFor(() => $$('[data-test="role-groups-option"]', modal).find((o) => text($('.gp-opt-name', o)) === 'GG-All'), 'GG-All in the AD group search results');
+  if (input.getAttribute('aria-expanded') !== 'true') {
+    throw new Error('the group combobox does not report aria-expanded=true with results open');
+  }
+  const wanted = $$('[data-test="role-groups-option"]', modal).indexOf(option);
+  for (let i = 0; i <= wanted; i += 1) {
+    key(input, 'ArrowDown');
+  }
+  if (input.getAttribute('aria-activedescendant') !== option.id) {
+    throw new Error('arrow keys did not move the active option to GG-All');
+  }
+  key(input, 'Enter');
+  // The fake AD of the real E2E reports sAMAccountNames in lower case.
+  await waitFor(() => $$('[data-test="role-groups-chip"]', modal).some((c) => text(c).toLowerCase().startsWith('gg-all')), 'the GG-All chip');
+  if (!topModal() || topModal() !== modal) {
+    throw new Error('Enter in the group picker closed or submitted the editor');
+  }
+  // Escape closes the result list, not the dialog.
+  setValue(input, 'GG-Al');
+  await waitFor(() => input.getAttribute('aria-expanded') === 'true', 'the result list to reopen');
+  key(input, 'Escape');
+  if (input.getAttribute('aria-expanded') !== 'false' || topModal() !== modal) {
+    throw new Error('Escape did not just close the group result list');
+  }
+  // Free text: a group AD search does not return can still be added.
+  setValue(input, `GG-Selftest-${rand}`);
+  key(input, 'Enter');
+  await waitFor(() => $$('[data-test="role-groups-chip"]', modal).length === 2, 'the typed group chip');
+
+  // Conditions: EmployeeId has a value AND (Department = Finance OR (Status is not T)).
+  $('[data-test="add-condition"]', modal).click();
+  setValue($$('[data-test="cond-attr"]', modal)[0], 'EmployeeId');
+  setValue($$('[data-test="cond-op"]', modal)[0], 'exists');
+  $('[data-test="add-group"]', modal).click();
+  // The builder redraws on structural changes, so the group is looked up again each time.
+  const group = () => $('[data-test="cond-group"]', modal);
+  await waitFor(group, 'a condition group');
+  setValue($('[data-test="cond-attr"]', group()), 'Department');
+  setValue($('[data-test="cond-value"]', group()), 'Finance');
+  $('[data-test="add-condition-nested"]', group()).click();
+  await waitFor(() => $$('[data-test="cond-attr"]', group()).length === 2, 'a second condition in the group');
+  setValue($$('[data-test="cond-attr"]', group())[1], 'Status');
+  setValue($$('[data-test="cond-op"]', group())[1], 'ne');
+  setValue($$('[data-test="cond-value"]', group())[1], 'T');
+
+  // Test this rule: explain rows with text results.
+  setValue($$('[data-test="sample-json"]', modal)[0], JSON.stringify({ EmployeeId: 'E1', Department: 'Sales', Status: 'A' }));
+  $('[data-test="rule-test-run"]', modal).click();
+  await waitFor(() => {
+    failOnErrorToast();
+    return $$('[data-test="explain-result"]', modal).length >= 4;
+  }, 'the explain table');
+  const results = $$('[data-test="explain-result"]', modal).map(text);
+  if (!results.some((r) => r.includes('does not match')) || !results.some((r) => /✓ ?matches/.test(r))) {
+    throw new Error(`explain results do not say which conditions matched: ${results.join(' | ')}`);
+  }
+  if (!text($('[data-test="rule-verdict"]', modal)).includes('MATCHES')) {
+    throw new Error(`the rule should match the sample record: ${text($('[data-test="rule-verdict"]', modal))}`);
+  }
+
+  // Preview impact of the unsaved rule (stacked dialog).
+  $('[data-test="role-impact"]', modal).click();
+  const impactModal = await waitFor(() => (topModal() !== modal ? topModal() : null), 'the impact preview dialog');
+  await waitFor(() => text($('[data-test="impact-count"]', impactModal)) || $('.notice-warn', impactModal), 'the impact preview to load', 20000);
+  failOnErrorToast();
+  if ($('main .notice-error', impactModal) || $('.notice-error', impactModal)) {
+    throw new Error(`impact preview failed: ${text($('.notice-error', impactModal))}`);
+  }
+  // Whoever the new rule changes gets its groups.
+  const changed = Number(text($('[data-test="impact-changed"] strong', impactModal)) || 0);
+  if (changed > 0 && text($('[data-test="impact-groups-added"]', impactModal)) === 'none') {
+    throw new Error('the impact preview of the new rule changes people but adds no group');
+  }
+  byText('button', 'Close', impactModal).click();
+  await waitFor(() => topModal() === modal, 'the impact dialog to close');
+
+  await submitModal('role editor');
+  const list = await api.get('/roles', { limit: 500 });
+  const saved = listItems(list).find((r) => r.name === name);
+  if (!saved) {
+    throw new Error('the new role was not saved');
+  }
+  try {
+    const g = (saved.conditions || [])[1];
+    if (!g || g.op !== 'any_of' || !Array.isArray(g.conditions) || g.conditions.length !== 2 || g.conditions[1].attr !== 'Status') {
+      throw new Error(`nested condition not stored as sent: ${JSON.stringify(saved.conditions)}`);
+    }
+    if (!(saved.grants.groups || []).some((g) => g.toLowerCase() === 'gg-all')) {
+      throw new Error(`picked group not stored: ${JSON.stringify(saved.grants.groups)}`);
+    }
+    // Reload and reopen: the group and its conditions come back.
+    await go('#/dashboard', 'dashboard');
+    await go('#/roles', 'roles');
+    const row = await waitFor(() => rowWith(name), 'the new role in the table');
+    if (!text(row).includes('OR')) {
+      throw new Error(`the list does not summarize the nested group: ${text(row)}`);
+    }
+    $('[data-test="edit-role"]', row).click();
+    const again = await waitFor(() => topModal(), 'the role editor again');
+    const g2 = await waitFor(() => $('[data-test="cond-group"]', again), 'the condition group after reload');
+    if ($$('[data-test="cond-attr"]', g2).map((el) => el.value).join() !== 'Department,Status') {
+      throw new Error('the nested conditions did not reload');
+    }
+    if ($$('[data-test="role-groups-chip"]', again).length !== 2) {
+      throw new Error('the group chips did not reload');
+    }
+    byText('button', 'Cancel', again).click();
+    await waitFor(() => !topModal(), 'the editor to close');
+  }
+  finally {
+    await api.del(`/roles/${encodeURIComponent(saved.id)}`);
+  }
+}
+
+// Lifecycle groups: add a group for disabled accounts (typed, no AD search needed), switch the removal mode, save,
+// check what the server stored, then put the original block back.
+async function scenarioLifecycle() {
+  const before = await api.get('/settings');
+  const original = JSON.parse(JSON.stringify(before.lifecycle_groups || {}));
+  const group = `GG-Selftest-Disabled-${rand}`;
+  await go('#/lifecycle', 'lifecycle');
+  const input = await waitFor(() => $('[data-test="lifecycle-disabled-input"]'), 'the disabled-accounts group picker');
+  setValue(input, group);
+  key(input, 'Enter');
+  await waitFor(() => $$('[data-test="lifecycle-disabled-chip"]').some((c) => text(c).startsWith(group)), 'the typed group chip');
+  $('[data-test="lifecycle-remove-managed"]').click();
+  await waitFor(() => !$('[data-test="lifecycle-keep-input"]'), 'the keep list to hide in "managed" mode');
+  $('[data-test="lifecycle-save"]').click();
+  await waitFor(() => {
+    failOnErrorToast();
+    return byText('.toast', 'Lifecycle groups saved');
+  }, 'the "Lifecycle groups saved" toast');
+  $$('.toast').forEach((t) => t.remove());
+  try {
+    const stored = (await api.get('/settings')).lifecycle_groups || {};
+    if (!(stored.disabled_add || []).includes(group) || stored.disabled_remove !== 'managed') {
+      throw new Error(`server stored ${JSON.stringify(stored)}`);
+    }
+    await go('#/dashboard', 'dashboard');
+    await go('#/lifecycle', 'lifecycle');
+    await waitFor(() => $$('[data-test="lifecycle-disabled-chip"]').some((c) => text(c).startsWith(group)), 'the saved group after reload');
+    if (!$('[data-test="lifecycle-remove-managed"]').checked) {
+      throw new Error('the removal mode did not reload');
+    }
+  }
+  finally {
+    const doc = await api.get('/settings');
+    doc.lifecycle_groups = original;
+    await api.put('/settings', doc);
+  }
+  await go('#/dashboard', 'dashboard');
+}
+
+// Preview changes page: search narrows the list to one person and a row expands to its +/- lines.
+async function scenarioImpact() {
+  await go('#/preview', 'preview');
+  const count = await waitFor(() => {
+    const c = $('[data-test="impact-count"]');
+    return c && text(c) ? c : null;
+  }, 'the impact preview to load', 20000);
+  failOnErrorToast();
+  const rows = () => $$('[data-test="impact-results"] tbody tr:not(.detail-row)');
+  if (rows().length === 0) {
+    log('  (nobody in the preview - search and expand not checked)');
+    return;
+  }
+  const first = text($('strong', rows()[0]));
+  const totalBefore = Number((text(count).match(/^\d+/) || ['0'])[0]);
+  setValue($('[data-test="impact-search"]'), first);
+  await waitFor(() => text(count).includes(`"${first}"`) && rows().length > 0 && rows().every((r) => text(r).includes(first)), 'the search to narrow the list');
+  const totalAfter = Number((text(count).match(/^\d+/) || ['0'])[0]);
+  if (totalAfter > totalBefore || totalAfter < 1) {
+    throw new Error(`search did not narrow the list (${totalBefore} -> ${totalAfter})`);
+  }
+  $('[data-test="row-toggle"]', rows()[0]).click();
+  const detail = await waitFor(() => {
+    const d = rows()[0].nextElementSibling;
+    return d && d.classList.contains('detail-row') && !d.hidden ? d : null;
+  }, 'the row details');
+  const lines = $$('[data-test="impact-diff"] li', detail);
+  if (lines.length > 0 && !lines.every((l) => /^(Added|Removed): /.test(text($('.sr-only', l))) && /^[+−]$/.test(text($('.diff-mark', l))))) {
+    throw new Error('diff lines lack their text markers');
+  }
+  setValue($('[data-test="impact-search"]'), `no-such-person-${rand}`);
+  await waitFor(() => text(count).startsWith('0 '), 'an empty result for an unknown name');
+  await go('#/dashboard', 'dashboard');
+}
+
 // ---------------------------------------------------------------- runner
 
 const STEPS = [
@@ -638,6 +867,9 @@ const STEPS = [
   ['sign-in options (Entra ID button, break-glass)', scenarioSignInOptions],
   ['history search', scenarioHistory],
   ['OU placement page', scenarioPlacement],
+  ['role rule: group search, nested conditions, explain, impact', scenarioRoleRule],
+  ['lifecycle groups save', scenarioLifecycle],
+  ['impact preview: search and expand', scenarioImpact],
   ['set a username on a name conflict', scenarioNeedsName],
   ['choose the account for a link', scenarioLinkChoose],
   ['add a person by hand (preview + create)', scenarioManualPerson],

@@ -375,7 +375,7 @@ try{
             }
 
             # Ambiguous or privileged groups fail the item BEFORE the account is created.
-            $groupInfo = Get-IDLGroupDns -Identities $p.Groups -GroupMap $groupMap
+            $groupInfo = Get-IDLGroupDns -Identities $p.Groups -GroupMap $groupMap -Adding
 
             # Pick the first free candidate.
             $chosen = $null

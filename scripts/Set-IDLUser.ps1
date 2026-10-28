@@ -200,7 +200,7 @@ try{
             }
 
             # Throws (item fails, nothing changed) for ambiguous or privileged groups.
-            $addInfo = Get-IDLGroupDns -Identities (Get-IDLStringList -Value (Get-IDLField -Object $item -Name 'addGroups')) -GroupMap $groupMap
+            $addInfo = Get-IDLGroupDns -Identities (Get-IDLStringList -Value (Get-IDLField -Object $item -Name 'addGroups')) -GroupMap $groupMap -Adding
             $removeInfo = Get-IDLGroupDns -Identities (Get-IDLStringList -Value (Get-IDLField -Object $item -Name 'removeGroups')) -GroupMap $groupMap
             if ($addInfo.Missing.Count -gt 0){
                 throw "Group(s) not found: $($addInfo.Missing -join ', ')"

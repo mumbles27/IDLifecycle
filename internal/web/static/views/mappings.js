@@ -10,6 +10,7 @@ import {
   VALUE_TYPE_OPTIONS, VALUE_TYPE_INFO,
 } from '../components.js';
 import { fieldMapper, templateFor } from './mapper.js';
+import { openImpactModal } from './impact.js';
 
 export async function render(root, ctx) {
   const isAdmin = ctx.can('admin');
@@ -38,6 +39,8 @@ export async function render(root, ctx) {
         Object.keys(MODE_INFO).flatMap((k) => [h('dt', null, pill(k)), h('dd', null, MODE_INFO[k])])));
   }
 
+  let savedMappings = [];
+
   async function load() {
     let items;
     try {
@@ -47,6 +50,7 @@ export async function render(root, ctx) {
       replaceContent(listEl, errorBox(e));
       return;
     }
+    savedMappings = items;
     items.sort((a, b) => (a.sort_order - b.sort_order) || String(a.name).localeCompare(String(b.name)));
     const columns = [
       { label: 'Order', key: 'sort_order', className: 'num' },
@@ -196,24 +200,38 @@ export async function render(root, ctx) {
         field('Description', inputArea(model, 'description', { rows: '2' }))),
       h('div', { class: 'editor-side' }, preview.el));
 
+    const mappingBody = () => ({
+      name: model.name.trim(),
+      target_attr: model.target_attr.trim(),
+      template: model.template,
+      mode: model.mode,
+      on_empty: model.on_empty,
+      value_type: model.value_type,
+      enabled: Boolean(model.enabled),
+      sort_order: Number(model.sort_order) || 0,
+      description: model.description || '',
+    });
+    const impactBtn = h('button', {
+      type: 'button',
+      class: 'btn',
+      'data-test': 'mapping-impact',
+      onclick: () => {
+        const proposed = existing ? { ...existing, ...mappingBody() } : mappingBody();
+        const mappings = savedMappings.filter((m) => !existing || m.id !== existing.id);
+        mappings.push(proposed);
+        openImpactModal({ title: `Preview impact: ${proposed.name || 'new mapping'}`, proposal: { mappings } });
+      },
+    }, 'Preview impact');
+
     formModal({
       title: existing ? `Edit mapping: ${existing.name}` : 'New mapping',
+      extraFooter: impactBtn,
       content: [existing && existing.target_attr && String(existing.target_attr).toLowerCase() === 'employeeid'
         ? notice('warn', 'employeeID is the link key between the source and AD and is always enforced as immutable.') : null, form],
       wide: true,
       submitLabel: existing ? 'Save mapping' : 'Create mapping',
       onSubmit: async () => {
-        const body = {
-          name: model.name.trim(),
-          target_attr: model.target_attr.trim(),
-          template: model.template,
-          mode: model.mode,
-          on_empty: model.on_empty,
-          value_type: model.value_type,
-          enabled: Boolean(model.enabled),
-          sort_order: Number(model.sort_order) || 0,
-          description: model.description || '',
-        };
+        const body = mappingBody();
         if (existing) {
           await api.put(`/mappings/${encodeURIComponent(existing.id)}`, { ...existing, ...body });
         }

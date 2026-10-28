@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -37,6 +38,10 @@ type Engine struct {
 	execMu       sync.Mutex
 	kick         chan struct{}
 	lastDeferred int // deletes held back by max_deletes_per_day at the last executor pass (guarded by execMu)
+
+	snapMu     sync.Mutex
+	snapCache  *cachedSnapshot // the last AD snapshot (sync or impact preview), reused by previews
+	previewing atomic.Bool
 
 	runCtx    context.Context
 	runCancel context.CancelFunc
@@ -231,142 +236,26 @@ func (e *Engine) sync(ctx context.Context, run *model.Run, notes *runNotes) erro
 	}
 	cnt["identities"] = len(idents)
 
-	// 2. AD snapshot.
-	props := attributeNames(mappings, rules)
-	if settings.Correlate.Enabled {
-		props = withCorrelationAttrs(props, settings.Correlate.Rules)
-	}
-	groupIDs := AllRuleGroups(rules)
-	snap, err := e.AD.Snapshot(ctx, ad.SnapshotRequest{
-		Server: settings.AD.Server, SearchBases: snapshotBases(settings.AD), IDAttribute: settings.AD.IDAttribute,
-		Properties: props, Groups: groupIDs, IncludeUnlinked: settings.Correlate.Enabled,
-	})
+	// 2. AD snapshot (kept for the impact preview).
+	cfg := planConfig{Settings: settings, Mappings: mappings, Rules: rules}
+	req := snapshotRequestFor(cfg)
+	snap, err := e.AD.Snapshot(ctx, req)
 	if err != nil {
 		return fmt.Errorf("AD snapshot: %w", err)
 	}
+	e.cacheSnapshot(req, snap)
 
-	byExt := map[string][]*ad.User{}
-	for i := range snap.Users {
-		u := &snap.Users[i]
-		if u.ExternalID == "" {
-			continue // not linked to anybody (only returned for correlation)
-		}
-		byExt[u.ExternalID] = append(byExt[u.ExternalID], u)
+	// 3. correlate, link + plan (pure), then persist what changed on the identities.
+	pass, err := planEveryone(cfg, snap, idents, e.Now(), cnt, func(msg string, args ...any) { e.Log.Warn(msg, args...) })
+	if err != nil {
+		return err
 	}
-	if len(byExt) == 0 {
-		for _, id := range idents {
-			if id.ADGUID != "" {
-				return errors.New("AD snapshot returned no users although accounts are linked; refusing to continue (check ad.search_bases and the service account's read rights)")
-			}
+	for _, id := range pass.updates {
+		if err := st.UpdateIdentity(ctx, id); err != nil {
+			return fmt.Errorf("update identity %s: %w", id.ExternalID, err)
 		}
 	}
-
-	pc := &PlanContext{
-		Settings: settings, Mappings: mappings, Rules: rules, Now: e.Now(),
-		GroupDN: map[string]string{}, ManagedDNs: map[string]bool{}, UserDNByExt: map[string]string{},
-	}
-	for _, g := range snap.Groups {
-		if g.Found {
-			pc.GroupDN[strings.ToLower(g.Identity)] = g.DN
-			pc.ManagedDNs[strings.ToLower(g.DN)] = true
-		} else {
-			cnt["warnings"]++
-			e.Log.Warn("role group not found in AD", "group", g.Identity)
-		}
-	}
-	for ext, list := range byExt {
-		if len(list) == 1 {
-			pc.UserDNByExt[ext] = list[0].DN
-		}
-	}
-
-	// 3. correlate, link + plan.
-	var transferring map[string]bool
-	if settings.Correlate.Enabled {
-		var warns []string
-		pc.Links, transferring, warns = correlate(settings, snap.Users, idents, byExt)
-		cnt["warnings"] += len(warns)
-		for _, w := range warns {
-			e.Log.Warn("correlation warning", "warning", w)
-		}
-	}
-	var plans []plannedFor
-	processed := map[string]bool{}
-	decided := map[string]bool{} // identities the planner reached a verdict for (with or without a change)
-	var planErrs []string
-
-	extCount := map[string]int{}
-	for _, id := range idents {
-		extCount[id.ExternalID]++
-	}
-	for _, id := range idents {
-		processed[id.ID] = true
-		if id.State == model.StateMerged {
-			// Its account was handed to another person record (MergedInto); that record manages it now.
-			decided[id.ID] = true
-			cnt["merged"]++
-			continue
-		}
-		if extCount[id.ExternalID] > 1 {
-			cnt["plan_errors"]++
-			planErrs = append(planErrs, fmt.Sprintf("%s: the same external id appears in more than one source; they would map to one AD account, so it is skipped", id.ExternalID))
-			continue
-		}
-		var acct *ad.User
-		if list := byExt[id.ExternalID]; len(list) > 1 {
-			cnt["plan_errors"]++
-			planErrs = append(planErrs, fmt.Sprintf("%s: %d AD accounts share %s=%s; resolve the duplicate", id.ExternalID, len(list), settings.AD.IDAttribute, id.ExternalID))
-			continue
-		} else if len(list) == 1 {
-			acct = list[0]
-		}
-
-		if e.link(ctx, &id, acct) {
-			if err := st.UpdateIdentity(ctx, id); err != nil {
-				return fmt.Errorf("update identity %s: %w", id.ExternalID, err)
-			}
-		}
-		if id.Active {
-			cnt["active"]++
-		} else {
-			cnt["inactive"]++
-		}
-
-		p, warns, err := PlanIdentity(pc, id, acct)
-		cnt["warnings"] += len(warns)
-		for _, w := range warns {
-			e.Log.Warn("plan warning", "identity", id.ExternalID, "warning", w)
-		}
-		if err != nil {
-			cnt["plan_errors"]++
-			planErrs = append(planErrs, fmt.Sprintf("%s: %v", id.ExternalID, err))
-			e.Log.Error("plan failed", "identity", id.ExternalID, "error", err)
-			continue
-		}
-		decided[id.ID] = true
-		if p != nil && len(p.Observed) > 0 {
-			if id.Applied == nil {
-				id.Applied = map[string]string{}
-			}
-			for k, v := range p.Observed {
-				setApplied(id.Applied, k, v)
-			}
-			if err := st.UpdateIdentity(ctx, id); err != nil {
-				return fmt.Errorf("update identity %s: %w", id.ExternalID, err)
-			}
-		}
-		if p != nil && p.Type != "" && acct != nil && transferring[strings.ToLower(acct.ObjectGUID)] {
-			// The account is proposed for another person record (contractor -> employee, rehire): no changes from the
-			// old record until a person decides about the link.
-			cnt["held_for_link"]++
-			continue
-		}
-		if p == nil || p.Type == "" {
-			cnt["unchanged"]++
-			continue
-		}
-		plans = append(plans, plannedFor{id, p})
-	}
+	pc, plans, processed, decided, planErrs := pass.pc, pass.plans, pass.processed, pass.decided, pass.errList
 	for _, w := range e.checkNames(ctx, settings, plans) {
 		cnt["warnings"]++
 		e.Log.Warn("name check", "warning", w)
@@ -545,40 +434,6 @@ func (e *Engine) supersede(ctx context.Context, c model.Change, cnt map[string]i
 	}
 	cnt["superseded"]++
 	e.audit(ctx, "system", "change.supersede", "change", c.ID, map[string]any{"from": c.Status})
-}
-
-// link reconciles an identity with its AD account and reports whether the row changed.
-func (e *Engine) link(ctx context.Context, id *model.Identity, acct *ad.User) bool {
-	before := *id
-	now := e.Now()
-	if acct != nil {
-		id.ADGUID, id.ADDN, id.ADSam = acct.ObjectGUID, acct.DN, acct.Sam
-		if acct.Enabled {
-			id.State, id.DisabledAt = model.StateLinked, nil
-		} else {
-			id.State = model.StateDisabled
-			// The retention clock only runs for people who are gone from the source; an account
-			// disabled for other reasons (leave of absence...) must not count down towards deletion.
-			switch {
-			case !id.Active && id.DisabledAt == nil:
-				id.DisabledAt = &now
-			case id.Active:
-				id.DisabledAt = nil
-			}
-		}
-	} else if id.ADGUID != "" || id.State == model.StateLinked || id.State == model.StateDisabled {
-		// Account vanished outside this service (or was deleted by us earlier).
-		if id.State != model.StateDeleted {
-			e.Log.Warn("linked AD account no longer exists", "identity", id.ExternalID, "guid", id.ADGUID)
-		}
-		id.ADGUID, id.ADDN, id.ADSam, id.DisabledAt = "", "", "", nil
-		if id.State != model.StateDeleted {
-			id.State = model.StateNew
-		}
-		id.Applied = map[string]string{}
-	}
-	return before.ADGUID != id.ADGUID || before.ADDN != id.ADDN || before.ADSam != id.ADSam || before.State != id.State ||
-		(before.DisabledAt == nil) != (id.DisabledAt == nil)
 }
 
 // attributeNames lists every AD attribute any mapping or role grant touches.

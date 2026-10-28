@@ -27,9 +27,11 @@ Dependency-free SPA (hand-written ES modules, no build step) in `internal/web/st
 | `#/audit` (History) | viewer | search with query syntax and filters, CSV export, "Verify integrity" |
 | `#/placement` (OU placement) | viewer (edit: admin) | department -> OU rules, OU picker from AD, CSV import/export, values in use |
 | `#/matching` (Matching) | viewer (edit: admin) | correlation rules and settings, report of uncorrelated accounts (link to person, ignore) |
-| `#/mappings` | viewer (edit: admin) | editor with mode explanations and live template preview |
-| `#/roles` | viewer (edit: admin) | rule editor, "Test a record" (admin) |
-| `#/sources` | viewer (edit: admin) | form generated from `/api/source-types`, test connection |
+| `#/mappings` | viewer (edit: admin) | editor with mode explanations and live template preview, "Preview impact" |
+| `#/roles` | viewer (edit: admin) | rule editor: condition builder (every operator, nested ALL/ANY groups, template), "Test this rule" with a per-condition explanation, groups via the live AD group picker (`group-picker.js`), "Preview impact" |
+| `#/lifecycle` (Lifecycle groups) | viewer (edit: admin) | groups for active / disabled accounts, what a disable removes, groups always kept; "Preview impact" |
+| `#/preview` (Preview changes) | admin | impact preview (`views/impact.js`, also opened as a dialog by the "Preview impact" buttons): summary, live search, filters, per-person +/- steps |
+| `#/sources` | viewer (edit: admin) | form generated from `/api/source-types` (select fields and fields shown only for some values of another field), "Test these settings" (`POST /api/sources/test`, before saving) |
 | `#/settings` | viewer (edit: admin) | whole document saved with `PUT /api/settings` |
 | `#/tables`, `#/tables/<name>` | viewer | read-only row browser |
 | `#/users` | admin | users CRUD, reset password |
@@ -40,7 +42,7 @@ Mutating controls carry `data-mutating`; they are not rendered for roles that ca
 
 `app.js` (shell, router, status banner) · `brand.js` (product name, logo and accent from `/branding/brand.json`) ·
 `branding/` (default `logo.svg`, `favicon.ico`) · `api.js` (fetch + CSRF + 401 handling) · `ui.js` (`h()` DOM helper,
-modals, toasts, tables, form helpers) · `components.js` (mapping fields, sample-record picker, template preview)
+modals, toasts, tables, form helpers) · `components.js` (mapping fields, sample-record picker, template preview) · `group-picker.js` (live AD group search combobox)
 · `views/*.js` (one per route).
 
 ## Test harnesses (not embedded)

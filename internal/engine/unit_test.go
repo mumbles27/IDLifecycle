@@ -3,6 +3,7 @@ package engine
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"idlifecycle/internal/model"
 )
@@ -180,7 +181,7 @@ func TestRoleOperators(t *testing.T) {
 		{model.Condition{Attr: "Nope", Op: "eq", Value: ""}, true},
 	}
 	for _, tc := range cases {
-		if got := condMatch(tc.c, attrs); got != tc.want {
+		if got := condMatch(tc.c, attrs, time.Now()); got != tc.want {
 			t.Errorf("%+v = %v, want %v", tc.c, got, tc.want)
 		}
 	}

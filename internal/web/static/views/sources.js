@@ -1,4 +1,6 @@
-// Sources: HR feeds (CSV, Paylocity, ...). The config form is generated from GET /api/source-types.
+// Sources: HR feeds (CSV, SQL, HR system APIs, manual entry). The config form is generated from GET /api/source-types:
+// field types string | password | int | bool | text | select (options), and show_if hides a field unless another
+// field has one of the listed values.
 
 import { api } from '../api.js';
 import {
@@ -114,7 +116,7 @@ export async function render(root, ctx) {
     });
   }
 
-  function configControl(def, config) {
+  function configControl(def, config, onChange) {
     const label = def.label || def.name;
     const common = { 'data-field': def.name };
     let control;
@@ -122,6 +124,11 @@ export async function render(root, ctx) {
     switch (def.type) {
       case 'bool':
         return h('div', { class: 'field' }, inputCheck(config, def.name, label, common), help ? h('p', { class: 'help' }, help) : null);
+      case 'select':
+        control = inputSelect(config, def.name, (def.options || []).map((o) => ({ value: o, label: o })), {
+          ...common, required: Boolean(def.required), onchange: () => onChange(def.name),
+        });
+        break;
       case 'int':
         control = inputNumber(config, def.name, { ...common, required: Boolean(def.required), step: '1' });
         break;
@@ -177,12 +184,54 @@ export async function render(root, ctx) {
       if (manual) {
         cfgBox.appendChild(notice('info', 'People in a manual source are typed in under ', h('a', { href: '#/manual' }, 'Add person'), '. "form_fields" defines that form, one field per line: Name | Label | flags (required, date, email, select: A; B; C, default: value). The employee ID is generated from the prefix, and the person counts as left the day after the end date field.'));
       }
+      // Fields with show_if are shown only while the field they depend on has one of the listed values (their values
+      // are kept either way; the server ignores what does not apply).
+      const dependents = [];
+      const applyVisibility = () => {
+        for (const { node, cond } of dependents) {
+          node.hidden = !(cond.values || []).includes(String(config[cond.field] === undefined ? '' : config[cond.field]));
+        }
+      };
       for (const f of def.fields || []) {
         if (config[f.name] === undefined && f.default !== undefined && f.default !== null) {
           config[f.name] = f.default;
         }
-        cfgBox.appendChild(configControl(f, config));
+        const node = configControl(f, config, applyVisibility);
+        if (f.show_if && f.show_if.field) {
+          dependents.push({ node, cond: f.show_if });
+        }
+        cfgBox.appendChild(node);
       }
+      applyVisibility();
+    }
+
+    function buildBody() {
+      const cfg = {};
+      for (const [k, v] of Object.entries(config)) {
+        if (v === '' || v === undefined || v === null) {
+          continue;
+        }
+        cfg[k] = v;
+      }
+      if (model.type === 'manual') {
+        optModel.external_id_field = 'ExternalID';
+        optModel.status_field = 'Status';
+        optModel.terminated_values = 'Terminated';
+        optModel.missing_means_terminated = false;
+      }
+      return {
+        name: model.name.trim(),
+        type: model.type,
+        enabled: Boolean(model.enabled),
+        options: {
+          external_id_field: optModel.external_id_field.trim(),
+          status_field: optModel.status_field.trim(),
+          terminated_values: csvToList(optModel.terminated_values),
+          missing_means_terminated: Boolean(optModel.missing_means_terminated),
+          missing_grace_runs: Number(optModel.missing_grace_runs) || 0,
+        },
+        config: cfg,
+      };
     }
 
     const typeSel = inputSelect(model, 'type', types.map((t) => ({ value: t.type, label: t.label || t.type })), {
@@ -192,14 +241,17 @@ export async function render(root, ctx) {
     });
     drawConfig();
 
+    // Tests what is in the form now, without saving it (masked secrets of a saved source come from the store).
     const testBtn = h('button', {
       type: 'button',
       class: 'btn',
-      disabled: !existing,
-      title: existing ? 'Tests the saved configuration' : 'Save the source first, then test it',
-      'data-test': 'source-test-saved',
-      onclick: (e) => testSource(existing, e.currentTarget),
-    }, 'Test saved connection');
+      title: 'Fetch once with the settings in this form, without saving them',
+      'data-test': 'source-test-form',
+      onclick: (e) => act(e.currentTarget, async () => {
+        const res = await api.post('/sources/test', { ...(existing ? { id: existing.id } : {}), ...buildBody() });
+        showTestResult({ name: model.name || 'unsaved source' }, res || {});
+      }),
+    }, 'Test these settings');
 
     const content = [
       field('Name', inputText(model, 'name', { required: true, 'data-test': 'source-name' }), { required: true }),
@@ -216,32 +268,7 @@ export async function render(root, ctx) {
       submitLabel: existing ? 'Save source' : 'Create source',
       extraFooter: testBtn,
       onSubmit: async () => {
-        const cfg = {};
-        for (const [k, v] of Object.entries(config)) {
-          if (v === '' || v === undefined || v === null) {
-            continue;
-          }
-          cfg[k] = v;
-        }
-        if (model.type === 'manual') {
-          optModel.external_id_field = 'ExternalID';
-          optModel.status_field = 'Status';
-          optModel.terminated_values = 'Terminated';
-          optModel.missing_means_terminated = false;
-        }
-        const body = {
-          name: model.name.trim(),
-          type: model.type,
-          enabled: Boolean(model.enabled),
-          options: {
-            external_id_field: optModel.external_id_field.trim(),
-            status_field: optModel.status_field.trim(),
-            terminated_values: csvToList(optModel.terminated_values),
-            missing_means_terminated: Boolean(optModel.missing_means_terminated),
-            missing_grace_runs: Number(optModel.missing_grace_runs) || 0,
-          },
-          config: cfg,
-        };
+        const body = buildBody();
         if (existing) {
           await api.put(`/sources/${encodeURIComponent(existing.id)}`, { ...existing, ...body });
         }

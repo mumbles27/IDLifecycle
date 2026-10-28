@@ -97,15 +97,17 @@ type DisableItem struct {
 	ObjectGUID   string   `json:"objectGuid"`
 	MoveTo       string   `json:"moveTo"`
 	RemoveGroups []string `json:"removeGroups"`
+	AddGroups    []string `json:"addGroups"` // lifecycle_groups.disabled_add, applied after the account is disabled
 	Description  string   `json:"description"`
 }
 
 type EnableItem struct {
-	ChangeID   string   `json:"changeId"`
-	ExternalID string   `json:"externalId"`
-	ObjectGUID string   `json:"objectGuid"`
-	MoveTo     string   `json:"moveTo"`
-	AddGroups  []string `json:"addGroups"`
+	ChangeID     string   `json:"changeId"`
+	ExternalID   string   `json:"externalId"`
+	ObjectGUID   string   `json:"objectGuid"`
+	MoveTo       string   `json:"moveTo"`
+	AddGroups    []string `json:"addGroups"`
+	RemoveGroups []string `json:"removeGroups"` // lifecycle_groups.disabled_add groups the account still holds
 }
 
 type RemoveItem struct {

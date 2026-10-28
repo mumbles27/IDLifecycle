@@ -89,6 +89,33 @@ Describe 'Start-IDLifecycleTray.ps1: tray.json, menu, command lines, settings, b
         (Get-IDLTrayTooltip -Product ('A' * 70) -State 'Running').Length | Should Be 63
     }
 
+    It 'promotes only its own notification-area entry (pwsh.exe icon whose first tooltip was ours), and only once' {
+        $entries = @(
+            [pscustomobject]@{ Key = '1'; ExecutablePath = '{6D80}\WindowsApps\Microsoft.PowerShell_7.6.7.0_x64__8wekyb3d8bbwe\pwsh.exe'; InitialTooltip = 'IDLifecycle - Running'; IsPromoted = 0 },
+            [pscustomobject]@{ Key = '2'; ExecutablePath = 'C:\Program Files\PowerShell\7\pwsh.exe'; InitialTooltip = 'IDLifecycle - Stopped'; IsPromoted = 1 },
+            [pscustomobject]@{ Key = '3'; ExecutablePath = 'C:\Program Files\PowerShell\7\pwsh.exe'; InitialTooltip = 'Some other script'; IsPromoted = 0 },
+            [pscustomobject]@{ Key = '4'; ExecutablePath = 'C:\Tools\notpwsh.exe'; InitialTooltip = 'IDLifecycle - Running'; IsPromoted = 0 },
+            [pscustomobject]@{ Key = '5'; ExecutablePath = 'C:\Program Files\PowerShell\7\pwsh.exe'; InitialTooltip = 'IDLifecycleX - Running'; IsPromoted = 0 }
+        )
+        (Get-IDLTrayPromotionKeys -Entries $entries -Product 'IDLifecycle') -join ',' | Should Be '1'
+        @(Get-IDLTrayPromotionKeys -Entries @() -Product 'IDLifecycle').Count | Should Be 0
+        (Get-IDLTrayPromotionKeys -Entries $entries -Product 'Acme Identity') -join ',' | Should Be ''
+    }
+
+    It 'the launcher (Windows PowerShell 5.1) parses there and refuses an execution policy it must not pass on' {
+        $launcher = Join-Path $script:ScriptsDir 'Start-IDLifecycleTrayLauncher.ps1'
+        $ps51 = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        if (-not (Test-Path -LiteralPath $ps51)){
+            return
+        }
+
+        & $ps51 -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $launcher -ExecutionPolicy Bypass
+        $LASTEXITCODE | Should Be 2
+        $errors = $null
+        $null = [System.Management.Automation.PSParser]::Tokenize([System.IO.File]::ReadAllText($launcher), [ref]$errors)
+        @($errors).Count | Should Be 0
+    }
+
     It 'builds the elevated helper''s command line: only known values, quoted so Windows splits it back exactly' {
         if (-not ('IDLTrayTest.Argv' -as [type])){
             Add-Type -Namespace 'IDLTrayTest' -Name 'Argv' -MemberDefinition @'

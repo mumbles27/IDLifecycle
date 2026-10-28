@@ -227,3 +227,63 @@ Describe 'Disable-IDLUser.ps1' {
         (Invoke-IDLScript -Script 'Disable-IDLUser' -Request (New-DisableRequest @()) -NoState).ExitCode | Should Be 3
     }
 }
+
+Describe 'Disable-IDLUser.ps1 addGroups (lifecycle groups for disabled accounts)' {
+
+    function New-AddFixture {
+        $jane = New-StubUserEntry -Sam 'jdoe' -ExternalId 'E1001' -Cn 'Jane Doe' -MemberOf @("CN=GG-AllStaff,OU=Groups,$script:Root")
+        $groups = @(
+            @{ dn = "CN=GG-AllStaff,OU=Groups,$script:Root"; sam = 'GG-AllStaff' },
+            @{ dn = "CN=GG-Disabled,OU=Groups,$script:Root"; sam = 'GG-Disabled' },
+            @{ dn = "CN=Domain Admins,CN=Users,$script:Root"; sam = 'Domain Admins'; objectSid = 'S-1-5-21-1-2-3-512' }
+        )
+        $path = New-StubStateFile -Users @($jane) -Groups $groups -Ous @("OU=Staff,$script:Root", "OU=Disabled,$script:Root", "OU=Groups,$script:Root")
+        return @{ State = $path; Jane = $jane }
+    }
+
+    function New-AddRequest {
+        param($Item)
+        return [ordered]@{ server = ''; idAttribute = 'employeeID'; items = @($Item) }
+    }
+
+    It 'adds the account to addGroups after disabling it; privileged and unknown groups are reported, never a failure' {
+        $f = New-AddFixture
+        $item = [ordered]@{ changeId = 'c1'; externalId = 'E1001'; objectGuid = $f.Jane.objectGuid; removeGroups = @('GG-AllStaff'); addGroups = @('GG-Disabled', 'Domain Admins', 'GG-Nope') }
+        $r = Invoke-IDLScript -Script 'Disable-IDLUser' -Request (New-AddRequest $item) -StatePath $f.State
+
+        $r.ExitCode | Should Be 0
+        $res = $r.Json.results[0]
+        $res.status | Should Be 'applied'
+        $res.message | Should Match 'added to CN=GG-Disabled'
+        $res.message | Should Match 'not added: .*Domain Admins \(privileged\)'
+        $res.message | Should Match 'GG-Nope \(not found\)'
+        $u = Get-StubUser -Path $f.State -Sam 'jdoe'
+        $u.enabled | Should Be $false
+        @($u.memberOf) -join '|' | Should Be "CN=GG-Disabled,OU=Groups,$script:Root"
+        # Order: the disable comes first, the group change after it; nobody is added to the admin group.
+        $calls = Get-StubCalls -Path $f.State
+        $calls[0].cmdlet | Should Be 'Disable-ADAccount'
+        @($calls | Where-Object { $_.cmdlet -eq 'Add-ADGroupMember' }).Count | Should Be 1
+        ($calls | ConvertTo-Json -Depth 6) | Should Not Match 'Domain Admins'
+        $r.LogText | Should Match "WARN.*Group 'Domain Admins' is a protected administrative group"
+        $r.ReportText | Should Match '"AddGroupMember","Skipped"'
+
+        # Idempotent: a second run has nothing to do (already disabled, already a member).
+        $before = (Get-StubCalls -Path $f.State).Count
+        $r = Invoke-IDLScript -Script 'Disable-IDLUser' -Request (New-AddRequest $item) -StatePath $f.State
+        $r.Json.results[0].status | Should Be 'skipped'
+        (Get-StubCalls -Path $f.State).Count | Should Be $before
+    }
+
+    It 'DryRun: WOULD lines for the disable and the group, zero mutating calls' {
+        $f = New-AddFixture
+        $item = [ordered]@{ changeId = 'c1'; externalId = 'E1001'; objectGuid = $f.Jane.objectGuid; addGroups = @('GG-Disabled') }
+        $r = Invoke-IDLScript -Script 'Disable-IDLUser' -Request (New-AddRequest $item) -StatePath $f.State -DryRun
+
+        $r.ExitCode | Should Be 0
+        $r.Json.results[0].status | Should Be 'would'
+        $r.LogText | Should Match 'WOULD: disable jdoe'
+        $r.LogText | Should Match 'WOULD: add jdoe to CN=GG-Disabled'
+        (Get-StubCalls -Path $f.State).Count | Should Be 0
+    }
+}

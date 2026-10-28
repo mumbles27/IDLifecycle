@@ -1530,3 +1530,54 @@ table.data tr.row-chosen td:first-child { box-shadow: inset 3px 0 0 var(--accent
 .rule-row { display: grid; grid-template-columns: 1fr 1fr 1.4fr auto auto; gap: 0.5rem; align-items: end; }
 @media (max-width: 760px) { .rule-row { grid-template-columns: 1fr; } }
 .preview-box { border: 1px solid var(--border); border-radius: 6px; padding: 0.6rem 0.8rem; background: var(--surface); }
+
+/* ---- group picker (combobox) ---- */
+.gp { position: relative; }
+.gp-pop { position: relative; }
+.gp-list { position: absolute; z-index: 30; left: 0; right: 0; top: 0.15rem; max-height: 16rem; overflow: auto; margin: 0; padding: 0.2rem 0; list-style: none; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; box-shadow: var(--shadow); }
+.gp-option { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.2rem 0.5rem; padding: 0.3rem 0.6rem; cursor: pointer; }
+.gp-option:hover, .gp-option.gp-active { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); }
+.gp-opt-name { font-weight: 600; }
+.gp-opt-desc { flex-basis: 100%; }
+.gp-chips { list-style: none; margin: 0.35rem 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 0.3rem; }
+.gp-chip { display: inline-flex; align-items: center; gap: 0.3rem; background: var(--accent-soft); color: var(--accent); border-radius: 6px; padding: 0.1rem 0.2rem 0.1rem 0.5rem; font-family: var(--mono); font-size: 0.85rem; }
+.gp-readonly .gp-chip { padding-right: 0.5rem; }
+.gp-remove { background: none; border: 0; color: inherit; font: inherit; font-size: 1rem; line-height: 1; padding: 0 0.3rem; cursor: pointer; border-radius: 4px; }
+.gp-remove:hover, .gp-remove:focus-visible { background: var(--surface); }
+.gp-priv { display: inline-block; background: var(--warn-bg); color: var(--warn-text); border: 1px solid var(--warn-border); border-radius: 4px; padding: 0 0.3rem; font-family: var(--font); font-size: 0.75rem; font-weight: 600; }
+.gp-none { padding: 0.1rem 0; }
+
+/* ---- role condition builder ---- */
+.cond-item { margin-bottom: 0.2rem; }
+.cond-help { margin: -0.3rem 0 0.5rem; }
+.cond-row-template { grid-template-columns: auto minmax(8rem, 1fr) minmax(12rem, 2fr) auto; }
+.cond-whole-record { align-self: center; }
+.cond-group { border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 6px; padding: 0.4rem 0.7rem 0.6rem; margin: 0 0 0.6rem; background: var(--surface-2); }
+.cond-group .cond-group { background: var(--surface); }
+.cond-group legend { padding: 0 0.3rem; }
+.cond-group-foot { display: flex; justify-content: flex-end; }
+.cond-add { margin: 0.2rem 0 0.4rem; }
+.rule-verdict { margin: 0.4rem 0; }
+@media (max-width: 760px) { .cond-row, .cond-row-template { grid-template-columns: 1fr; } }
+
+/* ---- lifecycle groups ---- */
+.radio-option { display: grid; grid-template-columns: auto 1fr; gap: 0 0.5rem; align-items: baseline; margin: 0.3rem 0; }
+.radio-option .help { grid-column: 2; margin: 0; }
+
+/* ---- impact preview ---- */
+.impact-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; justify-content: space-between; margin-bottom: 0.4rem; }
+.impact-headline { font-size: 1.05rem; }
+.impact-controls { display: grid; grid-template-columns: minmax(12rem, 2fr) minmax(10rem, 1fr) auto; gap: 0.5rem 1rem; align-items: end; margin-top: 0.8rem; }
+@media (max-width: 760px) { .impact-controls { grid-template-columns: 1fr; } }
+.impact-count { font-weight: 600; margin: 0.4rem 0; }
+.chip-add { background: var(--ok-bg); color: var(--ok-text); }
+.chip-del { background: var(--err-bg); color: var(--err-text); }
+.plan-type { font-weight: 600; }
+.diff-kind { white-space: nowrap; }
+.diff-kind-new, .diff-kind-changed, .diff-kind-gone { font-weight: 600; }
+table.data tr.impact-row-changed td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+.diff { list-style: none; margin: 0.2rem 0 0.5rem; padding: 0; font-family: var(--mono); font-size: 0.85rem; }
+.diff li { display: flex; gap: 0.5rem; padding: 0.1rem 0.4rem; border-radius: 3px; overflow-wrap: anywhere; }
+.diff-add { background: var(--ok-bg); color: var(--ok-text); }
+.diff-del { background: var(--err-bg); color: var(--err-text); }
+.diff-mark { font-weight: 700; width: 1ch; flex: none; }

@@ -34,6 +34,7 @@ export const db = {
     approval: { create: 'manual', update: 'auto', disable: 'manual', enable: 'manual', delete: 'manual', link: 'auto' },
     engine: { dry_run: true, max_destructive_per_run: 10, delete_after_days: 30, remove_stale_groups: true, enforce_ou: false, max_deletes_per_run: 5, max_deletes_per_day: 20 },
     ad: { server: '', search_bases: ['OU=Staff,DC=corp,DC=example,DC=com'], default_ou: 'OU=Staff,DC=corp,DC=example,DC=com', disabled_ou: '', id_attribute: 'employeeID', upn_suffix: 'corp.example.com', strip_groups_on_disable: true },
+    lifecycle_groups: { active_add: ['GG-All'], disabled_add: [], disabled_remove: 'all_except', disabled_keep: ['Mailbox-Retention'] },
     naming: { sam_template: '{{ first .FirstName 1 | lower }}{{ .LastName | lower }}', upn_template: '{{ .FirstName | lower }}.{{ .LastName | lower }}', cn_template: '{{ .FirstName }} {{ .LastName }}', max_candidates: 9, mail_template: '', mail_domain: '', conflict_mode: 'manual', conflict_random_digits: 3, conflict_suffix_template: '{{ last .EmployeeID 4 }}' },
     correlation: {
       enabled: true, rename: 'transitions', max_auto_links_per_run: 25, report_uncorrelated: true, ignore_accounts: ['svc_*'],
@@ -385,10 +386,19 @@ const SOURCE_TYPES = [
     ],
   },
   {
-    type: 'paylocity', label: 'Paylocity API',
+    type: 'rest', label: 'HR system API (REST/JSON)',
     fields: [
-      { name: 'company_id', label: 'Company ID', type: 'string', required: true },
-      { name: 'client_secret', label: 'Client secret', type: 'password', required: true },
+      { name: 'base_url', label: 'Base URL', type: 'string', required: true },
+      { name: 'path', label: 'Path', type: 'string' },
+      { name: 'method', label: 'Method', type: 'select', options: ['GET', 'POST'], default: 'GET' },
+      { name: 'body', label: 'Request body (JSON)', type: 'text', show_if: { field: 'method', values: ['POST'] } },
+      { name: 'auth', label: 'Authentication', type: 'select', options: ['none', 'api_key', 'basic', 'bearer', 'oauth2_client_credentials'], default: 'none' },
+      { name: 'api_key_name', label: 'API key header / parameter name', type: 'string', default: 'X-API-Key', show_if: { field: 'auth', values: ['api_key'] } },
+      { name: 'api_key', label: 'API key', type: 'password', show_if: { field: 'auth', values: ['api_key'] } },
+      { name: 'client_secret', label: 'Client secret', type: 'password', show_if: { field: 'auth', values: ['oauth2_client_credentials'] } },
+      { name: 'records_path', label: 'Records path', type: 'string' },
+      { name: 'pagination', label: 'Pagination', type: 'select', options: ['none', 'page', 'offset', 'cursor', 'next_link'], default: 'none' },
+      { name: 'page_size', label: 'Page size', type: 'int', default: 100, show_if: { field: 'pagination', values: ['page', 'offset', 'cursor'] } },
     ],
   },
   {
@@ -457,39 +467,316 @@ function applyTemplate(template, rec) {
   });
 }
 
-function rolePreview(record) {
+// Conditions as the engine evaluates them (internal/engine/conditions.go), with the explain trail.
+function parseWhen(v) {
+  const s = String(v === undefined || v === null ? '' : v).trim();
+  let m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (m) {
+    return Date.UTC(Number(m[3]), Number(m[1]) - 1, Number(m[2]));
+  }
+  m = s.match(/^\d{4}-\d{2}-\d{2}/);
+  if (!m) {
+    return NaN;
+  }
+  return Date.parse(s.length === 10 ? `${s}T00:00:00Z` : s);
+}
+
+function compare(a, b) {
+  const na = Number(a);
+  const nb = Number(b);
+  if (String(a).trim() !== '' && String(b).trim() !== '' && Number.isFinite(na) && Number.isFinite(nb)) {
+    return na - nb;
+  }
+  const da = parseWhen(a);
+  const dbb = parseWhen(b);
+  if (Number.isNaN(da) || Number.isNaN(dbb)) {
+    return NaN;
+  }
+  return da - dbb;
+}
+
+function evalCondition(c, record, path, explain) {
+  const list = (s) => String(s).split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
+  if (c.op === 'all_of' || c.op === 'any_of') {
+    const kids = (c.conditions || []).map((k, i) => evalCondition(k, record, `${path}.conditions[${i}]`, null));
+    const ok = c.op === 'any_of' ? kids.some((k) => k.matched) : kids.length > 0 && kids.every((k) => k.matched);
+    if (explain) {
+      explain.push({ path, attr: '', op: c.op, value: '', actual: `${kids.filter((k) => k.matched).length} of ${kids.length} matched`, matched: ok });
+      (c.conditions || []).forEach((k, i) => evalCondition(k, record, `${path}.conditions[${i}]`, explain));
+    }
+    return { matched: ok };
+  }
+  let actual = c.attr === '*' ? '' : record[c.attr];
+  actual = actual === undefined || actual === null ? '' : String(actual);
+  const v = String(c.value === undefined || c.value === null ? '' : c.value);
+  const al = actual.toLowerCase();
+  const vl = v.toLowerCase();
+  let ok = false;
+  switch (c.op) {
+    case 'eq': ok = al === vl; break;
+    case 'ne': ok = al !== vl; break;
+    case 'in': ok = list(v).includes(al); break;
+    case 'not_in': ok = !list(v).includes(al); break;
+    case 'contains': ok = al.includes(vl); break;
+    case 'not_contains': ok = !al.includes(vl); break;
+    case 'starts_with': ok = al.startsWith(vl); break;
+    case 'ends_with': ok = al.endsWith(vl); break;
+    case 'regex': case 'not_regex': {
+      let re;
+      try {
+        re = new RegExp(v.replace(/^\(\?i\)/, ''), v.startsWith('(?i)') ? 'i' : '');
+      }
+      catch (e) {
+        throw new HttpError(400, 'bad_request', `${path}: bad regex: ${e.message}`);
+      }
+      ok = re.test(actual) === (c.op === 'regex');
+      break;
+    }
+    case 'exists': ok = actual.trim() !== ''; break;
+    case 'empty': ok = actual.trim() === ''; break;
+    case 'gt': ok = compare(actual, v) > 0; break;
+    case 'gte': ok = compare(actual, v) >= 0; break;
+    case 'lt': ok = compare(actual, v) < 0; break;
+    case 'lte': ok = compare(actual, v) <= 0; break;
+    case 'older_than_days': case 'newer_than_days': {
+      const t = parseWhen(actual);
+      const days = (Date.now() - t) / 86400000;
+      ok = !Number.isNaN(t) && (c.op === 'older_than_days' ? days > Number(v) : days >= 0 && days < Number(v));
+      break;
+    }
+    case 'template':
+      try {
+        actual = applyTemplate(v, record).trim();
+      }
+      catch (e) {
+        actual = `template error: ${e.message}`;
+      }
+      ok = ['true', 'yes', '1'].includes(actual.toLowerCase());
+      break;
+    default:
+      throw new HttpError(400, 'bad_request', `${path}: unknown op "${c.op}"`);
+  }
+  if (explain) {
+    explain.push({ path, attr: c.attr, op: c.op, value: v, actual, matched: ok });
+  }
+  return { matched: ok };
+}
+
+function ruleMatches(r, record, explain) {
+  const results = (r.conditions || []).map((c, i) => evalCondition(c, record, `conditions[${i}]`, explain).matched);
+  return results.length === 0 || (r.match === 'any' ? results.some(Boolean) : results.every(Boolean));
+}
+
+function rolePreview(record, rule, roles = db.roles) {
   const matched = [];
   const groups = new Set();
   let ou = '';
   const attributes = {};
-  for (const r of db.roles.filter((x) => x.enabled).sort((a, b) => a.priority - b.priority)) {
-    const results = (r.conditions || []).map((c) => {
-      const v = record[c.attr];
-      if (c.op === 'exists') {
-        return v !== undefined && v !== null && v !== '';
-      }
-      if (c.op === 'eq') {
-        return String(v) === String(c.value);
-      }
-      if (c.op === 'ne') {
-        return String(v) !== String(c.value);
-      }
-      return false;
-    });
-    const ok = results.length === 0 || (r.match === 'any' ? results.some(Boolean) : results.every(Boolean));
-    if (!ok) {
+  let all = roles;
+  let explain;
+  const out0 = {};
+  if (rule) {
+    explain = [];
+    out0.rule_matched = ruleMatches(rule, record, explain);
+    all = roles.filter((r) => !rule.id || r.id !== rule.id).concat([{ ...rule, id: rule.id || '(this rule)' }]);
+  }
+  for (const r of all.filter((x) => x.enabled).sort((a, b) => a.priority - b.priority)) {
+    if (!ruleMatches(r, record, null)) {
       continue;
     }
     matched.push({ id: r.id, name: r.name });
-    (r.grants.groups || []).forEach((g) => groups.add(g));
-    if (r.grants.ou) {
+    ((r.grants && r.grants.groups) || []).forEach((g) => groups.add(g));
+    if (r.grants && r.grants.ou) {
       ou = r.grants.ou;
     }
-    for (const a of r.grants.attributes || []) {
+    for (const a of (r.grants && r.grants.attributes) || []) {
       attributes[a.target_attr] = applyTemplate(a.template, record);
     }
   }
-  return { matched, groups: Array.from(groups), ou, attributes };
+  const out = { matched, groups: Array.from(groups), ou, attributes, ...out0 };
+  if (explain) {
+    out.explain = explain;
+  }
+  return out;
+}
+
+// ---- AD group search (GET /api/ad/groups)
+const AD_GROUPS = [
+  { sam: 'GG-All', name: 'GG-All', description: 'Every employee', category: 'security', scope: 'global' },
+  { sam: 'GG-AllStaff', name: 'GG-AllStaff', description: 'All staff (baseline role)', category: 'security', scope: 'global' },
+  { sam: 'GG-Finance', name: 'GG-Finance', description: 'Finance department', category: 'security', scope: 'global' },
+  { sam: 'GG-Mkt', name: 'GG-Mkt', description: 'Marketing team', category: 'security', scope: 'global' },
+  { sam: 'ALLUSERS', name: 'ALLUSERS', description: 'All active user accounts', category: 'security', scope: 'universal' },
+  { sam: 'Finance-Readers', name: 'Finance-Readers', description: 'Read access to the finance share', category: 'security', scope: 'domainlocal' },
+  { sam: 'AllStaffDL', name: 'All Staff DL', description: 'All staff mailing list', category: 'distribution', scope: 'universal' },
+  { sam: 'Disabled Users', name: 'Disabled Users', description: 'Accounts that are disabled', category: 'security', scope: 'global' },
+  { sam: 'Mailbox-Retention', name: 'Mailbox-Retention', description: 'Keeps the mailbox of leavers (legal hold)', category: 'security', scope: 'global' },
+  { sam: 'Domain Admins', name: 'Domain Admins', description: 'Designated administrators of the domain', category: 'security', scope: 'global', privileged: true },
+].map((g) => ({ dn: `CN=${g.name},OU=Groups,DC=corp,DC=example,DC=com`, privileged: false, ...g }));
+
+function adGroups(params) {
+  const q = String(params.get('q') || '').trim();
+  if (q.length < 2) {
+    throw new HttpError(400, 'bad_request', 'q must be at least 2 characters.');
+  }
+  const max = Math.min(Number(params.get('max')) || 25, 100);
+  const ql = q.toLowerCase();
+  const hits = AD_GROUPS.filter((g) => [g.sam, g.name, g.description].some((s) => String(s).toLowerCase().includes(ql)));
+  return { groups: hits.slice(0, max), truncated: hits.length > max };
+}
+
+// ---- impact preview (POST /api/preview/impact): baseline = saved configuration, proposed = the body's overrides.
+const PRIVILEGED = new Set(AD_GROUPS.filter((g) => g.privileged).map((g) => g.sam.toLowerCase()));
+
+function desiredFor(ident, cfg) {
+  const rec = ident.attrs || {};
+  const rp = rolePreview(rec, null, cfg.roles);
+  const lg = cfg.settings.lifecycle_groups || {};
+  const groups = [...new Set([...rp.groups, ...(lg.active_add || [])])].filter((g) => !PRIVILEGED.has(String(g).toLowerCase()));
+  const attrs = {};
+  for (const m of cfg.mappings.filter((x) => x.enabled)) {
+    try {
+      attrs[m.target_attr] = applyTemplate(m.template, rec);
+    }
+    catch (e) {
+      // a template the mock cannot run is skipped
+    }
+  }
+  Object.assign(attrs, rp.attributes);
+  return { groups, attrs, ou: rp.ou };
+}
+
+// The AD account as it is now: in step with the saved configuration, except John Smith (i2) misses a group.
+function currentAD(ident, baseDesired) {
+  if (ident.state === 'disabled') {
+    return { sam: ident.ad_sam || 'tleft', groups: ['GG-AllStaff', 'GG-Finance', 'Mailbox-Retention', 'GG-Mkt'], attrs: {} };
+  }
+  if (!ident.ad_sam) {
+    return null;
+  }
+  const groups = baseDesired.groups.filter((g) => !(ident.id === 'i2' && g === 'GG-AllStaff'));
+  return { sam: ident.ad_sam, groups, attrs: { ...baseDesired.attrs } };
+}
+
+function planFor(ident, cfg, baseCfg) {
+  if (ident.state === 'deleted') {
+    return null;
+  }
+  const desired = desiredFor(ident, cfg);
+  const cur = currentAD(ident, desiredFor(ident, baseCfg));
+  const lg = cfg.settings.lifecycle_groups || {};
+  const actions = [];
+  if (ident.state === 'disabled') {
+    const mode = lg.disabled_remove || (cfg.settings.ad && cfg.settings.ad.strip_groups_on_disable ? 'all_except' : 'none');
+    const keep = new Set([...(lg.disabled_keep || []), ...(lg.disabled_add || [])].map((g) => g.toLowerCase()));
+    const managed = new Set([...desired.groups, ...(lg.disabled_add || [])].map((g) => g.toLowerCase()));
+    actions.push(`Disable account ${cur.sam}`);
+    for (const g of cur.groups) {
+      if ((mode === 'all_except' && !keep.has(g.toLowerCase())) || (mode === 'managed' && managed.has(g.toLowerCase()))) {
+        actions.push(`Remove from group ${g}`);
+      }
+    }
+    for (const g of lg.disabled_add || []) {
+      if (!cur.groups.some((x) => x.toLowerCase() === g.toLowerCase())) {
+        actions.push(`Add to group ${g}`);
+      }
+    }
+    return { type: 'disable', actions };
+  }
+  if (!cur) {
+    const sam = `${String(ident.attrs.FirstName || '').slice(0, 1)}${ident.attrs.LastName || ''}`.toLowerCase();
+    actions.push(`Create account ${sam}${desired.ou ? ` in ${desired.ou}` : ''}`);
+    desired.groups.forEach((g) => actions.push(`Add to group ${g}`));
+    Object.entries(desired.attrs).forEach(([k, v]) => actions.push(`Set ${k} = "${v}"`));
+    return { type: 'create', actions };
+  }
+  desired.groups.filter((g) => !cur.groups.includes(g)).forEach((g) => actions.push(`Add to group ${g}`));
+  if (cfg.settings.engine && cfg.settings.engine.remove_stale_groups) {
+    cur.groups.filter((g) => !desired.groups.includes(g)).forEach((g) => actions.push(`Remove from group ${g}`));
+  }
+  Object.entries(desired.attrs).filter(([k, v]) => cur.attrs[k] !== v).forEach(([k, v]) => actions.push(`Set ${k}: "${cur.attrs[k] || ''}" -> "${v}"`));
+  return actions.length ? { type: 'update', actions } : null;
+}
+
+function impact(body) {
+  if (body.q === '__busy__') {
+    throw new HttpError(409, 'conflict', 'A preview or sync is already running.');
+  }
+  const baseCfg = { roles: db.roles, mappings: db.mappings, settings: db.settings };
+  const hasProposal = Array.isArray(body.roles) || Array.isArray(body.mappings) || Boolean(body.settings);
+  const propCfg = {
+    roles: Array.isArray(body.roles) ? body.roles : db.roles,
+    mappings: Array.isArray(body.mappings) ? body.mappings : db.mappings,
+    settings: body.settings && typeof body.settings === 'object' ? body.settings : db.settings,
+  };
+  const summary = { changed_people: 0, baseline: {}, proposed: {}, groups_added: [], groups_removed: [], attributes: [] };
+  const gAdd = {};
+  const gDel = {};
+  const attrs = {};
+  const bump = (o, k) => { o[k] = (o[k] || 0) + 1; };
+  const all = db.identities.map((ident) => {
+    const base = planFor(ident, baseCfg, baseCfg);
+    const prop = hasProposal ? planFor(ident, propCfg, baseCfg) : base;
+    if (!base && !prop) {
+      return null;
+    }
+    const bActs = base ? base.actions : [];
+    const pActs = prop ? prop.actions : [];
+    const lines = hasProposal ? [...pActs.filter((a) => !bActs.includes(a)).map((text) => ({ op: '+', text })), ...bActs.filter((a) => !pActs.includes(a)).map((text) => ({ op: '-', text }))] : [];
+    let difference = 'same';
+    if (!base && prop) {
+      difference = 'new';
+    }
+    else if (base && !prop) {
+      difference = 'gone';
+    }
+    else if (lines.length) {
+      difference = 'changed';
+    }
+    if (base) {
+      bump(summary.baseline, base.type);
+    }
+    if (prop) {
+      bump(summary.proposed, prop.type);
+    }
+    for (const l of lines) {
+      const g = l.text.match(/^Add to group (.+)$/);
+      const r = l.text.match(/^Remove from group (.+)$/);
+      const a = l.text.match(/^Set ([^ :=]+)/);
+      if (g) {
+        bump(l.op === '+' ? gAdd : gDel, g[1]);
+      }
+      if (r) {
+        bump(l.op === '+' ? gDel : gAdd, r[1]);
+      }
+      if (a && l.op === '+') {
+        bump(attrs, a[1]);
+      }
+    }
+    if (difference !== 'same') {
+      summary.changed_people += 1;
+    }
+    const brief = (p) => (p ? { type: p.type, summary: p.actions } : null);
+    return {
+      identity_id: ident.id, external_id: ident.external_id, display: ident.display, ad_sam: ident.ad_sam || '', state: ident.state,
+      difference, baseline: brief(base), proposed: brief(prop), lines,
+    };
+  }).filter(Boolean);
+  const toList = (o, k) => Object.entries(o).map(([name, people]) => ({ [k]: name, people })).sort((a, b) => b.people - a.people);
+  summary.groups_added = toList(gAdd, 'group');
+  summary.groups_removed = toList(gDel, 'group');
+  summary.attributes = toList(attrs, 'attr');
+  const onlyChanged = body.only_changed !== false;
+  const q = String(body.q || '').trim().toLowerCase();
+  const filtered = all.filter((it) => (!onlyChanged || it.difference !== 'same')
+    && (!body.type || (it.baseline && it.baseline.type === body.type) || (it.proposed && it.proposed.type === body.type))
+    && (!q || [it.display, it.external_id, it.ad_sam].some((s) => String(s).toLowerCase().includes(q))));
+  const limit = Math.min(Number(body.limit) || 50, 500);
+  const offset = Number(body.offset) || 0;
+  return {
+    generated_at: now(), snapshot_at: ago(body.refresh ? 0 : 42), people: all.length, names_checked: false, notes: [],
+    summary, items: filtered.slice(offset, offset + limit), total: filtered.length,
+  };
 }
 
 // ------------------------------------------------------------------ router
@@ -604,6 +891,16 @@ function route(method, path, params, body) {
     return undefined;
   };
 
+  if (method === 'POST' && path === '/sources/test') {
+    need('admin');
+    if (!body || !body.type) {
+      throw new HttpError(400, 'invalid', 'type is required');
+    }
+    return {
+      ok: true, count: 2, error: '', attributes: ['id', 'name.first'],
+      sample: [{ id: 'E1', 'name.first': 'Jane' }, { id: 'E2', 'name.first': 'Bob' }],
+    };
+  }
   const hasUnmaskedConfig = (cfg) => cfg || {};
   let r = crud('sources', () => db.sources, 'admin', (b) => ({
     name: b.name, type: b.type, enabled: b.enabled, options: b.options || {}, config: hasUnmaskedConfig(b.config),
@@ -638,6 +935,10 @@ function route(method, path, params, body) {
   r = crud('mappings', () => db.mappings, 'admin', mapBuild);
   if (r !== undefined) {
     return r;
+  }
+  if (method === 'POST' && path === '/roles/preview') {
+    need('admin');
+    return rolePreview(body.record || {}, body.rule || null);
   }
   r = crud('roles', () => db.roles, 'admin', (b) => ({
     name: b.name, description: b.description || '', enabled: b.enabled, priority: b.priority, match: b.match, conditions: b.conditions || [], grants: b.grants || {},
@@ -698,9 +999,15 @@ function route(method, path, params, body) {
       return { ok: false, output: '', error: e.message };
     }
   }
-  if (method === 'POST' && path === '/roles/preview') {
+  if (method === 'GET' && path === '/ad/groups') {
     need('admin');
-    return rolePreview(body.record || {});
+    return adGroups(params);
+  }
+  if (method === 'POST' && path === '/preview/impact') {
+    need('admin');
+    const res = impact(body || {});
+    audit(db.session.user.username, 'preview.impact', 'preview', 'impact', { q: body.q || '' });
+    return res;
   }
   if (path === '/settings') {
     if (method === 'GET') {

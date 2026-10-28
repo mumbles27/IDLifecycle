@@ -194,6 +194,66 @@ const (
 	RenameAlways      = "always"
 )
 
+// What a disable does with the account's groups (LifecycleGroups.DisabledRemove).
+const (
+	DisabledRemoveAllExcept = "all_except" // every group except disabled_keep and disabled_add (privileged groups are kept by the script)
+	DisabledRemoveManaged   = "managed"    // only groups this service manages (role groups, active_add, disabled_add)
+	DisabledRemoveNone      = "none"       // no group is removed
+)
+
+// LifecycleGroups are groups tied to an account's lifecycle state rather than to a role. Lists hold group identities as
+// typed (sAMAccountName or DN), like role grants.
+type LifecycleGroups struct {
+	ActiveAdd      []string `json:"active_add"`      // every active account is a member (create, update, enable)
+	DisabledAdd    []string `json:"disabled_add"`    // added on disable, removed again on enable
+	DisabledRemove string   `json:"disabled_remove"` // all_except | managed | none; "" = derived from ad.strip_groups_on_disable
+	DisabledKeep   []string `json:"disabled_keep"`   // never removed on disable
+}
+
+// ApplyDefaults fills values derived from older settings documents (call after loading a stored document).
+func (s *Settings) ApplyDefaults() {
+	l := &s.Lifecycle
+	if l.DisabledRemove == "" {
+		l.DisabledRemove = DisabledRemoveNone
+		if s.AD.StripGroupsOnDisable {
+			l.DisabledRemove = DisabledRemoveAllExcept
+		}
+	}
+	for _, p := range []*[]string{&l.ActiveAdd, &l.DisabledAdd, &l.DisabledKeep} {
+		if *p == nil {
+			*p = []string{}
+		}
+	}
+}
+
+func (l *LifecycleGroups) validate() error {
+	switch l.DisabledRemove {
+	case DisabledRemoveAllExcept, DisabledRemoveManaged, DisabledRemoveNone:
+	default:
+		return fmt.Errorf("lifecycle_groups.disabled_remove must be all_except, managed or none")
+	}
+	for name, p := range map[string]*[]string{"active_add": &l.ActiveAdd, "disabled_add": &l.DisabledAdd, "disabled_keep": &l.DisabledKeep} {
+		clean := []string{}
+		seen := map[string]bool{}
+		for _, g := range *p {
+			g = strings.TrimSpace(g)
+			if g == "" || seen[strings.ToLower(g)] {
+				continue
+			}
+			if len(g) > 512 || strings.ContainsAny(g, "\r\n") {
+				return fmt.Errorf("lifecycle_groups.%s: %q is not a group name or DN", name, g)
+			}
+			seen[strings.ToLower(g)] = true
+			clean = append(clean, g)
+		}
+		if len(clean) > 100 {
+			return fmt.Errorf("lifecycle_groups.%s: at most 100 groups", name)
+		}
+		*p = clean
+	}
+	return nil
+}
+
 // CorrelationRule compares one source field with one AD attribute.
 type CorrelationRule struct {
 	Field    string `json:"field"`
@@ -300,6 +360,7 @@ type Settings struct {
 	Backup    BackupSettings      `json:"backup"`
 	Placement PlacementSettings   `json:"placement"`
 	Correlate CorrelationSettings `json:"correlation"`
+	Lifecycle LifecycleGroups     `json:"lifecycle_groups"`
 }
 
 // DefaultSettings are deliberately conservative: dry-run on, everything manual.
@@ -448,6 +509,12 @@ func (s *Settings) Validate() error {
 	if err := s.Correlate.validate(); err != nil {
 		return err
 	}
+	s.ApplyDefaults()
+	if err := s.Lifecycle.validate(); err != nil {
+		return err
+	}
+	// The old switch follows the new mode, for anything that still reads it.
+	s.AD.StripGroupsOnDisable = s.Lifecycle.DisabledRemove != DisabledRemoveNone
 
 	pl := &s.Placement
 	pl.Field = strings.TrimSpace(pl.Field)

@@ -206,14 +206,14 @@ func (e *Engine) applyBatch(ctx context.Context, s model.Settings, typ string, b
 	case model.ChangeEnable:
 		items := make([]ad.EnableItem, 0, len(claimed))
 		for _, c := range claimed {
-			items = append(items, ad.EnableItem{ChangeID: c.ID, ExternalID: c.ExternalID, ObjectGUID: c.Payload.ObjectGUID, MoveTo: c.Payload.MoveTo, AddGroups: c.Payload.AddGroups})
+			items = append(items, ad.EnableItem{ChangeID: c.ID, ExternalID: c.ExternalID, ObjectGUID: c.Payload.ObjectGUID, MoveTo: c.Payload.MoveTo, AddGroups: c.Payload.AddGroups, RemoveGroups: c.Payload.RemoveGroups})
 		}
 		results, callErr = e.AD.Enable(ctx, opts, items)
 	case model.ChangeDisable:
 		items := make([]ad.DisableItem, 0, len(claimed))
 		for _, c := range claimed {
 			items = append(items, ad.DisableItem{ChangeID: c.ID, ExternalID: c.ExternalID, ObjectGUID: c.Payload.ObjectGUID,
-				MoveTo: c.Payload.MoveTo, RemoveGroups: c.Payload.RemoveGroups,
+				MoveTo: c.Payload.MoveTo, RemoveGroups: c.Payload.RemoveGroups, AddGroups: c.Payload.AddGroups,
 				Description: "Disabled by IDLifecycle on " + e.Now().UTC().Format("2006-01-02") + " (no longer active in source)"})
 		}
 		results, callErr = e.AD.Disable(ctx, opts, items)

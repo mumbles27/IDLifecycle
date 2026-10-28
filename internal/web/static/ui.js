@@ -354,6 +354,11 @@ document.addEventListener('keydown', (ev) => {
   }
   const top = modalStack[modalStack.length - 1];
   if (ev.key === 'Escape') {
+    // An open combobox list (group picker) closes itself first; the dialog stays open.
+    const t = ev.target;
+    if (t && t.getAttribute && t.getAttribute('role') === 'combobox' && t.getAttribute('aria-expanded') === 'true') {
+      return;
+    }
     ev.preventDefault();
     ev.stopPropagation();
     top.close(undefined);

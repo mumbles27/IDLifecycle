@@ -7,12 +7,10 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"idlifecycle/internal/model"
 )
-
-// ValidOps are the supported condition operators.
-var ValidOps = map[string]bool{"eq": true, "ne": true, "in": true, "contains": true, "starts_with": true, "regex": true, "exists": true}
 
 var (
 	reCache sync.Map // pattern -> *regexp.Regexp (bounded)
@@ -41,18 +39,9 @@ func ValidateRole(r model.RoleRule) error {
 	if r.Match != "all" && r.Match != "any" {
 		return fmt.Errorf("match must be all or any")
 	}
-	for i, c := range r.Conditions {
-		if strings.TrimSpace(c.Attr) == "" {
-			return fmt.Errorf("conditions[%d].attr is required", i)
-		}
-		if !ValidOps[c.Op] {
-			return fmt.Errorf("conditions[%d].op %q is not valid", i, c.Op)
-		}
-		if c.Op == "regex" {
-			if _, err := compile(c.Value); err != nil {
-				return fmt.Errorf("conditions[%d].value is not a valid regular expression: %v", i, err)
-			}
-		}
+	count := 0
+	if err := validateConditions(r.Conditions, "conditions", 1, &count); err != nil {
+		return err
 	}
 	for i, g := range r.Grants.Groups {
 		if strings.TrimSpace(g) == "" {
@@ -142,33 +131,6 @@ func IsProtectedAttribute(name string) bool {
 	return false
 }
 
-func condMatch(c model.Condition, attrs map[string]string) bool {
-	v := lookupAttr(attrs, c.Attr)
-	switch c.Op {
-	case "eq":
-		return strings.EqualFold(strings.TrimSpace(v), strings.TrimSpace(c.Value))
-	case "ne":
-		return !strings.EqualFold(strings.TrimSpace(v), strings.TrimSpace(c.Value))
-	case "in":
-		for _, part := range strings.Split(c.Value, ",") {
-			if strings.EqualFold(strings.TrimSpace(v), strings.TrimSpace(part)) {
-				return true
-			}
-		}
-		return false
-	case "contains":
-		return strings.Contains(strings.ToLower(v), strings.ToLower(c.Value))
-	case "starts_with":
-		return strings.HasPrefix(strings.ToLower(v), strings.ToLower(c.Value))
-	case "regex":
-		re, err := compile(c.Value)
-		return err == nil && re.MatchString(v)
-	case "exists":
-		return strings.TrimSpace(v) != ""
-	}
-	return false
-}
-
 // lookupAttr finds a source attribute by exact key, then case-insensitively.
 func lookupAttr(attrs map[string]string, name string) string {
 	if v, ok := attrs[name]; ok {
@@ -182,8 +144,12 @@ func lookupAttr(attrs map[string]string, name string) string {
 	return ""
 }
 
-// RuleMatches reports whether an enabled rule applies. A rule with no conditions applies to everyone.
+// RuleMatches reports whether an enabled rule applies now. A rule with no conditions applies to everyone.
 func RuleMatches(r model.RoleRule, attrs map[string]string) bool {
+	return ruleMatchesAt(r, attrs, time.Now())
+}
+
+func ruleMatchesAt(r model.RoleRule, attrs map[string]string, now time.Time) bool {
 	if !r.Enabled {
 		return false
 	}
@@ -192,14 +158,14 @@ func RuleMatches(r model.RoleRule, attrs map[string]string) bool {
 	}
 	if r.Match == "any" {
 		for _, c := range r.Conditions {
-			if condMatch(c, attrs) {
+			if condMatch(c, attrs, now) {
 				return true
 			}
 		}
 		return false
 	}
 	for _, c := range r.Conditions {
-		if !condMatch(c, attrs) {
+		if !condMatch(c, attrs, now) {
 			return false
 		}
 	}
@@ -217,13 +183,18 @@ type Resolved struct {
 // ResolveRoles evaluates rules in ascending priority so that higher-priority rules apply last
 // (and therefore win for OU and for attribute grants on the same target attribute).
 func ResolveRoles(rules []model.RoleRule, attrs map[string]string) Resolved {
+	return ResolveRolesAt(rules, attrs, time.Now())
+}
+
+// ResolveRolesAt is ResolveRoles at a given time (day-count conditions).
+func ResolveRolesAt(rules []model.RoleRule, attrs map[string]string, now time.Time) Resolved {
 	sorted := append([]model.RoleRule(nil), rules...)
 	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].Priority < sorted[j].Priority })
 
 	var res Resolved
 	seen := map[string]bool{}
 	for _, r := range sorted {
-		if !RuleMatches(r, attrs) {
+		if !ruleMatchesAt(r, attrs, now) {
 			continue
 		}
 		res.Matched = append(res.Matched, r)

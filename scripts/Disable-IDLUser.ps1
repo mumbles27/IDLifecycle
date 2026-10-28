@@ -8,7 +8,7 @@
     Request:
       {"server":"", "idAttribute":"employeeID", "items":[
          {"changeId":"c1","externalId":"E1001","objectGuid":"<guid>","moveTo":"OU=Disabled,DC=...",
-          "removeGroups":["GG-AllStaff"],"description":"Disabled by IDLifecycle 2026-10-16"} ]}
+          "removeGroups":["GG-AllStaff"],"addGroups":["GG-Disabled"],"description":"Disabled by IDLifecycle 2026-10-16"} ]}
 
     Per item the script finds the account by objectGuid (all items in one bulk query), VERIFIES that its
     idAttribute equals externalId (otherwise the item fails and nothing is touched), then:
@@ -18,8 +18,11 @@
       4. removes it from the listed groups it is a member of (sAMAccountName or DN; unknown groups are warned and ignored;
          privileged and ambiguous groups are KEPT with a WARN log, a 'Skipped' report row and a
          "kept privileged group(s): ..." note in the message - never a failure),
-      5. moves it to moveTo (if given and it is not already there).
-    It is idempotent: an already-disabled account still gets steps 2-5; if nothing needed doing the status is "skipped".
+      5. adds it to the addGroups it is not yet a member of (e.g. a "Disabled Users" group). Never a failure either:
+         a privileged group (adminCount=1 or a protected RID) is refused, an ambiguous or unknown one ignored - each with a
+         WARN log, a 'Skipped' report row and a "not added: ..." note in the message,
+      6. moves it to moveTo (if given and it is not already there).
+    It is idempotent: an already-disabled account still gets steps 2-6; if nothing needed doing the status is "skipped".
     One failing item never stops the others.
 
     Response: {"ok":true,"dryRun":false,"results":[{"changeId","externalId","status":"applied|would|skipped|failed",
@@ -95,6 +98,12 @@ try{
         }
 
         $groups = Get-IDLStringList -Value (Get-IDLField -Object $item -Name 'removeGroups')
+        if ($groups.Count -gt 0){
+            $needMemberOf = $true
+            $allGroups.AddRange($groups)
+        }
+
+        $groups = Get-IDLStringList -Value (Get-IDLField -Object $item -Name 'addGroups')
         if ($groups.Count -gt 0){
             $needMemberOf = $true
             $allGroups.AddRange($groups)
@@ -214,6 +223,27 @@ try{
                 $changes += Update-IDLGroupMembership -User $user -RemoveDns $removeDns -Server $server -DryRun:$DryRun -Done $done
             }
 
+            # Groups a disabled account joins (e.g. "Disabled Users"). Like the removals this never blocks the disable:
+            # privileged groups are refused, ambiguous and unknown ones ignored - all reported.
+            $notAdded = [System.Collections.Generic.List[string]]::new()
+            $addInfo = Get-IDLGroupDns -Identities (Get-IDLStringList -Value (Get-IDLField -Object $item -Name 'addGroups')) -GroupMap $groupMap -SkipPrivileged
+            foreach ($missingGroup in $addInfo.Missing){
+                Write-IDLLog "  Group '$missingGroup' not found; $identity is not added to it" 'WARN'
+                Add-IDLReportRow -Action 'AddGroupMember' -Result 'Skipped' -Identity $identity -ObjectIdOrDN $userDn -Details "$($missingGroup): not found"
+                $notAdded.Add("$missingGroup (not found)")
+            }
+
+            foreach ($skip in $addInfo.Skipped){
+                $why = (($skip.Kind -eq 'privileged') ? ("a protected administrative group ($($skip.Reason)); refusing to add the account") : ("ambiguous ($($skip.Reason)); not added"))
+                Write-IDLLog "  Group '$($skip.Identity)' is $why" 'WARN'
+                Add-IDLReportRow -Action 'AddGroupMember' -Result 'Skipped' -Identity $identity -ObjectIdOrDN $userDn -Details "$($skip.Identity): $why"
+                $notAdded.Add("$($skip.Identity) ($($skip.Kind))")
+            }
+
+            if ($addInfo.Dns.Count -gt 0){
+                $changes += Update-IDLGroupMembership -User $user -AddDns $addInfo.Dns -Server $server -DryRun:$DryRun -Done $done
+            }
+
             $finalDn = $userDn
             if ($moveTo -ne ''){
                 $newDn = Move-IDLUser -User $user -TargetOu $moveTo -Server $server -DryRun:$DryRun -Done $done
@@ -233,6 +263,10 @@ try{
 
             if ($keptAmbiguous.Count -gt 0){
                 $notes.Add('kept ambiguous group(s): ' + ($keptAmbiguous -join ', '))
+            }
+
+            if ($notAdded.Count -gt 0){
+                $notes.Add('not added: ' + ($notAdded -join ', '))
             }
 
             $userFields = Get-IDLUserFields -User $user -DnOverride $finalDn

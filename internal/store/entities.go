@@ -17,12 +17,14 @@ func (s *Store) GetSettings(ctx context.Context) (model.Settings, error) {
 	var v string
 	err := s.queryRow(ctx, `SELECT setting_value FROM settings WHERE setting_key = ?`, "settings").Scan(&v)
 	if errors.Is(err, sql.ErrNoRows) {
+		st.ApplyDefaults()
 		return st, nil
 	}
 	if err != nil {
 		return st, err
 	}
 	fromJSON(v, &st)
+	st.ApplyDefaults()
 	return st, nil
 }
 

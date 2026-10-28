@@ -55,6 +55,24 @@ $script:PollSeconds = 10
 
 #region Pure helpers (tested with -DefineOnly)
 
+function Get-IDLTrayPromotionKeys {
+    # Windows 11 / Server 2025 put a new tray icon behind the "^" overflow. Its per-user entry (HKCU\Control
+    # Panel\NotifyIconSettings\<id>: ExecutablePath, InitialTooltip, IsPromoted) appears once the icon was shown.
+    # Returns the ids of this tray's entries that are not promoted yet: pwsh.exe icons whose first tooltip was ours.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Entries,
+        [Parameter(Mandatory)][string]$Product
+    )
+
+    $prefix = "$Product - "
+    return [string[]]@($Entries | Where-Object {
+            ([string]$_.ExecutablePath -match '(^|\\)pwsh\.exe$') -and
+            ([string]$_.InitialTooltip).StartsWith($prefix, [System.StringComparison]::Ordinal) -and
+            ([int]$_.IsPromoted -ne 1)
+        } | ForEach-Object { [string]$_.Key })
+}
+
 function Get-IDLTrayStateText {
     # Win32 service / ServiceController states -> words for people.
     [CmdletBinding()]
@@ -749,6 +767,47 @@ function Update-IDLTrayMenu {
     }
 }
 
+function Set-IDLTrayPromoted {
+    # Shows the icon in the taskbar instead of the overflow - once per user (marker HKCU\Software\IDLifecycle\Tray
+    # Promoted = 1), so an icon the user hides again stays hidden. Returns $true when done (or nothing to do here).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Product
+    )
+
+    $marker = 'HKCU:\Software\IDLifecycle\Tray'
+    if ((Get-ItemProperty -LiteralPath $marker -Name 'Promoted' -ErrorAction SilentlyContinue).Promoted -eq 1){
+        return $true
+    }
+
+    $root = 'HKCU:\Control Panel\NotifyIconSettings'
+    if (-not (Test-Path -LiteralPath $root)){
+        return $true # older Windows: icons are shown by the taskbar's own rules
+    }
+
+    $entries = @(Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue | ForEach-Object {
+            $p = Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue
+            [pscustomobject]@{
+                Key            = $_.PSChildName
+                ExecutablePath = [string]($p.PSObject.Properties['ExecutablePath'].Value)
+                InitialTooltip = [string]($p.PSObject.Properties['InitialTooltip'].Value)
+                IsPromoted     = [int]($p.PSObject.Properties['IsPromoted'].Value)
+            }
+        })
+    $ours = @($entries | Where-Object { ([string]$_.InitialTooltip).StartsWith("$Product - ", [System.StringComparison]::Ordinal) })
+    if ($ours.Count -eq 0){
+        return $false # Windows has not registered the icon yet: try again on the next tick
+    }
+
+    foreach ($key in (Get-IDLTrayPromotionKeys -Entries $entries -Product $Product)){
+        Set-ItemProperty -LiteralPath (Join-Path -Path $root -ChildPath $key) -Name 'IsPromoted' -Value 1 -Type DWord
+    }
+
+    $null = New-Item -Path $marker -Force
+    Set-ItemProperty -LiteralPath $marker -Name 'Promoted' -Value 1 -Type DWord
+    return $true
+}
+
 function Start-IDLTray {
     # Runs the tray until Exit (or until tray.json disappears).
     [CmdletBinding()]
@@ -827,9 +886,25 @@ function Start-IDLTray {
         $script:Tray.Icon.ShowBalloonTip(8000, $script:Branding.ProductName, $script:Branding.Warning, [System.Windows.Forms.ToolTipIcon]::Warning)
     }
 
+    $script:Promoted = $false
+    $script:PromoteTries = 0
     $timer = [System.Windows.Forms.Timer]::new()
     $timer.Interval = $script:PollSeconds * 1000
     $timer.Add_Tick({
+            if (
+                (-not $script:Promoted) -and
+                ($script:PromoteTries -lt 6)
+            ){
+                $script:PromoteTries++
+                try{
+                    $script:Promoted = Set-IDLTrayPromoted -Product $script:Branding.ProductName
+                }
+                catch{
+                    $script:Promoted = $true # never retry a failing registry write every tick
+                    Write-Verbose "Tray icon not promoted: $($_.Exception.Message)"
+                }
+            }
+
             if (-not (Test-Path -LiteralPath $script:InfoPath -PathType Leaf)){
                 # Uninstalled: the tray goes away by itself.
                 $script:Tray.Icon.Visible = $false

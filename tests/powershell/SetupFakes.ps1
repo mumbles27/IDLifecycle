@@ -406,6 +406,23 @@ function New-IDLSetupShortcut {
     Save-FakeState -State $s
 }
 
+function Test-IDLSetupDesktopSession {
+    return (-not [bool](Read-FakeState)['noDesktop'])
+}
+
+function Test-IDLSetupTrayRunning {
+    return [bool](Read-FakeState)['trayRunning']
+}
+
+function Start-IDLSetupTrayNow {
+    param([string]$Shortcut)
+
+    Add-FakeCall -Op 'startTray' -Data $Shortcut
+    $s = Read-FakeState
+    $s['trayRunning'] = $true
+    Save-FakeState -State $s
+}
+
 function Remove-IDLSetupShortcut {
     param([string]$Path)
 

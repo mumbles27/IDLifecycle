@@ -123,7 +123,7 @@ type Planned struct {
 // PlanIdentity decides what (if anything) must change for one person. acct is nil when no AD account is linked.
 func PlanIdentity(pc *PlanContext, id model.Identity, acct *ad.User) (*Planned, []string, error) {
 	var warnings []string
-	res := ResolveRoles(pc.Rules, id.Attrs)
+	res := ResolveRolesAt(pc.Rules, id.Attrs, pc.now())
 	maps := mergeMappings(pc.Mappings, res.Attrs)
 	// Rules saved before validation tightened may still target the link key or a protected attribute; the
 	// scripts would refuse the whole item, so drop just that attribute and say so.
@@ -146,7 +146,8 @@ func PlanIdentity(pc *PlanContext, id model.Identity, acct *ad.User) (*Planned, 
 		return nil, warnings, err
 	}
 
-	groupDNs, w := resolveGroups(pc, res.Groups)
+	// Lifecycle: every active account is in lifecycle_groups.active_add, like a role that matches everyone.
+	groupDNs, w := resolveGroups(pc, append(append([]string{}, res.Groups...), pc.Settings.Lifecycle.ActiveAdd...))
 	warnings = append(warnings, w...)
 	place := ResolvePlacement(pc.Settings, id, res.OU)
 	if place.Reason != "" && !place.Needs && (acct == nil || !acct.Enabled) {
@@ -336,10 +337,12 @@ func planDeactivate(pc *PlanContext, id model.Identity, acct *ad.User) *Planned 
 			p.Payload.MoveTo = s.AD.DisabledOU
 			p.Summary = append(p.Summary, "Move to "+s.AD.DisabledOU)
 		}
-		if s.AD.StripGroupsOnDisable && len(acct.MemberOf) > 0 {
-			p.Payload.RemoveGroups = append([]string(nil), acct.MemberOf...)
-			sort.Strings(p.Payload.RemoveGroups)
-			p.Summary = append(p.Summary, fmt.Sprintf("Remove from %d group(s)", len(acct.MemberOf)))
+		p.Payload.RemoveGroups, p.Payload.AddGroups = disableGroups(pc, acct)
+		if n := len(p.Payload.RemoveGroups); n > 0 {
+			p.Summary = append(p.Summary, fmt.Sprintf("Remove from %d group(s)", n))
+		}
+		for _, g := range p.Payload.AddGroups {
+			p.Summary = append(p.Summary, "Add to group "+shortCN(g)+" (disabled accounts)")
 		}
 		return p
 	}
@@ -367,6 +370,14 @@ func planEnable(pc *PlanContext, acct *ad.User, groupDNs []string, ou string) *P
 	for _, g := range groupDNs {
 		p.Summary = append(p.Summary, "Add to group "+shortCN(g))
 	}
+	// Groups only disabled accounts are in (lifecycle_groups.disabled_add) are left on re-enable.
+	for _, g := range lifecycleDNs(pc, pc.Settings.Lifecycle.DisabledAdd) {
+		if inGroups(acct.MemberOf, g) {
+			p.Payload.RemoveGroups = append(p.Payload.RemoveGroups, g)
+			p.Summary = append(p.Summary, "Remove from group "+shortCN(g)+" (disabled accounts)")
+		}
+	}
+	sort.Strings(p.Payload.RemoveGroups)
 	return p
 }
 
@@ -517,4 +528,77 @@ func placementNote(p Placement) string {
 		}
 	}
 	return ""
+}
+
+func (pc *PlanContext) now() time.Time {
+	if pc.Now.IsZero() {
+		return time.Now()
+	}
+	return pc.Now
+}
+
+// lifecycleDNs resolves lifecycle group identities to DNs (groups AD does not know are left out; the run already
+// warned about them when the snapshot resolved them).
+func lifecycleDNs(pc *PlanContext, identities []string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, g := range identities {
+		if dn, ok := pc.GroupDN[strings.ToLower(strings.TrimSpace(g))]; ok && !seen[strings.ToLower(dn)] {
+			seen[strings.ToLower(dn)] = true
+			out = append(out, dn)
+		}
+	}
+	return out
+}
+
+func inGroups(memberOf []string, dn string) bool {
+	for _, m := range memberOf {
+		if strings.EqualFold(m, dn) {
+			return true
+		}
+	}
+	return false
+}
+
+// disabledRemoveMode is lifecycle_groups.disabled_remove, derived from ad.strip_groups_on_disable when unset.
+func disabledRemoveMode(s model.Settings) string {
+	if m := s.Lifecycle.DisabledRemove; m != "" {
+		return m
+	}
+	if s.AD.StripGroupsOnDisable {
+		return model.DisabledRemoveAllExcept
+	}
+	return model.DisabledRemoveNone
+}
+
+// disableGroups decides group changes when an account is disabled: which memberships to remove (by
+// lifecycle_groups.disabled_remove, never disabled_keep or disabled_add) and which disabled_add groups to add.
+// Privileged groups are still listed for removal; the script keeps them and says so.
+func disableGroups(pc *PlanContext, acct *ad.User) (remove, add []string) {
+	keep := map[string]bool{}
+	for _, g := range lifecycleDNs(pc, pc.Settings.Lifecycle.DisabledKeep) {
+		keep[strings.ToLower(g)] = true
+	}
+	addDNs := lifecycleDNs(pc, pc.Settings.Lifecycle.DisabledAdd)
+	for _, g := range addDNs {
+		keep[strings.ToLower(g)] = true
+	}
+	mode := disabledRemoveMode(pc.Settings)
+	if mode != model.DisabledRemoveNone {
+		for _, g := range acct.MemberOf {
+			l := strings.ToLower(g)
+			if keep[l] || (mode == model.DisabledRemoveManaged && !pc.ManagedDNs[l]) {
+				continue
+			}
+			remove = append(remove, g)
+		}
+	}
+	for _, g := range addDNs {
+		if !inGroups(acct.MemberOf, g) {
+			add = append(add, g)
+		}
+	}
+	sort.Strings(remove)
+	sort.Strings(add)
+	return remove, add
 }

@@ -597,7 +597,7 @@ export async function render(root, ctx) {
         field('Disabled OU', inputText(ad, 'disabled_ou', { placeholder: 'OU=Disabled,DC=corp,DC=example,DC=com' }), { help: 'Disabled accounts are moved here. Blank leaves them in place.' }),
         field('UPN suffix', inputText(ad, 'upn_suffix', { placeholder: 'corp.example.com' }))),
       field('Search bases (one per line)', inputArea(view, 'bases', { rows: '3', placeholder: 'OU=Staff,DC=corp,DC=example,DC=com', 'data-test': 'set-bases' }), { help: 'Only accounts under these OUs are managed.' }),
-      inputCheck(ad, 'strip_groups_on_disable', 'Remove all group memberships when disabling an account'));
+      h('p', { class: 'help', 'data-test': 'set-lifecycle-link' }, 'Which groups a disabled account loses or keeps, and the groups every active account gets, are set on ', h('a', { href: '#/lifecycle' }, 'Lifecycle groups'), '.'));
 
     // ---- naming
     const nPreview = previewPanel({

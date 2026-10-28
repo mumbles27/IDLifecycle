@@ -273,8 +273,23 @@ Describe 'Install-IDLifecycle.ps1 (fakes for every system change; temp folders o
                     (Join-Path $desktop 'Programs\IDLifecycle\IDLifecycle Tray.lnk'),
                     (Join-Path $desktop 'Startup\IDLifecycle Tray.lnk')) | Sort-Object) -join '|')
         $lnk = $shortcuts[(Join-Path $desktop 'Startup\IDLifecycle Tray.lnk')]
-        $lnk['Arguments'] | Should Be ('-NoProfile -STA -WindowStyle Hidden -ExecutionPolicy RemoteSigned -File "{0}"' -f (Join-Path $fx.Install 'scripts\Start-IDLifecycleTray.ps1'))
+        # Machine-wide PowerShell 7 is started directly; otherwise Windows PowerShell runs the launcher (never a
+        # version-numbered Microsoft Store path).
+        $machinePwsh = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'
+        if (Test-Path -LiteralPath $machinePwsh){
+            $lnk['Target'] | Should Be $machinePwsh
+            $lnk['Arguments'] | Should Be ('-NoProfile -STA -WindowStyle Hidden -ExecutionPolicy RemoteSigned -File "{0}"' -f (Join-Path $fx.Install 'scripts\Start-IDLifecycleTray.ps1'))
+        }
+        else{
+            $lnk['Target'] | Should Be (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')
+            $lnk['Arguments'] | Should Be ('-NoProfile -WindowStyle Hidden -ExecutionPolicy RemoteSigned -File "{0}" -ExecutionPolicy RemoteSigned' -f (Join-Path $fx.Install 'scripts\Start-IDLifecycleTrayLauncher.ps1'))
+        }
+
+        $lnk['Target'] | Should Not Match 'WindowsApps'
         $lnk['Arguments'] | Should Not Match 'Bypass'
+        # The tray is started at once for the signed-in user (through Explorer, never elevated).
+        @(Get-FakeCalls -Path $fx.State -Op 'startTray')[0]['data'] | Should Be (Join-Path $desktop 'Programs\IDLifecycle\IDLifecycle Tray.lnk')
+        $r.ReportText | Should Match '"StartTray","Applied"'
         $shortcuts[(Join-Path $desktop 'Programs\IDLifecycle\IDLifecycle Setup.lnk')]['Target'] | Should Be (Join-Path $fx.Install 'Setup.cmd')
         (Test-Path -LiteralPath (Join-Path $desktop 'IDLifecycle-Branding\README.txt')) | Should Be $true
         foreach ($step in @('WriteTrayInfo', 'BrandingFolder', 'SetupShortcut', 'TrayShortcut', 'TrayAutostart')){
@@ -288,6 +303,15 @@ Describe 'Install-IDLifecycle.ps1 (fakes for every system change; temp folders o
             $r.ReportText | Should Match ('"' + $step + '","Skipped"')
         }
 
+        # No desktop in this session (e.g. a remote PowerShell session): the tray waits for the next sign-in.
+        Update-FakeSetupState -Path $fx.State -Change { param($s) $s['noDesktop'] = $true }
+        Reset-FakeCalls -Path $fx.State
+        $r = Invoke-SetupScript -Script 'Install-IDLifecycle' -Params (Get-BaseParams -Fx $fx) -StatePath $fx.State -AdminPassword $adminPw
+        $r.ExitCode | Should Be 0
+        $r.LogText | Should Match 'SKIP: StartTray .*no signed-in desktop here'
+        @(Get-FakeCalls -Path $fx.State -Op 'startTray').Count | Should Be 0
+        Update-FakeSetupState -Path $fx.State -Change { param($s) $s['noDesktop'] = $false }
+
         # A branding folder others can change is reported (WARN), never "fixed" silently.
         Update-FakeSetupState -Path $fx.State -Change { param($s) $s['brandingUntrusted'] = 'BUILTIN\Users can change it' }
         $r = Invoke-SetupScript -Script 'Install-IDLifecycle' -Params (Get-BaseParams -Fx $fx -Extra @{ NoTray = $true }) -StatePath $fx.State -AdminPassword $adminPw
@@ -295,6 +319,7 @@ Describe 'Install-IDLifecycle.ps1 (fakes for every system change; temp folders o
         $r.LogText | Should Match '\[WARN\] SKIP: BrandingFolder .*not protected \(BUILTIN\\Users can change it\)'
         $r.ReportText | Should Match '"RemoveTrayShortcut","Applied"'
         $r.ReportText | Should Match '"RemoveTrayAutostart","Applied"'
+        $r.ReportText | Should Match '"StartTray","Skipped"'
         @((Read-FakeSetupState -Path $fx.State)['shortcuts'].Keys) -join '|' | Should Be (Join-Path $desktop 'Programs\IDLifecycle\IDLifecycle Setup.lnk')
         $r.LogText | Should Not Match 'Tray icon: starts for everyone'
         Remove-SetupFixture -Fixture $fx

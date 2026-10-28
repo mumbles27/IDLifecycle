@@ -471,6 +471,31 @@ function New-IDLSetupShortcut {
     }
 }
 
+function Test-IDLSetupDesktopSession {
+    # True when this session has a desktop (Explorer runs in it), so a tray icon can be shown now.
+    $session = (Get-Process -Id $PID).SessionId
+    return ($session -ne 0) -and (@(Get-Process -Name 'explorer' -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $session }).Count -gt 0)
+}
+
+function Test-IDLSetupTrayRunning {
+    # True when a tray already runs in this session (a second one would only exit again).
+    $session = (Get-Process -Id $PID).SessionId
+    return (@(Get-CimInstance -ClassName Win32_Process -Filter "Name='pwsh.exe'" -ErrorAction SilentlyContinue | Where-Object {
+                ($_.SessionId -eq $session) -and ([string]$_.CommandLine -match 'Start-IDLifecycleTray\.ps1')
+            }).Count -gt 0)
+}
+
+function Start-IDLSetupTrayNow {
+    # Opens the tray shortcut through Explorer, so the tray runs as the signed-in user with Explorer's (not elevated)
+    # rights - never with this elevated installer's token.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Shortcut
+    )
+
+    Start-Process -FilePath (Join-Path -Path $env:SystemRoot -ChildPath 'explorer.exe') -ArgumentList ('"{0}"' -f $Shortcut)
+}
+
 function Remove-IDLSetupShortcut {
     [CmdletBinding()]
     param(
@@ -3100,21 +3125,25 @@ try{
     }
 
     $roots = Get-IDLSetupShortcutRoots
-    # A shortcut for everyone needs a pwsh.exe every user can start: the machine-wide install, not a per-version
-    # Microsoft Store path (which changes with every update).
-    $pwshExe = [System.Environment]::ProcessPath
+    # A shortcut for everyone needs a program every user can start. The machine-wide PowerShell 7 is started directly;
+    # without it (e.g. PowerShell from the Microsoft Store, whose pwsh.exe sits in a version-numbered folder that changes
+    # with every update and cannot be started by a shortcut) Windows PowerShell 5.1 runs a small launcher that finds the
+    # user's pwsh.exe at sign-in.
+    $trayScript = Join-Path -Path $installedScripts -ChildPath 'Start-IDLifecycleTray.ps1'
     $machinePwsh = Join-Path -Path $env:ProgramFiles -ChildPath 'PowerShell\7\pwsh.exe'
     if (Test-Path -LiteralPath $machinePwsh -PathType Leaf){
-        $pwshExe = $machinePwsh
+        $trayTarget = $machinePwsh
+        $trayArgs = '-NoProfile -STA -WindowStyle Hidden -ExecutionPolicy {0} -File "{1}"' -f $cfgPolicy, $trayScript
     }
-    elseif ($pwshExe -match '\\WindowsApps\\'){
-        Write-IDLLog "PowerShell 7 runs from the Microsoft Store ($pwshExe); the tray shortcut uses that path, which changes when it updates. Install the MSI version for a stable tray shortcut." 'WARN'
+    else{
+        $trayTarget = Join-Path -Path $env:SystemRoot -ChildPath 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $launcher = Join-Path -Path $installedScripts -ChildPath 'Start-IDLifecycleTrayLauncher.ps1'
+        $trayArgs = '-NoProfile -WindowStyle Hidden -ExecutionPolicy {0} -File "{1}" -ExecutionPolicy {0}' -f $cfgPolicy, $launcher
+        Write-IDLLog "PowerShell 7 is not installed machine-wide ($machinePwsh); the tray starts through Start-IDLifecycleTrayLauncher.ps1, which finds each user's pwsh.exe at sign-in."
     }
 
     $icon = Join-Path -Path $installedScripts -ChildPath 'branding\idlifecycle.ico'
-    $iconLocation = (((Test-Path -LiteralPath $icon -PathType Leaf) -or $DryRun) ? ("$icon,0") : ("$pwshExe,0"))
-    $trayScript = Join-Path -Path $installedScripts -ChildPath 'Start-IDLifecycleTray.ps1'
-    $trayArgs = '-NoProfile -STA -WindowStyle Hidden -ExecutionPolicy {0} -File "{1}"' -f $cfgPolicy, $trayScript
+    $iconLocation = (((Test-Path -LiteralPath $icon -PathType Leaf) -or $DryRun) ? ("$icon,0") : ("$trayTarget,0"))
     $shortcuts = [System.Collections.Generic.List[object]]::new()
     $setupCmd = Join-Path -Path $InstallDir -ChildPath 'Setup.cmd'
     if (
@@ -3124,8 +3153,8 @@ try{
         $shortcuts.Add(@{ Action = 'SetupShortcut'; Path = (Join-Path -Path $roots.Programs -ChildPath 'IDLifecycle Setup.lnk'); Target = $setupCmd; Arguments = ''; Description = 'Install, upgrade or remove IDLifecycle'; Tray = $false })
     }
 
-    $shortcuts.Add(@{ Action = 'TrayShortcut'; Path = (Join-Path -Path $roots.Programs -ChildPath 'IDLifecycle Tray.lnk'); Target = $pwshExe; Arguments = $trayArgs; Description = 'IDLifecycle tray icon'; Tray = $true })
-    $shortcuts.Add(@{ Action = 'TrayAutostart'; Path = (Join-Path -Path $roots.Startup -ChildPath 'IDLifecycle Tray.lnk'); Target = $pwshExe; Arguments = $trayArgs; Description = 'IDLifecycle tray icon (starts at sign-in)'; Tray = $true })
+    $shortcuts.Add(@{ Action = 'TrayShortcut'; Path = (Join-Path -Path $roots.Programs -ChildPath 'IDLifecycle Tray.lnk'); Target = $trayTarget; Arguments = $trayArgs; Description = 'IDLifecycle tray icon'; Tray = $true })
+    $shortcuts.Add(@{ Action = 'TrayAutostart'; Path = (Join-Path -Path $roots.Startup -ChildPath 'IDLifecycle Tray.lnk'); Target = $trayTarget; Arguments = $trayArgs; Description = 'IDLifecycle tray icon (starts at sign-in)'; Tray = $true })
     foreach ($s in $shortcuts){
         if (
             ($s.Tray) -and
@@ -3152,6 +3181,21 @@ try{
             ($existing.Icon -ieq $iconLocation)
         } `
             -Apply { New-IDLSetupShortcut -Path $s.Path -Target $s.Target -Arguments $s.Arguments -WorkingDirectory $installedScripts -Icon $iconLocation -Description $s.Description }
+    }
+
+    # The Startup shortcut only runs at the next sign-in: start the tray now for whoever is signed in here.
+    $trayLink = Join-Path -Path $roots.Programs -ChildPath 'IDLifecycle Tray.lnk'
+    if ($NoTray){
+        Add-SetupSkip -Action 'StartTray' -Identity $trayLink -Reason 'not wanted (-NoTray)'
+    }
+    elseif (-not (Test-IDLSetupDesktopSession)){
+        Add-SetupSkip -Action 'StartTray' -Identity $trayLink -Reason 'no signed-in desktop here; it starts at the next sign-in'
+    }
+    else{
+        Invoke-SetupStep -Action 'StartTray' -Identity $trayLink -Details '(as the signed-in user, without administrator rights; a tray that already runs stays as it is)' `
+            -SatisfiedReason 'already running in this session' `
+            -IsSatisfied { Test-IDLSetupTrayRunning } `
+            -Apply { Start-IDLSetupTrayNow -Shortcut $trayLink }
     }
 
     Assert-NoFailedSteps -Phase 'Tray and shortcuts'

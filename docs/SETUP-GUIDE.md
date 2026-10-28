@@ -15,7 +15,7 @@ Have everything in this table ready before you run the installer. The gMSA deleg
 | AD permissions | Delegated on the target OUs only | Create and delete user objects (including **Delete subtree**), write the mapped attributes, and manage membership of the groups your role rules use |
 | App database | SQLite (default, nothing to set up) or an empty SQL Server, PostgreSQL, MySQL or Db2 database | Server databases need a login that can create tables. Db2 also needs the 64-bit IBM ODBC driver |
 | TLS certificate | PEM certificate + key | Needed if the console listens on anything other than `127.0.0.1`, and for Entra ID sign-in |
-| HR source | Paylocity API credentials, a CSV path, or a read-only SQL login and view | Configured after install |
+| HR source | API access to your HR system (URL and credentials), a CSV path, or a read-only SQL login and view | Configured after install |
 | Build machine | Go 1.22+ | Only to build the release folder; not needed on the server |
 
 Keep the admin password and any connection strings ready. The installer prompts for them and never writes them to logs or command lines.
@@ -189,7 +189,7 @@ Work through these steps in order, signed in as an admin. Everything stays in dr
 | Disabled OU | Where disabled accounts are moved (optional) | none |
 | ID attribute | The AD attribute that holds the HR employee ID | `employeeID` |
 | UPN suffix | For example `@corp.com` | none |
-| Strip groups on disable | Remove group memberships when an account is disabled | on |
+| Strip groups on disable | Moved to Configure → Lifecycle groups (what a disable removes and keeps) | all groups except those kept |
 
 ### 5.2 Naming and new accounts
 
@@ -218,7 +218,7 @@ Templates also support regular expressions: `regexReplace`, `regexFind` and `reg
 
 On **Sources**, add your HR feed and click **Test** until it returns sample records.
 
-- **Paylocity**: API credentials (stored encrypted).
+- **HR system API (REST/JSON)**: the endpoint that lists people, its sign-in (API key, Basic, token or OAuth2 client credentials; stored encrypted), where the list sits in the response and how it pages. Click Test these settings before saving: it shows how many people came back and every field name.
 - **CSV**: a file path the service account can read. Set `csv_allowed_dirs` in `config.json` to limit which folders sources may read.
 - **SQL**: a driver, a connection string and one `SELECT` query. Use a login that can only read the HR view. For SQL Server, leave out the user and password to connect as the service account.
 
@@ -229,6 +229,14 @@ On **Attribute mappings**, map source fields to AD attributes. The **field mappe
 ### 5.5 Role rules
 
 On **Role rules**, define who gets which groups, OU and extra attributes, based on source fields such as department or job title.
+
+A rule's conditions can compare any HR field: equals, one of a list, contains, starts or ends with, a regular expression, empty or filled, greater or less than (numbers and dates), a date older or newer than N days (for example hire date in the last 30 days), or a template for anything else. Group conditions in **ALL of** / **ANY of** blocks for rules like "Finance and (manager or director)". **Test this rule** shows, for a sample record, which condition matched and why.
+
+Add groups with the search box: type two or more letters and pick from the AD groups that match. Administrative groups (Domain Admins and similar) are marked and can never be granted.
+
+**Lifecycle groups** (Configure) adds groups by account state: groups every active account gets (for example `ALLUSERS`), groups a disabled account gets (for example `Disabled Users`, removed again on re-enable), what a disable removes (all groups except the ones you keep, only groups this service manages, or nothing) and groups always kept.
+
+Before saving a rule, lifecycle groups or a mapping, click **Preview impact**: it shows how many people the change affects, which groups are added or removed for how many people, and for each person the steps that change. Search for one person in the box at the top. **Operate → Preview changes** shows what the next sync would do with the saved settings. Nothing is written by a preview.
 
 ### 5.6 Run a sync in dry run
 
@@ -303,7 +311,7 @@ The installer adds a tray icon for everyone who signs in to the server (untick *
 | Open log folder | Opens the logs you can read |
 | Exit | Closes the tray icon; the service keeps running |
 
-Saving settings and service actions ask for administrator rights (a UAC prompt) each time. Everything else is set in the web console.
+The installer starts the tray straight away for you; others get it at their next sign-in. The first time, it moves itself out of the hidden-icons area (^) into the taskbar. Saving settings and service actions ask for administrator rights (a UAC prompt) each time. Everything else is set in the web console.
 
 ### 5.16 Your own branding (optional)
 
@@ -417,3 +425,4 @@ With the setup window, double-click `Setup.cmd` in the release folder or in the 
 | A link waits with "VERIFY the match" or "choose the matching account" | Only some matching rules agree, or several accounts match the person | Check the side-by-side fields, then This is the person, None of these, or Not this person |
 | A contractor got a second account when they joined HR | Matching was off, or the names differ between the two records | Turn matching on. Delete the extra new account in AD; the next sync then proposes linking the old one (or use Link to person… on the Matching page) |
 | Folder has no SHA256SUMS, so it is not a release folder | The folder was not built with New-IDLifecycleRelease.ps1 (for example a copy of the repository with a self-built exe) | Build a release, install from GitHub, or for testing only tick 'Skip the SHA-256 file check' (least safe) |
+| No IDLifecycle icon in the taskbar | It is in the hidden-icons area (^), or you have not signed in since it was installed | Click ^ and drag the icon to the taskbar, or start it from Start menu, IDLifecycle, IDLifecycle Tray |

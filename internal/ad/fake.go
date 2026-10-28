@@ -33,11 +33,12 @@ type Fake struct {
 	SchemaErr    error
 	ActionErr    error // returned for every action call (simulates exit 4 etc.)
 	Calls        []string
-	Passwords    []string          // passwords received by Create, for assertions
-	MustChange   []bool            // ChangePasswordAtLogon received by Create, in the same order
-	OUList       []string          // OUs reported by OUs (AddOU)
-	MailObjects  map[string]string // lower(mail) -> DN of contacts/groups holding the address (AddMailObject)
-	NamesErr     error             // returned by CheckNames
+	Passwords    []string            // passwords received by Create, for assertions
+	MustChange   []bool              // ChangePasswordAtLogon received by Create, in the same order
+	OUList       []string            // OUs reported by OUs (AddOU)
+	MailObjects  map[string]string   // lower(mail) -> DN of contacts/groups holding the address (AddMailObject)
+	NamesErr     error               // returned by CheckNames
+	GroupInfo    map[string]GroupHit // lower(sam) -> search details (SetGroupInfo)
 	guid         int
 }
 
@@ -411,6 +412,13 @@ func (f *Fake) Disable(_ context.Context, o ActionOpts, items []DisableItem) ([]
 				changed = true
 			}
 		}
+		for _, g := range it.AddGroups {
+			if dn, ok := f.resolveGroup(g); ok {
+				before := len(u.MemberOf)
+				addMember(u, dn)
+				changed = changed || len(u.MemberOf) != before
+			}
+		}
 		if it.Description != "" && u.Attrs["description"] != it.Description {
 			u.Attrs["description"], changed = it.Description, true
 		}
@@ -450,6 +458,11 @@ func (f *Fake) Enable(_ context.Context, o ActionOpts, items []EnableItem) ([]Re
 		}
 		changed := !u.Enabled
 		u.Enabled = true
+		for _, g := range it.RemoveGroups {
+			if dn, ok := f.resolveGroup(g); ok && removeMember(u, dn) {
+				changed = true
+			}
+		}
 		for _, g := range it.AddGroups {
 			if dn, ok := f.resolveGroup(g); ok {
 				before := len(u.MemberOf)

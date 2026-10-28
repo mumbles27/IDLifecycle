@@ -355,9 +355,10 @@ func TestSourceSecretsNeverLeave(t *testing.T) {
 	admin := e.login("admin")
 
 	body := map[string]any{
-		"name": "Paylocity", "type": "paylocity", "enabled": true,
+		"name": "HR API", "type": "rest", "enabled": true,
 		"options": map[string]any{"external_id_field": "employeeId", "status_field": "currentStatus.statusType", "terminated_values": []string{"T"}},
-		"config":  map[string]any{"company_id": "C1", "client_id": "cid", "client_secret": "top-secret-value"},
+		"config": map[string]any{"base_url": "https://hr.example.com", "auth": "oauth2_client_credentials", "token_url": "https://hr.example.com/oauth/token",
+			"client_id": "cid", "client_secret": "top-secret-value"},
 	}
 	var created model.Source
 	want(t, "create", admin.do("POST", "/api/sources", body, &created), 201)
@@ -373,10 +374,10 @@ func TestSourceSecretsNeverLeave(t *testing.T) {
 	// Round trip with the mask keeps the stored secret.
 	var got model.Source
 	admin.do("GET", "/api/sources/"+created.ID, nil, &got)
-	got.Name = "Paylocity renamed"
+	got.Name = "HR API renamed"
 	want(t, "update with masked secret", admin.do("PUT", "/api/sources/"+created.ID, got, nil), 200)
 	after, _ := e.st.GetSource(context.Background(), created.ID)
-	if after.Config["client_secret"] != stored.Config["client_secret"] || after.Name != "Paylocity renamed" {
+	if after.Config["client_secret"] != stored.Config["client_secret"] || after.Name != "HR API renamed" {
 		t.Error("masked secret must keep the stored ciphertext")
 	}
 
@@ -393,8 +394,8 @@ func TestSourceSecretsNeverLeave(t *testing.T) {
 	}
 
 	want(t, "unknown type", admin.do("POST", "/api/sources", map[string]any{"name": "x", "type": "ldap", "options": map[string]any{"external_id_field": "id"}}, nil), 400)
-	want(t, "missing required config", admin.do("POST", "/api/sources", map[string]any{"name": "y", "type": "paylocity", "options": map[string]any{"external_id_field": "id"}, "config": map[string]any{}}, nil), 400)
-	body["name"] = "Paylocity renamed"
+	want(t, "missing required config", admin.do("POST", "/api/sources", map[string]any{"name": "y", "type": "rest", "options": map[string]any{"external_id_field": "id"}, "config": map[string]any{}}, nil), 400)
+	body["name"] = "HR API renamed"
 	want(t, "duplicate name", admin.do("POST", "/api/sources", body, nil), 409)
 }
 

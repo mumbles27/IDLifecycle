@@ -1000,11 +1000,18 @@ function Get-ADGroup {
         [string]$SearchBase,
         [ValidateSet('Base', 'OneLevel', 'Subtree')][string]$SearchScope,
         [string[]]$Properties = @(),
+        [int]$ResultPageSize,
+        [int]$ResultSetSize,
         [string]$Server,
         [pscredential]$Credential
     )
 
-    Invoke-StubGet -Kinds @('group') -Identity $Identity -LDAPFilter $LDAPFilter -Filter $Filter -SearchBase $SearchBase -SearchScope $SearchScope -Properties $Properties -HasIdentity ($PSCmdlet.ParameterSetName -eq 'Identity')
+    $found = Invoke-StubGet -Kinds @('group') -Identity $Identity -LDAPFilter $LDAPFilter -Filter $Filter -SearchBase $SearchBase -SearchScope $SearchScope -Properties $Properties -HasIdentity ($PSCmdlet.ParameterSetName -eq 'Identity') -CmdletName 'Get-ADGroup'
+    if ($ResultSetSize -gt 0){
+        $found = @($found) | Select-Object -First $ResultSetSize
+    }
+
+    $found
 }
 
 function Get-ADObject {

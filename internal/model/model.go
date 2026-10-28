@@ -143,6 +143,8 @@ type Condition struct {
 	Attr  string `json:"attr"`
 	Op    string `json:"op"`
 	Value string `json:"value"`
+	// Conditions are the children of a group (op all_of / any_of).
+	Conditions []Condition `json:"conditions,omitempty"`
 }
 
 type Grants struct {

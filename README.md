@@ -5,10 +5,10 @@
 A Windows service that keeps Active Directory in step with your HR system.
 
 **Documentation:** [Install and initial setup guide](docs/SETUP-GUIDE.md) (step by step, for the people installing it) ·
-[Architecture and interface contracts](docs/ARCHITECTURE.md) · [Web UI notes](docs/UI.md) · [Code map](docs/CODEMAP.html) (a diagram of how the
-packages, scripts and web UI connect; open the file in a browser) · this README (reference).
+[Architecture and interface contracts](docs/ARCHITECTURE.md) · [Web UI notes](docs/UI.md) · [Code map](https://mumbles27.github.io/IDLifecycle/CODEMAP.html)
+(a diagram of how the packages, scripts and web UI connect; its source is `docs/CODEMAP.html`) · this README (reference).
 
-* **Sources**: Paylocity (API), a CSV file, or a SQL database table/view (SQL Server, PostgreSQL, MySQL/MariaDB,
+* **Sources**: any HR system with a REST/JSON API (generic connector, no code), a CSV file, or a SQL database table/view (SQL Server, PostgreSQL, MySQL/MariaDB,
   SQLite) filled by your own HR export job; more can be added by implementing one small Go interface.
 * **Rules in a database**: attribute mappings, role rules (groups / OU / extra attributes), naming policy,
   schedule and approval policy all live in the DB and are edited in a web GUI.
@@ -121,7 +121,12 @@ that the service really is this installation's `idlifecycled.exe service`, valid
 the service (`idlifecycled config set`: a network address needs HTTPS, the certificate and key must load), changes only
 those fields in `config.json`, updates `tray.json`, and logs to the setup log folder. It uses the execution policy from
 `config.json` (never `Bypass`). Everything else is set in the web console. One tray runs per signed-in user; it closes
-itself when `tray.json` disappears (uninstall). `-NoTray` (or unticking the option in the setup window) leaves it out.
+itself when `tray.json` disappears (uninstall). The installer starts the tray at once for whoever is signed in (through
+Explorer, so never with administrator rights); everyone else gets it at their next sign-in. On its first start the tray
+asks Windows to show it in the taskbar instead of the hidden-icons overflow (^), once per user, so hiding it again
+sticks. Without PowerShell 7 installed machine-wide (`%ProgramFiles%PowerShell`, e.g. PowerShell from the Microsoft
+Store) the shortcuts start `Start-IDLifecycleTrayLauncher.ps1` with Windows PowerShell, which finds each user's `pwsh.exe`
+at sign-in, so a PowerShell update never breaks the shortcut. `-NoTray` (or unticking the option in the setup window) leaves it out.
 
 The same settings from an elevated command line:
 
@@ -297,11 +302,54 @@ the panel falls back to a built-in list of common attributes and says why. The s
 
 ### Roles
 
-A role rule has optional conditions (`eq ne in contains starts_with regex exists`, match `all`/`any`) and grants
-(groups, OU, extra attributes). A rule **without conditions applies to everyone** (your baseline groups). Matching
-rules are additive for groups; for OU and for attributes on the same target, the higher `priority` wins. With
-`remove_stale_groups` on, the service removes people from *groups it manages* (any group named in a rule) when no
-rule grants them any more; it never touches other groups.
+A role rule grants **groups, an OU and extra attributes** to everyone whose source record matches its conditions; a rule
+**without conditions applies to everyone**. Matching rules are additive for groups; for the OU and for attributes on the
+same target, the higher `priority` wins. With `remove_stale_groups` on, the service removes people from *groups it
+manages* (any group named in a rule or in the lifecycle groups) when nothing grants them any more; it never touches
+other groups.
+
+**Conditions** compare a source field (case-insensitive, values trimmed):
+
+| Operator | Matches when the field ... |
+|---|---|
+| `eq` `ne` | equals / differs from the value |
+| `in` `not_in` | is / is not one of a comma-separated list |
+| `contains` `not_contains` `starts_with` `ends_with` | as named |
+| `regex` `not_regex` | matches / does not match a regular expression (RE2) |
+| `exists` `empty` | has a value / is missing or blank |
+| `gt` `gte` `lt` `lte` | compares as numbers when both sides are numbers, else as dates (YYYY-MM-DD, RFC 3339, M/D/YYYY) |
+| `older_than_days` `newer_than_days` | is a date more / less than N days ago (e.g. hire date newer than 30 days) |
+| `template` | a template (same functions as mappings) renders `true`, `yes` or `1` - for anything else, e.g. `{{ and (eq .Company "Acme") (regexMatch "^IT" .CostCenter) }}` |
+| `all_of` / `any_of` | a group of conditions that must all / any match - nest them (up to 3 levels, 50 conditions per rule) for "A and (B or C)" |
+
+The rule editor builds these with a form, and **Test this rule** shows for a sample record which condition matched and
+why (✓/✗ with the actual value). Groups are added with a **live AD group search** (type 2+ letters: name, account name and
+description, the whole domain; administrative groups are marked and can never be granted - the scripts refuse to add
+anyone to Domain Admins, Administrators and the other protected groups). If AD cannot be searched, type the group name.
+
+### Lifecycle groups
+
+**Configure → Lifecycle groups** sets groups by account state, on top of the role rules:
+
+| Setting | Effect |
+|---|---|
+| Active accounts get | every active account is a member (e.g. `ALLUSERS`), like a rule for everyone |
+| Disabled accounts get | added when an account is disabled (e.g. `Disabled Users`); removed again when it is re-enabled |
+| On disable remove | **all groups except the kept ones** (default), only **groups this service manages**, or **nothing** |
+| Always keep | groups never removed on disable (e.g. a mailbox-retention group) |
+
+Administrative groups are never removed by a disable either. Older installs keep their behaviour: the former
+*strip groups on disable* setting becomes "all groups except the kept ones" (on) or "nothing" (off).
+
+### Previewing the impact of a change
+
+**Preview impact** (on a role rule, the lifecycle groups and the mappings) and **Operate → Preview changes** show what
+the next sync would do to every account - before anything is saved. The service plans everyone twice against the same
+AD snapshot - with the saved configuration and with your unsaved one - and lists who is affected: people changed per
+change type, the groups added and removed and how many people each affects, attributes changed, and per person the
+difference (+ added / − removed steps). A live search box finds one person (name, ID or account name); filters show
+only changed people or one change type. Nothing is written and no names are checked in AD; the AD snapshot is reused
+for 15 minutes (**Refresh from AD** takes a new one). Without changes, the page shows exactly what the next sync plans.
 
 ### Templates
 
@@ -348,7 +396,7 @@ keep a random part in it. The preview shows a sample password and whether AD's c
 ### Lifecycle & safety rails
 
 * Terminated (status field matches `terminated_values`, or absent from the feed for more than `missing_grace_runs`
-  runs when `missing_means_terminated`) → **disable** (optionally move to the Disabled OU, strip groups). After
+  runs when `missing_means_terminated`) → **disable** (optionally move to the Disabled OU; groups by *Lifecycle groups*). After
   `delete_after_days` → **delete**. Active again → **enable**.
 * An empty or failed source fetch never means "everyone left": the run is flagged and nothing is proposed for it.
 * **Bulk-destructive guard**: more than `max_destructive_per_run` disables/deletes in one run are held for manual
@@ -385,6 +433,38 @@ changes - and only then, so an OU an administrator sets by hand in AD is left al
 anyone. A department change to a value without a rule waits in Approvals the same way. On an approval, *Change OU*
 picks another OU for that person (approvers), optionally also adding the rule for the whole department (admins).
 Each choice is in the History (`change.set_ou`).
+
+### HR system API (generic REST connector)
+
+Sources → New source → *HR system API (REST/JSON)* reads people from any HR system that has a REST API returning
+JSON - no code needed. Fill in the base URL and path of the endpoint that lists people, the authentication (none, an API
+key in a header or query parameter, Basic, a fixed bearer token, or OAuth2 client credentials with token URL, client
+ID/secret, scope and audience), where the array of people sits in the response (*Records path*, e.g. `data` or
+`result.employees`; empty when the response is the array) and how the API pages:
+
+| Pagination | Parameters |
+|---|---|
+| none | one request |
+| page | page number + page size parameters (first page 0 or 1); stops on an empty or short page |
+| offset | offset + limit parameters |
+| cursor | cursor parameter + the dotted path of the next cursor in the response (`meta.next_cursor`) |
+| next_link | the dotted path of the next page's URL (`links.next`), or the `Link: <...>; rel="next"` header |
+
+Nested JSON becomes dotted field names (`name.first`, `department.name`; arrays of values are comma-joined), which is
+what mappings and role rules use; *Only these fields* keeps a short list. **Test these settings** in the editor fetches
+once with the form as it is - before saving - and shows the record count, every field name and a sample.
+
+Secrets (API key, password, token, client secret) are stored encrypted, masked in the GUI and never written to errors or
+logs; a stored secret is never sent to a changed base or token URL. Requests time out (60 s), retry on 429/5xx (honouring
+`Retry-After`), refuse redirects or next links to another host, and cap a page at 50 MiB. More pages than *Maximum pages*
+or people than *Maximum records* is an error, never a shorter list - a truncated feed would look like people leaving.
+
+**A dedicated connector** is for an HR system the generic one cannot read (an unusual login, a report that must be
+requested and polled, XML ...). It is a small Go file in `internal/sources`: a `Type` (name, label, form fields -
+password fields are encrypted automatically) and a `Fetch` that returns the complete population. The package
+documentation (`internal/sources/sources.go`) lists the steps, `example_connector_test.go` is a complete ~50-line
+connector with its test, and `NewHTTPClient` (retries, size cap, same-host redirects, secrets kept out of errors),
+`Flatten` and `RecordsAt` do the plumbing. Register it in `init` in `sources.go`.
 
 ### Several sources and people added by hand
 
@@ -619,7 +699,7 @@ to the stub, so they cannot reach a real domain.
   shared test suite but need a run against real servers (set the `IDL_TEST_*_DSN` variables). The Db2 store is covered only by
   server-less tests (DDL expansion, paging, a recorder driver that audits every statement for Db2 rules) and has never run on Db2.
 * The scripts were verified against a stub AD module, not a live domain. Do a supervised first run in a lab OU.
-* Paylocity field names/endpoints come from public documentation and are configurable; validate against your tenant.
+* The generic HR API connector was tested against simulated APIs only; try your HR system's settings with **Test these settings** before relying on it.
 * Not yet done: audit rows are written next to (not inside) the state-change transaction; an auto-approved `enable` will re-enable an account that someone disabled deliberately for another reason (keep `approval.enable` manual); MSSQL string parameters are sent as nvarchar against VARCHAR key columns (correct, but can cost an index seek on very large tables); migrations are not transactional.
 * Single-valued string attributes only; single service instance. Correlation compares whole values (no similarity
   scores, nicknames or initials) and a merged record cannot be un-merged in the console.

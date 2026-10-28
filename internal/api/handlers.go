@@ -40,6 +40,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	s.route(mux, "PUT /api/sources/{id}", model.RoleAdmin, s.handleSaveSource)
 	s.route(mux, "DELETE /api/sources/{id}", model.RoleAdmin, s.handleDeleteSource)
 	s.route(mux, "POST /api/sources/{id}/test", model.RoleAdmin, s.handleTestSource)
+	s.route(mux, "POST /api/sources/test", model.RoleAdmin, s.handleTestUnsavedSource)
 
 	s.route(mux, "GET /api/mappings", model.RoleViewer, s.handleListMappings)
 	s.route(mux, "POST /api/mappings", model.RoleAdmin, s.handleSaveMapping)
@@ -48,6 +49,8 @@ func (s *Server) routes(mux *http.ServeMux) {
 	s.route(mux, "DELETE /api/mappings/{id}", model.RoleAdmin, s.handleDeleteMapping)
 	s.route(mux, "POST /api/templates/preview", model.RoleAdmin, s.handleTemplatePreview)
 	s.route(mux, "GET /api/ad/ous", model.RoleApprover, s.handleListOUs)
+	s.route(mux, "GET /api/ad/groups", model.RoleAdmin, s.handleSearchGroups)
+	s.route(mux, "POST /api/preview/impact", model.RoleAdmin, s.handlePreviewImpact)
 	s.route(mux, "GET /api/placement/values", model.RoleViewer, s.handlePlacementValues)
 	s.route(mux, "POST /api/changes/{id}/ou", model.RoleApprover, s.handleSetChangeOU)
 	s.route(mux, "GET /api/changes/{id}/names", model.RoleApprover, s.handleChangeNames)
@@ -267,6 +270,64 @@ func (s *Server) handleTestSource(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	s.runSourceTest(w, r, src, src.ID)
+}
+
+// handleTestUnsavedSource tests the configuration in the editor before it is saved: the body is a source as for
+// POST/PUT /api/sources (with "id" for an existing source, whose stored secrets are used for masked fields). It is
+// prepared exactly like a save - validated, secrets encrypted, a stored secret never sent to a changed endpoint - but
+// nothing is stored.
+func (s *Server) handleTestUnsavedSource(w http.ResponseWriter, r *http.Request) {
+	var in model.Source
+	if !decode(w, r, &in) {
+		return
+	}
+	var prevCfg map[string]any
+	if strings.TrimSpace(in.ID) != "" {
+		cur, err := s.Store.GetSource(r.Context(), in.ID)
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		in.Type, prevCfg = cur.Type, cur.Config
+	}
+	if in.Config == nil {
+		in.Config = map[string]any{}
+	}
+	if strings.TrimSpace(in.Name) == "" {
+		in.Name = "(test)"
+	}
+	idField := strings.TrimSpace(in.Options.ExternalIDField)
+	if idField == "" {
+		in.Options.ExternalIDField = "-" // the test lists the fields; the ID field is checked only when one is given
+	}
+	sources.NormalizeManual(&in)
+	if err := sources.Validate(in); err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+	if prevCfg != nil && sources.EndpointChangedWithoutSecret(in.Type, prevCfg, in.Config) {
+		badRequest(w, "re-enter the secret when changing the endpoint URL (a stored secret is never re-sent to a new address)")
+		return
+	}
+	cfg, err := sources.PrepareConfigForStorage(in.Type, in.Config, prevCfg, s.Cipher)
+	if err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+	in.Config = cfg
+	if in.Type != sources.TypeManual {
+		in.Options.ExternalIDField = idField
+	}
+	auditID := in.ID
+	if auditID == "" {
+		auditID = "(unsaved)"
+	}
+	s.runSourceTest(w, r, in, auditID)
+}
+
+// runSourceTest fetches the source once and reports the count, the field names and a sample (audited as source.test).
+func (s *Server) runSourceTest(w http.ResponseWriter, r *http.Request, src model.Source, auditID string) {
 	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
 	defer cancel()
 
@@ -278,7 +339,7 @@ func (s *Server) handleTestSource(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		res["error"] = err.Error()
-		s.audit(r, "source.test", "source", src.ID, map[string]any{"ok": false})
+		s.audit(r, "source.test", "source", auditID, map[string]any{"ok": false, "type": src.Type})
 		writeJSON(w, http.StatusOK, res)
 		return
 	}
@@ -304,7 +365,7 @@ func (s *Server) handleTestSource(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	res["ok"], res["count"], res["attributes"], res["sample"] = res["error"] == "", len(rows), names, sample
-	s.audit(r, "source.test", "source", src.ID, map[string]any{"ok": res["ok"], "count": len(rows)})
+	s.audit(r, "source.test", "source", auditID, map[string]any{"ok": res["ok"], "count": len(rows), "type": src.Type})
 	writeJSON(w, http.StatusOK, res)
 }
 
@@ -546,6 +607,7 @@ func (s *Server) handleDeleteRole(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRolePreview(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Record map[string]string `json:"record"`
+		Rule   *model.RoleRule   `json:"rule"` // optional unsaved rule: replaces the saved one with its id (or is added)
 	}
 	if !decode(w, r, &in) {
 		return
@@ -554,6 +616,24 @@ func (s *Server) handleRolePreview(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.fail(w, r, err)
 		return
+	}
+	explain := []engine.ExplainLine{}
+	ruleMatched := false
+	if in.Rule != nil {
+		if err := engine.ValidateRole(*in.Rule); err != nil {
+			badRequest(w, err.Error())
+			return
+		}
+		ruleMatched, explain = engine.ExplainRule(*in.Rule, in.Record, time.Now())
+		replaced := false
+		for i := range rules {
+			if in.Rule.ID != "" && rules[i].ID == in.Rule.ID {
+				rules[i], replaced = *in.Rule, true
+			}
+		}
+		if !replaced {
+			rules = append(rules, *in.Rule)
+		}
 	}
 	mappings, err := s.Store.ListMappings(r.Context())
 	if err != nil {
@@ -570,7 +650,7 @@ func (s *Server) handleRolePreview(w http.ResponseWriter, r *http.Request) {
 	if groups == nil {
 		groups = []string{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"matched": matched, "groups": groups, "ou": res.OU, "attributes": attrs, "errors": errs})
+	writeJSON(w, http.StatusOK, map[string]any{"matched": matched, "groups": groups, "ou": res.OU, "attributes": attrs, "errors": errs, "explain": explain, "rule_matched": ruleMatched})
 }
 
 // ---- settings ----------------------------------------------------------------------

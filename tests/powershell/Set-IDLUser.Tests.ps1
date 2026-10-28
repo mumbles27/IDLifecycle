@@ -217,4 +217,21 @@ Describe 'Set-IDLUser.ps1' {
         (Invoke-IDLScript -Script 'Set-IDLUser' -Request (New-SetRequest @()) -StatePath $down).ExitCode | Should Be 4
         (Invoke-IDLScript -Script 'Set-IDLUser' -Request (New-SetRequest @()) -NoState).ExitCode | Should Be 3
     }
+
+    It 'refuses to add an account to a protected administrative group: the item fails before any change' {
+        $jane = New-StubUserEntry -Sam 'jdoe' -ExternalId 'E1001' -Cn 'Jane Doe' -Attributes @{ title = 'Old' }
+        $groups = @(
+            @{ dn = "CN=GG-AllStaff,OU=Groups,$script:Root"; sam = 'GG-AllStaff' },
+            @{ dn = "CN=Administrators,CN=Builtin,$script:Root"; sam = 'Administrators'; objectSid = 'S-1-5-32-544' }
+        )
+        $state = New-StubStateFile -Users @($jane) -Groups $groups -Ous @("OU=Staff,$script:Root", "OU=Groups,$script:Root")
+        $item = [ordered]@{ changeId = 'c1'; externalId = 'E1001'; objectGuid = $jane.objectGuid; set = @{ title = 'New' }; addGroups = @('GG-AllStaff', 'Administrators') }
+        $r = Invoke-IDLScript -Script 'Set-IDLUser' -Request (New-SetRequest @($item)) -StatePath $state
+
+        $r.ExitCode | Should Be 1
+        $r.Json.results[0].status | Should Be 'failed'
+        $r.Json.results[0].error | Should Match 'refusing to add Administrators: it is a protected administrative group \(well-known privileged RID 544\)'
+        (Get-StubCalls -Path $state).Count | Should Be 0
+        (Get-StubUser -Path $state -Sam 'jdoe').attributes.title | Should Be 'Old'
+    }
 }

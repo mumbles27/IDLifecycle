@@ -1745,12 +1745,14 @@ function Get-IDLGroupDns {
         With -SkipPrivileged (used by Disable-IDLUser, which must never be blocked) ambiguous and privileged groups
         are NOT thrown on but returned in .Skipped as {Identity; Kind ('privileged'|'ambiguous'); Reason}; they are
         never part of .Dns, so their membership is left alone.
+        -Adding (the identities are groups the account is ADDED to) words the refusal of a privileged group as such.
     #>
     [CmdletBinding()]
     param(
         [AllowNull()][string[]]$Identities,
         [Parameter(Mandatory)]$GroupMap,
-        [switch]$SkipPrivileged
+        [switch]$SkipPrivileged,
+        [switch]$Adding
     )
 
     $dns = [System.Collections.Generic.List[string]]::new()
@@ -1778,6 +1780,10 @@ function Get-IDLGroupDns {
             if ($SkipPrivileged){
                 $skipped.Add([pscustomobject]@{ Identity = $identity; Kind = 'privileged'; Reason = [string]$entry.PrivilegedReason })
                 continue
+            }
+
+            if ($Adding){
+                throw "refusing to add ${identity}: it is a protected administrative group ($($entry.PrivilegedReason)); privileged groups are never added by IDLifecycle"
             }
 
             throw "Group '$identity' is privileged ($($entry.PrivilegedReason)); refusing to change its membership."
