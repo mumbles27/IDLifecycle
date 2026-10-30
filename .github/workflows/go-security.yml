@@ -1,0 +1,84 @@
+name: Go Quality and Security
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main, dev]
+  schedule:
+    - cron: '0 10 * * 1'  # Mondays at 10:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  go-quality:
+    name: Go tests and static analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: go build ./...
+      - name: Go vet
+        run: go vet ./...
+      - name: Tests with race detector
+        run: go test -race ./...
+      - name: Staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          "$(go env GOPATH)/bin/staticcheck" ./...
+
+  govulncheck:
+    name: Go dependency vulnerabilities
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
+  gosec:
+    name: Go source security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Gosec
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          "$(go env GOPATH)/bin/gosec" ./...
+
+  trivy:
+    name: Dependencies and configuration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,misconfig
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+
+  gitleaks:
+    name: Secrets in Git history
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: 'false'
