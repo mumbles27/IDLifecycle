@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	defaultTokenURL = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+	defaultTokenURL = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token" // #nosec G101 -- an endpoint URL template, not a credential
 	defaultGraphURL = "https://graph.microsoft.com"
 	scopeSMTP       = "https://outlook.office365.com/.default"
 	scopeGraph      = "https://graph.microsoft.com/.default"
@@ -116,7 +116,7 @@ func parseExpires(raw json.RawMessage) int {
 	}
 	var s string
 	if json.Unmarshal(raw, &s) == nil {
-		fmt.Sscan(s, &n)
+		_, _ = fmt.Sscan(s, &n) // not a number: 0, the caller uses its default
 	}
 	return n
 }

@@ -129,7 +129,7 @@ func (b *Branding) override(st *brandState) []string {
 			warns = append(warns, name+" is larger than 1 MiB; ignored")
 			return nil
 		}
-		data, err := os.ReadFile(p)
+		data, err := os.ReadFile(p) // #nosec G304 -- a fixed file name in the trusted branding folder
 		if err != nil {
 			warns = append(warns, name+": "+err.Error())
 			return nil

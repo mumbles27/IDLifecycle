@@ -122,14 +122,14 @@ func view(u model.User) userView {
 }
 
 func (s *Server) setCookie(w http.ResponseWriter, token string, exp time.Time) {
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- HttpOnly + SameSite=Strict; Secure whenever TLS is on (plain HTTP is only allowed on loopback)
 		Name: cookieName, Value: token, Path: "/", Expires: exp, MaxAge: int(time.Until(exp).Seconds()),
 		HttpOnly: true, Secure: s.TLS, SameSite: http.SameSiteStrictMode,
 	})
 }
 
 func (s *Server) clearCookie(w http.ResponseWriter) {
-	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: s.TLS, SameSite: http.SameSiteStrictMode})
+	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: s.TLS, SameSite: http.SameSiteStrictMode}) // #nosec G124 -- same attributes as setCookie
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {

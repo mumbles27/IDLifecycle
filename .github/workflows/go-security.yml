@@ -1,0 +1,111 @@
+name: Go Quality and Security
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main, dev]
+  schedule:
+    - cron: '0 10 * * 1'  # Mondays at 10:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  go-quality:
+    name: Go tests and static analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: go build ./...
+      - name: Go vet
+        run: go vet ./...
+      - name: Tests with race detector
+        # The plain test output goes to the log; every failed test (with its output, e.g. a data race report) also
+        # becomes an annotation, which can be read without opening the log.
+        run: |
+          status=0
+          go test -race -json ./... > test-results.json || status=$?
+          jq -r 'select(.Action=="output") | .Output' test-results.json | tr -d '\r'
+          jq -rs '
+            (map(select(.Action=="output")) | group_by([.Package, (.Test // "")])
+              | map({key: "\(.[0].Package)|\(.[0].Test // "")", value: (map(.Output) | join(""))}) | from_entries) as $out
+            | map(select(.Action=="fail"))[]
+            | "::error title=FAIL \(.Package) \(.Test // "(package)")::"
+              + (($out["\(.Package)|\(.Test // "")"] // "")
+                  | (if contains("WARNING: DATA RACE") then .[index("WARNING: DATA RACE"):][0:6000] else .[-3500:] end)
+                  | gsub("%"; "%25") | gsub("\r"; "") | gsub("\n"; "%0A"))
+          ' test-results.json
+          exit $status
+      - name: Staticcheck
+        if: ${{ !cancelled() }}
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          "$(go env GOPATH)/bin/staticcheck" ./...
+
+  govulncheck:
+    name: Go dependency vulnerabilities
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
+  gosec:
+    name: Go source security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Gosec
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          "$(go env GOPATH)/bin/gosec" ./...
+
+  trivy:
+    name: Dependencies and configuration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,misconfig
+          severity: HIGH,CRITICAL
+          format: json
+          output: trivy-results.json
+          exit-code: '0'
+      - name: Report findings
+        # One annotation per HIGH/CRITICAL finding; fails when there is any (as exit-code 1 did).
+        run: |
+          jq -r '.Results[]? | .Target as $t
+            | ((.Vulnerabilities // [])[] | "::error file=\($t),title=\(.VulnerabilityID) (\(.Severity))::\(.PkgName) \(.InstalledVersion), fixed in \(.FixedVersion // "no fix yet"): \(.Title // "")"),
+              ((.Misconfigurations // [])[] | "::error file=\($t),title=\(.ID) (\(.Severity))::\(.Title): \(.Message)")' trivy-results.json
+          n=$(jq '[.Results[]? | ((.Vulnerabilities // []) + (.Misconfigurations // []))[]] | length' trivy-results.json)
+          echo "HIGH/CRITICAL findings: $n"
+          test "$n" -eq 0
+
+  gitleaks:
+    name: Secrets in Git history
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: 'false'

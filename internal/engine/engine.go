@@ -140,11 +140,12 @@ func (e *Engine) Start(ctx context.Context, trigger, by string) (model.Run, <-ch
 
 	done := make(chan struct{})
 	e.wg.Add(1)
+	working := run // the goroutine fills in its own copy; the caller gets the run as it started
 	go func() {
 		defer e.wg.Done()
 		defer close(done)
 		defer e.runMu.Unlock()
-		e.finish(e.runCtx, &run)
+		e.finish(e.runCtx, &working)
 	}()
 	return run, done, nil
 }

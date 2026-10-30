@@ -64,7 +64,7 @@ func Load(dataDir string) (*Cipher, error) {
 	}
 
 	path := filepath.Join(dataDir, keyFile)
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- secret.key in the protected data folder
 	if errors.Is(err, os.ErrNotExist) {
 		key := make([]byte, 32)
 		if _, err := rand.Read(key); err != nil {

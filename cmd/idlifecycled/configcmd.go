@@ -104,7 +104,7 @@ func cmdConfig(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "error: nothing to change: give -listen, -tls-cert/-tls-key or -log-level")
 		return 2
 	}
-	raw, err := os.ReadFile(*cfgPath)
+	raw, err := os.ReadFile(*cfgPath) // #nosec G304 G703 -- the config path an administrator passed on the command line
 	if err != nil {
 		fmt.Fprintln(stderr, "error:", err)
 		return 1
@@ -197,11 +197,11 @@ func replaceFile(path string, data []byte) error {
 	_, werr := tmp.Write(data)
 	cerr := tmp.Close()
 	if err := errors.Join(werr, cerr); err != nil {
-		_ = os.Remove(name)
+		_ = os.Remove(name) // #nosec G703 -- our own temp file next to the config file
 		return err
 	}
-	if err := os.Rename(name, path); err != nil {
-		_ = os.Remove(name)
+	if err := os.Rename(name, path); err != nil { // #nosec G703 -- replaces the config file the administrator named
+		_ = os.Remove(name) // #nosec G703 -- our own temp file next to the config file
 		return err
 	}
 	return nil

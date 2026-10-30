@@ -110,7 +110,7 @@ func TestRESTAuthModes(t *testing.T) {
 		t.Helper()
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if !ok(r) {
-				http.Error(w, "denied", 401)
+				http.Error(w, "denied", http.StatusUnauthorized)
 				return
 			}
 			writeJSON(w, people(1, 1))
@@ -150,8 +150,7 @@ func TestRESTAuthModes(t *testing.T) {
 
 func TestRESTOAuth2TokenCachingAndRefreshOn401(t *testing.T) {
 	var tokenCalls, apiCalls int32
-	var srv *httptest.Server
-	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/oauth/token":
 			n := atomic.AddInt32(&tokenCalls, 1)
@@ -162,22 +161,22 @@ func TestRESTOAuth2TokenCachingAndRefreshOn401(t *testing.T) {
 			}
 			if r.Header.Get("Authorization") != "" { // body style
 				if id, sec, _ := r.BasicAuth(); id != "cid" || sec != "csecret-xyz" {
-					http.Error(w, "bad client", 401)
+					http.Error(w, "bad client", http.StatusUnauthorized)
 					return
 				}
 			} else if r.Form.Get("client_id") != "cid" || r.Form.Get("client_secret") != "csecret-xyz" {
-				http.Error(w, "bad client", 401)
+				http.Error(w, "bad client", http.StatusUnauthorized)
 				return
 			}
 			writeJSON(w, map[string]any{"access_token": fmt.Sprintf("tok%d", n), "expires_in": 3600})
 		default:
 			n := atomic.AddInt32(&apiCalls, 1)
 			if n == 2 && r.Header.Get("Authorization") == "Bearer tok1" { // the first token is revoked after one call
-				http.Error(w, "expired", 401)
+				http.Error(w, "expired", http.StatusUnauthorized)
 				return
 			}
 			if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer tok") {
-				http.Error(w, "no token", 401)
+				http.Error(w, "no token", http.StatusUnauthorized)
 				return
 			}
 			page, _ := strconv.Atoi(r.URL.Query().Get("page"))
@@ -321,17 +320,17 @@ func TestRESTRetriesAndErrorsWithoutSecrets(t *testing.T) {
 		case "/flaky":
 			if atomic.AddInt32(&calls, 1) < 3 {
 				w.Header().Set("Retry-After", "0")
-				http.Error(w, "slow down", 429)
+				http.Error(w, "slow down", http.StatusTooManyRequests)
 				return
 			}
 			writeJSON(w, people(1, 2))
 		case "/down":
-			http.Error(w, "down for maintenance", 503)
+			http.Error(w, "down for maintenance", http.StatusServiceUnavailable)
 		case "/html":
 			w.Header().Set("Content-Type", "text/html")
 			_, _ = w.Write([]byte("<html>login page with key-SECRET-1 echoed</html>"))
 		case "/denied":
-			http.Error(w, "bad key key-SECRET-1", 403)
+			http.Error(w, "bad key key-SECRET-1", http.StatusForbidden)
 		}
 	}))
 	defer srv.Close()
@@ -360,7 +359,7 @@ func TestRESTRetriesAndErrorsWithoutSecrets(t *testing.T) {
 }
 
 func TestRESTContextCancel(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { http.Error(w, "busy", 503) }))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { http.Error(w, "busy", http.StatusServiceUnavailable) }))
 	defer srv.Close()
 	s := newRESTForTest(t, map[string]any{"base_url": srv.URL})
 	s.http.BaseDelay = time.Minute
@@ -376,7 +375,7 @@ func TestRESTPOSTBody(t *testing.T) {
 	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if atomic.AddInt32(&calls, 1) == 1 {
-			http.Error(w, "busy", 503)
+			http.Error(w, "busy", http.StatusServiceUnavailable)
 			return
 		}
 		var body map[string]any

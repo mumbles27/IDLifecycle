@@ -20,7 +20,7 @@ func TestTestUnsavedSourceConfig(t *testing.T) {
 	hr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		lastToken.Store(r.Header.Get("Authorization"))
 		if r.Header.Get("Authorization") != "Bearer tok-AAA" {
-			http.Error(w, "denied", 401)
+			http.Error(w, "denied", http.StatusUnauthorized)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")

@@ -188,7 +188,7 @@ func parseRESTConfig(cfg map[string]any) (*restConfig, error) {
 	if strings.ContainsAny(path, "?#") {
 		return nil, errors.New("path must not contain ? or # (use query parameters)")
 	}
-	c.endpoint = c.base.JoinPath(path)
+	c.endpoint = c.base.JoinPath(path) // #nosec G125 -- the path an admin configured, on the configured base URL (same host enforced by NewHTTPClient)
 
 	switch c.method {
 	case "GET":

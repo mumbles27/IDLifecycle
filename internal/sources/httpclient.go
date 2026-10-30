@@ -122,7 +122,7 @@ func (c *HTTPClient) Do(ctx context.Context, build func() (*http.Request, error)
 			lastErr = fmt.Errorf("request to %s failed: %s", safe, c.Redact(networkError(err)))
 		} else {
 			body, rerr := io.ReadAll(io.LimitReader(resp.Body, MaxResponseBytes+1))
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			switch {
 			case rerr != nil:
 				lastErr = fmt.Errorf("reading the response from %s: %s", safe, c.Redact(rerr.Error()))

@@ -173,7 +173,7 @@ func (s *Server) handleOIDCStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Lax (not Strict): the browser comes back from login.microsoftonline.com with a top-level GET.
-	http.SetCookie(w, &http.Cookie{Name: oidcCookie, Value: state, Path: "/api/auth/oidc", MaxAge: int(oidcFlowTTL.Seconds()),
+	http.SetCookie(w, &http.Cookie{Name: oidcCookie, Value: state, Path: "/api/auth/oidc", MaxAge: int(oidcFlowTTL.Seconds()), // #nosec G124 -- HttpOnly, SameSite=Lax (needed for the redirect back), Secure whenever TLS is on
 		HttpOnly: true, Secure: s.TLS, SameSite: http.SameSiteLaxMode})
 	url := s.oauthConfig(p, o, "").AuthCodeURL(state, oidc.Nonce(nonce), oauth2.S256ChallengeOption(verifier),
 		oauth2.SetAuthURLParam("response_mode", "query"), oauth2.SetAuthURLParam("prompt", "select_account"))
@@ -195,7 +195,7 @@ type entraClaims struct {
 func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	q := r.URL.Query()
-	http.SetCookie(w, &http.Cookie{Name: oidcCookie, Value: "", Path: "/api/auth/oidc", MaxAge: -1, HttpOnly: true, Secure: s.TLS, SameSite: http.SameSiteLaxMode})
+	http.SetCookie(w, &http.Cookie{Name: oidcCookie, Value: "", Path: "/api/auth/oidc", MaxAge: -1, HttpOnly: true, Secure: s.TLS, SameSite: http.SameSiteLaxMode}) // #nosec G124 -- clears the flow cookie, same attributes
 
 	deny := func(status int, who, reason, title, msg string) {
 		_ = s.Store.AppendAudit(ctx, orAnon(who), "auth.login_failed", "user", who, map[string]any{"remote": clientIP(r), "method": "oidc", "reason": reason})

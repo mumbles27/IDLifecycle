@@ -44,7 +44,7 @@ func CreateFile(ctx context.Context, st *store.Store, cfg config.Config, c *secr
 	}
 	var cfgJSON []byte
 	if p := cfg.Path(); p != "" {
-		b, err := os.ReadFile(p)
+		b, err := os.ReadFile(p) // #nosec G304 -- a file in the protected data folder
 		if err != nil {
 			return FileInfo{}, Header{}, fmt.Errorf("read %s: %w", p, err)
 		}
@@ -65,7 +65,7 @@ func CreateFile(ctx context.Context, st *store.Store, cfg config.Config, c *secr
 	}
 	final := filepath.Join(folder, name)
 	tmp := final + ".partial"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600) // #nosec G304 -- a new temp file in the backup folder
 	if err != nil {
 		return FileInfo{}, Header{}, err
 	}
@@ -196,7 +196,7 @@ func RestoreFile(ctx context.Context, cfgPath, inPath string, o RestoreOptions) 
 	// IDL_MASTER_KEY overrides secret.key: the restore can only work if it already holds the backup's key.
 	envKey := strings.TrimSpace(os.Getenv("IDL_MASTER_KEY"))
 
-	f, err := os.Open(inPath)
+	f, err := os.Open(inPath) // #nosec G304 -- the backup file an administrator named on the command line
 	if err != nil {
 		return RestoreResult{}, err
 	}
@@ -252,7 +252,7 @@ func RestoreWith(ctx context.Context, r io.Reader, passphrase string, st *store.
 // mergeConfig writes the backup's config.json over cfgPath, keeping this server's data_dir, database and
 // powershell.scripts_dir. The previous file is kept as config.json.replaced-<stamp>; the result must load.
 func mergeConfig(cfgPath string, backupJSON []byte, stamp string) (string, error) {
-	curRaw, err := os.ReadFile(cfgPath)
+	curRaw, err := os.ReadFile(cfgPath) // #nosec G304 -- config.json of this installation
 	if err != nil {
 		return "", err
 	}

@@ -313,14 +313,3 @@ func cfgInt(cfg map[string]any, key string, def int) int {
 	}
 	return def
 }
-
-func cfgBool(cfg map[string]any, key string) bool {
-	switch x := cfg[key].(type) {
-	case bool:
-		return x
-	case string:
-		b, _ := strconv.ParseBool(x)
-		return b
-	}
-	return false
-}

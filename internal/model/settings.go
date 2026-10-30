@@ -394,7 +394,7 @@ func DefaultSettings() Settings {
 			MaxCandidates: 9,
 			ConflictMode:  ConflictManual, ConflictRandomDigits: 3, ConflictSuffix: `{{ last .EmployeeID 4 }}`,
 		},
-		NewUser: NewUserSettings{
+		NewUser: NewUserSettings{ // #nosec G101 -- PasswordTemplate is the default pattern for initial passwords, not a password
 			PasswordMode: PasswordModeRandom, PasswordLength: 20, ChangePasswordAtLogon: true, Enabled: true,
 			PasswordTemplate: `{{ upper (first .LastName 1) }}{{ lower (first .FirstName 1) }}{{ last .EmployeeID 4 }}!{{ random 6 }}`,
 		},

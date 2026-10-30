@@ -1,0 +1,17 @@
+[[allowlists]]
+description = "Synthetic JWT used by the PowerShell Graph test double"
+condition = "AND"
+paths = ['''^tests/powershell/FakeGraph\.ps1$''']
+regexTarget = "line"
+regexes = [
+  '''^\s*\$token = '[A-Za-z0-9_-]+' \+ \(ConvertTo-B64Url .*\) \+ '\.fakesig'$''',
+]
+
+[[allowlists]]
+description = "Synthetic passwords used by audit-history tests"
+condition = "AND"
+paths = ['''^internal/api/history_test\.go$''']
+regexTarget = "line"
+regexes = [
+  '''^\s*want\(t, "(?:create|update) user".*"password": "Carol-Passw0rd-(?:123|456)"''',
+]

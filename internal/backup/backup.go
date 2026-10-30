@@ -471,8 +471,11 @@ func (s *sealWriter) emit(plain []byte, last bool) error {
 	}
 	ct := s.aead.Seal(nil, nonce(s.prefix, s.counter, last), plain, s.ad)
 	s.counter++
+	if len(ct) > chunkSize+s.aead.Overhead() {
+		return errors.New("backup chunk too large") // cannot happen: chunks are at most chunkSize
+	}
 	var l [4]byte
-	binary.BigEndian.PutUint32(l[:], uint32(len(ct)))
+	binary.BigEndian.PutUint32(l[:], uint32(len(ct))) // #nosec G115 -- bounded by chunkSize + overhead just above
 	if _, err := s.w.Write(l[:]); err != nil {
 		return err
 	}
@@ -508,8 +511,8 @@ func (o *openReader) Read(p []byte) (int, error) {
 		if _, err := io.ReadFull(o.r, l[:]); err != nil {
 			return 0, ErrPassphrase // truncated: the last chunk never came
 		}
-		size := binary.BigEndian.Uint32(l[:])
-		if size < uint32(o.aead.Overhead()) || size > chunkSize+uint32(o.aead.Overhead()) {
+		size := int(binary.BigEndian.Uint32(l[:]))
+		if size < o.aead.Overhead() || size > chunkSize+o.aead.Overhead() {
 			return 0, ErrPassphrase
 		}
 		ct := make([]byte, size)

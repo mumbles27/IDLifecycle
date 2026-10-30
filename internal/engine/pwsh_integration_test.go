@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -41,6 +42,11 @@ type pwshEnv struct {
 
 func findPwsh(t *testing.T) string {
 	t.Helper()
+	// The scripts are Windows-only (ActiveDirectory module, Windows security APIs); PowerShell on Linux runs them
+	// only up to the first Windows call.
+	if runtime.GOOS != "windows" {
+		t.Skip("the PowerShell scripts run on Windows only")
+	}
 	for _, n := range []string{"pwsh.exe", "pwsh"} {
 		if p, err := exec.LookPath(n); err == nil {
 			return p

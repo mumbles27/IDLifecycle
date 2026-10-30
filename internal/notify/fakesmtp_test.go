@@ -71,6 +71,7 @@ type fakeSMTP struct {
 	Token       string // accepted XOAUTH2 bearer token
 	Echo535     string // text appended to 535 replies (to test scrubbing)
 
+	start      sync.Once
 	mu         sync.Mutex
 	msgs       []captured
 	xoauthSeen []string
@@ -86,19 +87,25 @@ func newFakeSMTP(t *testing.T, serverTLS *tls.Config, exts ...string) *fakeSMTP 
 	}
 	f := &fakeSMTP{t: t, ln: ln, tls: serverTLS, Exts: exts, Got: make(chan captured, 10)}
 	t.Cleanup(func() { ln.Close() })
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go f.serve(c)
-		}
-	}()
 	return f
 }
 
-func (f *fakeSMTP) Port() int { return f.ln.Addr().(*net.TCPAddr).Port }
+// Port starts serving on first use, so the options a test sets before (ImplicitTLS, User, ...) are visible to
+// every connection without a data race.
+func (f *fakeSMTP) Port() int {
+	f.start.Do(func() {
+		go func() {
+			for {
+				c, err := f.ln.Accept()
+				if err != nil {
+					return
+				}
+				go f.serve(c)
+			}
+		}()
+	})
+	return f.ln.Addr().(*net.TCPAddr).Port
+}
 
 func (f *fakeSMTP) Messages() []captured {
 	f.mu.Lock()

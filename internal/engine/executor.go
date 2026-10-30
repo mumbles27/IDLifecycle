@@ -502,7 +502,7 @@ const (
 	pwUpper  = "ABCDEFGHJKLMNPQRSTUVWXYZ"
 	pwLower  = "abcdefghijkmnopqrstuvwxyz"
 	pwDigits = "23456789"
-	pwSymbol = "!@#$%^&*-_=+?"
+	pwSymbol = "!@#$%^&*-_=+?" // #nosec G101 -- the character set for generated passwords, not a credential
 )
 
 func pickChar(set string) (byte, error) {

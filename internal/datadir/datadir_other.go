@@ -20,7 +20,7 @@ func broadReaders(path string, _ bool) ([]Problem, error) {
 	return nil, nil
 }
 
-func lockdown(dir string, _ []string) error { return os.Chmod(dir, 0o700) }
+func lockdown(dir string, _ []string) error { return os.Chmod(dir, 0o700) } // #nosec G302 -- a directory: owner-only rwx (it needs x)
 
 // untrustedOwner reports an owner other than root or the current user.
 func untrustedOwner(path string) (string, error) {
