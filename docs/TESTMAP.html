@@ -1,0 +1,439 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IDLifecycle Test Map</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Same visual language as CODEMAP.html: one reading column, each drawing in a frame with a caption. */
+:root {
+  --bg: #f4f6f7; --surface: #ffffff; --fg: #1a2329; --muted: #5a6872; --line: #c6cfd5; --faint: #e3e8eb;
+  --core: #0d6873;      /* production code under test */
+  --fake: #4b4f9b;      /* stand-ins used by the automated tests */
+  --ext: #96570f;       /* real systems outside the exe */
+  --ok: #2d7a3e; --bad: #b3362b;
+  --display: "IBM Plex Sans Condensed", "Arial Narrow", system-ui, sans-serif;
+  --body: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", Consolas, "Courier New", monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #11171b; --surface: #19222a; --fg: #e2e8ec; --muted: #94a2ad; --line: #34424d; --faint: #222d35;
+  --core: #5ec3cc; --fake: #a4a8f2; --ext: #e2a656; --ok: #6cc47f; --bad: #f08a7f; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #11171b; --surface: #19222a; --fg: #e2e8ec; --muted: #94a2ad; --line: #34424d; --faint: #222d35;
+  --core: #5ec3cc; --fake: #a4a8f2; --ext: #e2a656; --ok: #6cc47f; --bad: #f08a7f; color-scheme: dark }
+
+body { background: var(--bg); color: var(--fg); font: 15px/1.6 var(--body); margin: 0; }
+.wrap { max-width: 1160px; margin: 0 auto; padding-block: 32px 64px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: grid; gap: 48px; }
+header { display: grid; gap: 10px; max-width: 76ch; }
+.eyebrow { font: 500 12px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--core); }
+h1 { font: 600 clamp(30px, 5vw, 44px)/1.1 var(--display); margin: 0; text-wrap: balance; }
+h2 { font: 600 24px/1.2 var(--display); margin: 0; text-wrap: balance; }
+h3 { font: 600 16px/1.3 var(--body); margin: 0; }
+p { margin: 0; }
+a { color: var(--core); }
+.lede { color: var(--muted); font-size: 16px; }
+section { display: grid; gap: 14px; min-width: 0; }
+section > p { max-width: 76ch; }
+code, .mono { font-family: var(--mono); font-size: .9em; }
+.key { display: flex; flex-wrap: wrap; gap: 8px 20px; font-size: 13px; color: var(--muted); }
+.key span { display: inline-flex; align-items: center; gap: 7px; }
+.key i { width: 14px; height: 14px; border-radius: 3px; border: 2px solid; display: inline-block; }
+.key b { display: inline-block; width: 22px; border-top: 2px solid; }
+
+figure { margin: 0; display: grid; gap: 10px; min-width: 0; }
+.frame { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; overflow-x: auto; padding: 12px; }
+.frame svg { display: block; width: 100%; height: auto; min-width: 820px; }
+figcaption { color: var(--muted); font-size: 13.5px; max-width: 82ch; }
+
+svg text { fill: var(--fg); font: 12.5px var(--body); pointer-events: none; }
+svg .t-title { font: 600 13px var(--body); }
+svg .t-sub { fill: var(--muted); font: 11px var(--mono); }
+svg .t-col { fill: var(--muted); font: 500 11px var(--mono); letter-spacing: .06em; text-transform: uppercase; }
+svg .wall { stroke: var(--ext); stroke-width: 1.5; stroke-dasharray: 3 5; }
+svg .t-wall { fill: var(--ext); font: 500 10.5px var(--mono); }
+
+/* the interactive map */
+.map-layout { display: grid; gap: 16px; }
+#map .node { cursor: pointer; }
+#map .node rect { fill: var(--surface); stroke: var(--line); stroke-width: 1.5; transition: stroke .15s, fill .15s, opacity .15s; }
+#map .node.run rect { fill: var(--faint); }
+#map .node.code rect { stroke: var(--core); }
+#map .node.fake rect { stroke: var(--fake); }
+#map .node.real rect { stroke: var(--ext); stroke-dasharray: 5 3; }
+#map .node:focus { outline: none; }
+#map .node:focus-visible rect { stroke-width: 3; }
+#map .node.sel rect { stroke: var(--fg); stroke-width: 2.5; }
+#map .node.on.code rect { fill: color-mix(in srgb, var(--core) 12%, var(--surface)); }
+#map .node.on.fake rect { fill: color-mix(in srgb, var(--fake) 12%, var(--surface)); }
+#map .node.on.real rect { fill: color-mix(in srgb, var(--ext) 12%, var(--surface)); }
+#map .node.on.run rect { fill: color-mix(in srgb, var(--fg) 10%, var(--surface)); stroke: var(--fg); }
+#map .node.dim { opacity: .3; }
+#map .e { fill: none; stroke-width: 1.3; transition: opacity .15s, stroke-width .15s; }
+#map .e.run { stroke: var(--muted); opacity: .45; }
+#map .e.fake { stroke: var(--fake); }
+#map .e.real { stroke: var(--ext); stroke-dasharray: 5 4; }
+#map .e.direct { stroke: var(--ext); }
+#map .e.hidden { opacity: 0; }
+#map.picked .e { opacity: .12; }
+#map.picked .e.on { opacity: 1; stroke-width: 2.2; }
+#map.picked .e.run.on { stroke: var(--fg); }
+#map.picked .e.hidden:not(.on) { opacity: 0; }
+
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 16px; display: grid; gap: 10px; min-width: 0; max-width: 820px; }
+.panel h3 { font-family: var(--mono); font-weight: 500; color: var(--core); overflow-wrap: anywhere; }
+.panel .cmd { font: 12.5px/1.5 var(--mono); background: var(--faint); border-radius: 6px; padding: 8px 10px; overflow-wrap: anywhere; white-space: pre-wrap; }
+.panel p { font-size: 13.5px; }
+.panel dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 4px 10px; font-size: 13px; }
+.panel dt { color: var(--muted); }
+.panel dd { margin: 0; overflow-wrap: anywhere; }
+.panel .hint { color: var(--muted); }
+
+/* step sequences */
+ol.steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); counter-reset: s; }
+ol.steps li { counter-increment: s; background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
+  padding: 14px 14px 14px 48px; position: relative; display: grid; gap: 4px; min-width: 0; align-content: start; }
+ol.steps li::before { content: counter(s); position: absolute; left: 14px; top: 13px; width: 24px; height: 24px; border-radius: 50%;
+  display: grid; place-items: center; font: 600 12px var(--mono); color: var(--core); border: 1.5px solid var(--core); }
+ol.steps li p { font-size: 13.5px; color: var(--muted); }
+ol.steps li .where { font: 12px var(--mono); color: var(--core); overflow-wrap: anywhere; }
+ol.steps.real li::before { color: var(--ext); border-color: var(--ext); }
+ol.steps.real li .where { color: var(--ext); }
+
+/* tables */
+.tablewrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
+table { border-collapse: collapse; width: 100%; min-width: 720px; font-size: 13.5px; }
+th, td { text-align: left; padding: 9px 14px; border-bottom: 1px solid var(--faint); vertical-align: top; }
+th { font: 600 12px var(--mono); letter-spacing: .05em; text-transform: uppercase; color: var(--muted); background: var(--faint); }
+td:first-child { font-family: var(--mono); font-size: 12.5px; color: var(--core); }
+tr:last-child td { border-bottom: 0; }
+#matrix td:not(:first-child) { font-size: 12.5px; }
+#matrix .yes { color: var(--fg); }
+#matrix .yes::before { content: "● "; color: var(--core); }
+#matrix .real::before { content: "● "; color: var(--ext); }
+#matrix .no { color: var(--line); }
+td.ps { color: var(--fake); }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="wrap">
+<header>
+  <div class="eyebrow">idlifecycle · tests · how they connect</div>
+  <h1>IDLifecycle Test Map</h1>
+  <p class="lede">Which test suite runs which part of the code, what each one puts in place of Active Directory, Microsoft 365, HR systems and the rest, and which checks you run yourself against the real thing. The step-by-step commands are in <a href="TESTING.md">TESTING.md</a>; the code itself is mapped in the <a href="CODEMAP.html">code map</a>.</p>
+  <div class="key">
+    <span><i style="border-color:var(--fg);background:var(--faint)"></i>Test suite or check</span>
+    <span><i style="border-color:var(--core)"></i>Production code under test</span>
+    <span><i style="border-color:var(--fake)"></i>Stand-in used by the tests</span>
+    <span><i style="border-color:var(--ext);border-style:dashed"></i>Real system</span>
+  </div>
+  <div class="key">
+    <span><b style="border-color:var(--muted)"></b>suite runs this code</span>
+    <span><b style="border-color:var(--fake)"></b>in tests, talks to this stand-in</span>
+    <span><b style="border-color:var(--ext);border-top-style:dashed"></b>stand-in for this real system</span>
+    <span><b style="border-color:var(--ext)"></b>your check talks to it for real</span>
+  </div>
+</header>
+
+<section>
+  <h2>What tests what</h2>
+  <p>Click a test suite to see the code it runs and the stand-ins it uses, or click a piece of code to see every suite that covers it. Nothing on the left of the dashed line ever reaches a real directory, tenant, mail server or HR system: only <strong>Your checks</strong> cross it, and they read, test a sign-in, or run in dry-run.</p>
+  <div class="map-layout">
+    <figure>
+      <div class="frame">
+        <svg id="map" viewBox="0 0 1100 676" role="img" aria-label="Six test suites on the left connect to the production code they run in the middle. Each piece of code connects to the stand-in the tests use in place of a real system: a mock API for the web console, an in-memory directory for the engine, a temporary SQLite database for the store, fixture files and fake HR APIs for sources, a fake mail server, the stub ActiveDirectory module, a fake Graph and stub Exchange Online module, and fakes for the installer. A dashed wall separates the stand-ins from the real systems; only Your checks cross it."></svg>
+      </div>
+      <figcaption>Automated suites stop at the dashed wall. The temporary SQLite database is the one stand-in you can swap for a real database server on purpose (<code>IDL_TEST_*_DSN</code>). Press Escape or click the empty background to clear the selection; a link such as <code>TESTMAP.html#pester</code> opens with that suite picked.</figcaption>
+    </figure>
+    <aside class="panel" id="panel" aria-live="polite"></aside>
+  </div>
+</section>
+
+<section>
+  <h2>Coverage at a glance</h2>
+  <p>The same information as a table: for each part of the code, the suites that run it and what each one uses in its place.</p>
+  <div class="tablewrap"><table id="matrix"></table></div>
+</section>
+
+<section>
+  <h2>How the stand-ins are kept safe and honest</h2>
+  <p>A fake is only useful if it can't be bypassed and behaves like the real thing. These are the guards and the contract tests behind the dashed wall.</p>
+  <ol class="steps">
+    <li><h3>Only the stub module can load</h3><p>Every script under test runs in a child <code>pwsh</code> whose <code>PSModulePath</code> holds only <code>StubAD</code> (plus <code>StubEXO</code> for cloud scripts). Before the first test, the runner proves <code>ActiveDirectory</code> resolves to version 99.0.0 in the stub folder, or aborts with <code>SAFETY ABORT</code>.</p><span class="where">Run-Tests.ps1 · TestHelpers.ps1 Assert-StubOnlyEnvironment</span></li>
+    <li><h3>Stubs refuse to run without a test state file</h3><p>The fake AD and Exchange Online modules throw on import unless <code>IDL_STUB_AD_STATE</code> / <code>IDL_STUB_EXO_STATE</code> point at a JSON file, so they can never quietly stand in for real ones.</p><span class="where">StubAD\ActiveDirectory · StubEXO\ExchangeOnlineManagement</span></li>
+    <li><h3>Graph is redirected only to loopback</h3><p>The cloud module accepts a different login and Graph URL only with <code>IDL_CLOUD_TEST=1</code> and only to 127.0.0.1, where <code>FakeGraph.ps1</code> listens. It verifies the certificate-signed client assertion like Entra ID does.</p><span class="where">IDLifecycle.Cloud.psm1 · FakeGraph.ps1</span></li>
+    <li><h3>Setup fakes need a test switch</h3><p>The install, uninstall and tray scripts load <code>SetupFakes.ps1</code> only with <code>IDL_SETUP_TEST=1</code> and only from the tests folder. Services, ACLs, Program Files and machine variables are simulated in a JSON file.</p><span class="where">SetupFakes.ps1 · FakeDaemon.ps1</span></li>
+    <li><h3>Fakes copy the real rules</h3><p>Stubs throw where the real cmdlets throw (already a member, not found, unique names, non-leaf deletes). FakeGraph returns the real error codes for mail-enabled, dynamic, synced and role-assignable groups.</p><span class="where">tests/powershell/README.md lists each copied behaviour</span></li>
+    <li><h3>Go fakes are held to the script contract</h3><p><code>TestFakeContract</code> and <code>TestFakeRefusesWhatTheScriptsRefuse</code> check that the in-memory <code>ad.FakeClient</code> and <code>cloud.Fake</code> answer like the scripts do, and the PowerShell bridge test runs the real scripts through the real Go client.</p><span class="where">ad/powershell_test.go · cloud/cloud_test.go · engine/pwsh_integration_test.go</span></li>
+    <li><h3>Every write is recorded</h3><p>Each mutating stub cmdlet and every Graph call is logged in the state file (secrets as <code>***</code>), which is how the tests prove a dry run made <strong>zero</strong> changes and a secret never reached a log.</p><span class="where">state.calls · Get-StubCalls · Get-FakeGraphCalls · Get-ExoCalls</span></li>
+  </ol>
+</section>
+
+<section>
+  <h2>From a checkout to a live run</h2>
+  <p>The order to build confidence in. The first four steps never touch anything real; from step 5 on you are checking your own environment, still without changing it until the last step.</p>
+  <ol class="steps">
+    <li><h3>Go tests</h3><p>Engine, API, store, sources, mail, CLI and the browser end-to-end test, against fakes and a temporary SQLite database.</p><span class="where">go test ./... -count=1</span></li>
+    <li><h3>PowerShell tests</h3><p>Every script against the stubs. About 20 minutes. Exit code 0 means all passed.</p><span class="where">pwsh -NoProfile -File tests\powershell\Run-Tests.ps1</span></li>
+    <li><h3>Mock console</h3><p>Click through the console with sample data and no backend, or run its selftest.</p><span class="where">go run ./cmd/idl-mockui</span></li>
+    <li><h3>Installer dry run</h3><p>Shows every install step without doing it; the setup window calls this <em>Test run (no changes)</em>.</p><span class="where">Install-IDLifecycle.ps1 … -DryRun</span></li>
+  </ol>
+  <ol class="steps real" start="5" style="counter-reset: s 4">
+    <li><h3>Health check</h3><p>Config, data folder ACL, database, admin user, PowerShell, scripts and the AD module; <code>-cloud</code> also signs in to Microsoft 365.</p><span class="where">idlifecycled check [-json] [-cloud]</span></li>
+    <li><h3>Test buttons</h3><p>Sources: <em>Test these settings</em>. Settings: <em>Test connection</em> (Microsoft 365), <em>Send test email</em>, <em>Test sign-in settings</em>. Roles: <em>Test this rule</em>.</p><span class="where">the console</span></li>
+    <li><h3>Preview impact</h3><p>For a role, mapping or lifecycle-group change: every person it would affect, against a live AD snapshot, before you save.</p><span class="where">Roles · Mappings · Lifecycle groups</span></li>
+    <li><h3>Dry-run syncs</h3><p>A fresh install starts in dry run: syncs plan every change as <em>simulated</em> and never write. Review them in Approvals and History.</p><span class="where">Settings → Engine → Dry run</span></li>
+    <li><h3>A script by hand</h3><p>Read-only scripts, or action scripts with <code>-DryRun</code>, against your domain to see exactly what they would do.</p><span class="where">docs/TESTING.md → Run one script by hand</span></li>
+    <li><h3>Supervised first live run</h3><p>Dry run off, manual approvals, a lab OU and a few people. Approve one change of each type and check the result in AD and Entra ID.</p><span class="where">Approvals · Runs · History</span></li>
+  </ol>
+</section>
+
+<section>
+  <h2>Where the tests live</h2>
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>Area</th><th>Test files</th><th>What they prove</th></tr></thead>
+    <tbody>
+      <tr><td>engine</td><td class="mono">internal/engine/*_test.go</td><td>Full sync flows with <code>ad.FakeClient</code> and SQLite: create, update, disable, rehire, delete; approvals per change type, dry run, bulk and delete limits, crash recovery, naming conflicts, matching people to accounts, role conditions, OU placement, lifecycle and cloud groups, the impact preview. <code>pwsh_integration_test.go</code> runs the real scripts through the real Go client against StubAD.</td></tr>
+      <tr><td>api</td><td class="mono">internal/api/*_test.go</td><td>Every endpoint on an <code>httptest</code> server: sign-in, lockout, CSRF, viewer / approver / admin permissions, settings validation and secret masking, OIDC, backups, the group searches, the cloud connection test and the impact preview.</td></tr>
+      <tr><td>store</td><td class="mono">internal/store/*_test.go</td><td>One shared suite for every database. SQLite always; PostgreSQL, SQL Server, MySQL and Db2 when <code>IDL_TEST_POSTGRES_DSN</code>, <code>IDL_TEST_MSSQL_DSN</code>, <code>IDL_TEST_MYSQL_DSN</code>, <code>IDL_TEST_DB2_DSN</code> are set.</td></tr>
+      <tr><td>sources</td><td class="mono">internal/sources/*_test.go</td><td>CSV fixtures, the REST connector against fake HR APIs (every auth and paging mode, retries, refused cross-host links), SQL against a temporary database, manual entry, and the example connector.</td></tr>
+      <tr><td>notify</td><td class="mono">internal/notify/*_test.go</td><td>A fake SMTP server and token endpoint: STARTTLS, TLS, OAuth2, bad passwords scrubbed from errors, header injection refused.</td></tr>
+      <tr><td>ad · cloud</td><td class="mono">internal/ad/powershell_test.go<br>internal/cloud/cloud_test.go</td><td>The Go ↔ PowerShell bridge: request and response JSON, exit codes, stray output and timeouts, passwords scrubbed, scripts blocked by Mark of the Web, and the fakes' contract.</td></tr>
+      <tr><td>app (browser)</td><td class="mono">internal/app/e2e_test.go<br>internal/app/e2e_oidc_test.go</td><td>Headless Edge drives the real console against the real API with the production CSP, running <code>testdata/selftest/selftest.js</code>; also the Entra ID sign-in round trip. Skipped when no Edge or Chrome is installed.</td></tr>
+      <tr><td>cmd/idlifecycled</td><td class="mono">main_test.go · configcmd_test.go</td><td><code>init</code>, <code>lockdown</code>, <code>check</code>, <code>user</code>, <code>config get/set</code> against a temporary data folder.</td></tr>
+      <tr><td>other Go</td><td class="mono">config · secrets · backup · scheduler · datadir · connstr · web</td><td>Config validation and path policy, encryption and DPAPI, backup and restore round trips, schedules and time zones, folder ACLs, DSN scrubbing, branding.</td></tr>
+      <tr><td class="ps">AD scripts</td><td class="mono">tests/powershell/*-IDL*.Tests.ps1</td><td>One file per script against StubAD: results, idempotent re-runs, dry run with zero writes, ID-attribute checks, privileged-group refusals, per-item failures (exit 1), logs and CSV reports.</td></tr>
+      <tr><td class="ps">cloud scripts</td><td class="mono">Cloud · *Cloud*.Tests.ps1</td><td>Against FakeGraph and StubEXO: the signed client assertion, group kinds and refusals, paging and throttling, Exchange Online for mail-enabled groups, connection checks, the certificate script.</td></tr>
+      <tr><td class="ps">setup · tray</td><td class="mono">Install-* · Uninstall-* · Start-IDLifecycle* · Invoke-IDLTrayAction · *Security.Tests.ps1</td><td>Install, upgrade and uninstall against SetupFakes and FakeDaemon, the setup window and tray without a window, ACL and trust helpers, and one real <code>go build</code> + <code>check</code> of the exe.</td></tr>
+      <tr><td class="ps">UI mock</td><td class="mono">internal/web/testdata/mock/*</td><td>The console against an in-browser API with sample data (<code>mock-api.js</code>), for UI work and screenshots without a server.</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+</div>
+
+<script>
+// Columns: x and width. Rows: 56 px apart, boxes 44 high; the six suites are spread over the same height.
+const COL = { run: [16, 196], code: [300, 230], fake: [600, 220], real: [880, 204] };
+const RY = r => 40 + r * 56, RH = 44, SY = i => 40 + i * 104, SH = 60;
+
+const N = {
+  // test suites
+  go:     { col: 'run', i: 0, label: 'go test ./...', sub: 'Go unit + integration',
+            cmd: 'go test ./... -count=1', time: 'a few minutes',
+            needs: 'Go 1.27 (go.mod). Nothing else: SQLite is built in.',
+            text: 'Every Go package against in-memory and loopback stand-ins. This is the suite that proves the planning logic: who gets created, changed, disabled or deleted, what waits for approval, and that dry run never writes.' },
+  bridge: { col: 'run', i: 1, label: 'go test: PS bridge', sub: 'pwsh_integration_test',
+            cmd: 'go test ./internal/engine -run TestRealScripts -v\ngo test ./internal/ad -v', time: 'about a minute',
+            needs: 'PowerShell 7 (pwsh) on PATH; skipped without it.',
+            text: 'Runs the real AD scripts through the real Go PowerShellClient, against StubAD. Proves the JSON contract between the exe and the scripts end to end, which the engine tests (using the in-memory fake) cannot.' },
+  e2e:    { col: 'run', i: 2, label: 'go test: browser E2E', sub: 'app/e2e_test.go · Edge',
+            cmd: 'go test ./internal/app -v', time: 'under a minute',
+            needs: 'Microsoft Edge or Chrome installed; skipped otherwise.',
+            text: 'Starts the real server with the production Content Security Policy and drives the real console in headless Edge: sign-in, approvals, settings, the group pickers, CSV export, and Entra ID sign-in against a fake identity provider.' },
+  pester: { col: 'run', i: 3, label: 'Run-Tests.ps1', sub: 'Pester 3.4 · real scripts',
+            cmd: 'pwsh -NoProfile -File tests\\powershell\\Run-Tests.ps1', time: 'about 20 minutes',
+            needs: 'PowerShell 7 and Pester 3.4.0. Run one suite at a time.',
+            text: 'Every script in scripts\\ in a child pwsh against StubAD, StubEXO, FakeGraph and the setup fakes. Checks syntax first and aborts unless the stub is the only ActiveDirectory module the child can load.' },
+  mock:   { col: 'run', i: 4, label: 'Mock console', sub: 'go run ./cmd/idl-mockui',
+            cmd: 'go run ./cmd/idl-mockui\n→ open the printed mock.html or mock-selftest.html URL', time: 'seconds',
+            needs: 'Go and a browser. No database, AD or service.',
+            text: 'The console against mock-api.js, an in-browser API with sample people, changes and settings. Use it to click through screens, try a UI change, or run the selftest against the mock.' },
+  you:    { col: 'run', i: 5, label: 'Your checks', sub: 'check · tests · dry run',
+            cmd: 'idlifecycled check -cloud\nTest buttons, Preview impact, dry-run syncs,\nscripts by hand with -DryRun', time: 'as long as you like',
+            needs: 'An installed service (or a checkout), your domain, and your app registration.',
+            text: 'The only checks that reach real systems. Each one reads, tests a sign-in, or plans without writing: the health check, the Test buttons in the console, Preview impact, dry-run syncs, and scripts run by hand with -DryRun.' },
+
+  // production code
+  ui:      { col: 'code', r: 0,  label: 'Web console', sub: 'internal/web/static', text: 'The browser app: one view per page, the group pickers, the impact preview.' },
+  api:     { col: 'code', r: 1,  label: 'HTTP API', sub: 'internal/api', text: 'JSON endpoints, sign-in, sessions, CSRF and role checks.' },
+  engine:  { col: 'code', r: 2,  label: 'Engine', sub: 'plan · approve · execute', text: 'Fetches sources, plans changes, applies approval policy and limits, executes approved changes, writes the audit chain.' },
+  store:   { col: 'code', r: 3,  label: 'Store', sub: 'internal/store', text: 'All database access, for SQLite, PostgreSQL, SQL Server, MySQL and Db2.' },
+  sources: { col: 'code', r: 4,  label: 'HR sources', sub: 'CSV · SQL · REST · manual', text: 'Reads people from HR systems.' },
+  notify:  { col: 'code', r: 5,  label: 'Email', sub: 'internal/notify', text: 'SMTP, Microsoft 365 SMTP with OAuth2, and Graph sendMail.' },
+  clients: { col: 'code', r: 6,  label: 'Go ↔ PowerShell', sub: 'ad · cloud PowerShellClient', text: 'Runs a script with JSON on stdin and reads one JSON document from stdout.' },
+  ads:     { col: 'code', r: 7,  label: 'AD scripts', sub: 'scripts\\*-IDL*.ps1', text: 'Read and change Active Directory.' },
+  clouds:  { col: 'code', r: 8,  label: 'Cloud scripts', sub: 'Graph · Exchange Online', text: 'Read and change Entra ID, Microsoft 365 and Exchange Online group memberships.' },
+  setup:   { col: 'code', r: 9,  label: 'Setup and tray', sub: 'install · uninstall · tray', text: 'Install, upgrade, uninstall, the setup window and the tray icon.' },
+  cli:     { col: 'code', r: 10, label: 'idlifecycled CLI', sub: 'check · init · config', text: 'The executable\'s commands: check, init, lockdown, user, backup, restore, config.' },
+
+  // stand-ins
+  f_mock:  { col: 'fake', r: 0,  label: 'mock-api.js', sub: 'in-browser fake API', text: 'Sample people, changes and settings in memory; same endpoints as the real API.' },
+  f_dir:   { col: 'fake', r: 2,  label: 'ad.FakeClient · cloud.Fake', sub: 'in-memory directory', text: 'An in-memory AD and Entra ID with the same rules as the scripts, held to them by contract tests.' },
+  f_sql:   { col: 'fake', r: 3,  label: 'Temporary SQLite', sub: 'storetest.New', text: 'A fresh database per test, deleted afterwards.' },
+  f_hr:    { col: 'fake', r: 4,  label: 'Fixtures · fake HR APIs', sub: 'CSV files · httptest', text: 'CSV fixtures, temporary SQL databases and httptest servers that act like HR APIs.' },
+  f_smtp:  { col: 'fake', r: 5,  label: 'Fake mail server', sub: 'fakesmtp_test.go', text: 'A loopback SMTP server and token endpoint.' },
+  f_stub:  { col: 'fake', r: 7,  label: 'StubAD', sub: 'ActiveDirectory 99.0.0', text: 'A fake ActiveDirectory module whose directory is a JSON file per test.' },
+  f_graph: { col: 'fake', r: 8,  label: 'FakeGraph · StubEXO', sub: 'loopback · EXO 99.0.0', text: 'A fake Entra ID token endpoint and Graph API on 127.0.0.1, and a fake ExchangeOnlineManagement module.' },
+  f_setup: { col: 'fake', r: 9,  label: 'SetupFakes · FakeDaemon', sub: 'IDL_SETUP_TEST=1', text: 'Simulated services, ACLs, folders and a stand-in idlifecycled.exe.' },
+  f_tmp:   { col: 'fake', r: 10, label: 'Temporary data folder', sub: 't.TempDir · %TEMP%', text: 'A throwaway config.json, database and key.' },
+
+  // real systems
+  r_db:    { col: 'real', r: 3, label: 'Database servers', sub: 'opt-in: IDL_TEST_*_DSN', text: 'PostgreSQL, SQL Server, MySQL or Db2. The store suite runs against one only when you set its DSN variable.' },
+  r_hr:    { col: 'real', r: 4, label: 'Your HR systems', sub: 'CSV share · SQL · API', text: 'Reached by Test these settings and by syncs.' },
+  r_mail:  { col: 'real', r: 5, label: 'Mail', sub: 'SMTP · Microsoft 365', text: 'Reached by Send test email and notifications.' },
+  r_ad:    { col: 'real', r: 7, label: 'Active Directory', sub: 'your domain', text: 'Reached by check (module only), snapshots, Preview impact, and scripts run by hand.' },
+  r_m365:  { col: 'real', r: 8, label: 'Entra ID · Exchange', sub: 'your tenant', text: 'Reached by Test connection and check -cloud.' },
+  r_win:   { col: 'real', r: 9, label: 'This Windows server', sub: 'services · Program Files', text: 'Changed only by a real install or uninstall.' },
+};
+
+// Which nodes each suite touches.
+const T = {
+  go:     ['api', 'engine', 'store', 'sources', 'notify', 'clients', 'cli', 'f_dir', 'f_sql', 'f_hr', 'f_smtp', 'f_tmp', 'r_db'],
+  bridge: ['engine', 'clients', 'ads', 'f_stub', 'f_sql'],
+  e2e:    ['ui', 'api', 'engine', 'store', 'f_dir', 'f_sql'],
+  pester: ['ads', 'clouds', 'setup', 'cli', 'f_stub', 'f_graph', 'f_setup', 'f_tmp'],
+  mock:   ['ui', 'f_mock'],
+  you:    ['ui', 'api', 'engine', 'sources', 'notify', 'clients', 'ads', 'clouds', 'cli', 'r_hr', 'r_mail', 'r_ad', 'r_m365'],
+};
+// Code → stand-in, stand-in → real system, and the direct real connections of Your checks.
+const LINKS = [
+  ['ui', 'f_mock', 'fake'], ['engine', 'f_dir', 'fake'], ['store', 'f_sql', 'fake'], ['sources', 'f_hr', 'fake'],
+  ['notify', 'f_smtp', 'fake'], ['clients', 'f_stub', 'fake'], ['ads', 'f_stub', 'fake'], ['clouds', 'f_graph', 'fake'],
+  ['setup', 'f_setup', 'fake'], ['cli', 'f_tmp', 'fake'],
+  ['f_sql', 'r_db', 'real'], ['f_hr', 'r_hr', 'real'], ['f_smtp', 'r_mail', 'real'], ['f_stub', 'r_ad', 'real'],
+  ['f_graph', 'r_m365', 'real'], ['f_setup', 'r_win', 'real'],
+  ['sources', 'r_hr', 'direct'], ['notify', 'r_mail', 'direct'], ['ads', 'r_ad', 'direct'], ['clouds', 'r_m365', 'direct'],
+];
+// What each suite uses in place of a real system, per piece of code (for the table and the panel).
+const VIA = {
+  go:     { api: 'httptest + SQLite', engine: 'ad.FakeClient, cloud.Fake', store: 'SQLite (or a real server via DSN)', sources: 'fixtures, fake HR APIs', notify: 'fake SMTP / token server', clients: 'tiny test scripts', cli: 'temp data folder' },
+  bridge: { engine: 'SQLite', clients: 'real scripts', ads: 'StubAD' },
+  e2e:    { ui: 'headless Edge', api: 'real server', engine: 'ad.FakeClient', store: 'SQLite' },
+  pester: { ads: 'StubAD', clouds: 'FakeGraph, StubEXO', setup: 'SetupFakes, FakeDaemon', cli: 'one real build + check' },
+  mock:   { ui: 'mock-api.js' },
+  you:    { ui: 'your browser', api: 'the service', engine: 'dry run, Preview impact', sources: 'Test these settings', notify: 'Send test email', clients: 'check, Test connection', ads: 'by hand with -DryRun', clouds: 'Test connection, check -cloud', cli: 'idlifecycled check' },
+};
+
+const NS = 'http://www.w3.org/2000/svg';
+const svg = document.getElementById('map');
+const mk = (n, a, parent) => { const e = document.createElementNS(NS, n); for (const k in a) e.setAttribute(k, a[k]); (parent || svg).appendChild(e); return e; };
+const box = id => { const n = N[id], [x, w] = COL[n.col]; return n.col === 'run' ? { x, y: SY(n.i), w, h: SH } : { x, y: RY(n.r), w, h: RH }; };
+const curve = (x1, y1, x2, y2) => { const d = Math.max(28, (x2 - x1) / 2); return `M${x1} ${y1}C${x1 + d} ${y1} ${x2 - d} ${y2} ${x2} ${y2}`; };
+
+// column headings and the wall
+[['Test suites', 'run'], ['Code under test', 'code'], ['Stand-ins', 'fake'], ['Real systems', 'real']].forEach(([t, c]) =>
+  mk('text', { class: 't-col', x: COL[c][0], y: 24 }).textContent = t);
+mk('line', { class: 'wall', x1: 850, y1: 34, x2: 850, y2: 652 });
+mk('text', { class: 't-wall', x: 850, y: 668, 'text-anchor': 'middle' }).textContent = 'automated tests stop here';
+
+// edges first, so boxes sit on top
+const edges = [];
+const eg = mk('g', {});
+for (const s of Object.keys(T)) {
+  for (const id of T[s].filter(t => N[t].col === 'code')) {
+    const a = box(s), b = box(id);
+    edges.push({ from: s, to: id, kind: 'run', el: mk('path', { class: 'e run', d: curve(a.x + a.w, a.y + a.h / 2, b.x, b.y + b.h / 2) }, eg) });
+  }
+}
+for (const [f, t, kind] of LINKS) {
+  const a = box(f), b = box(t);
+  let d;
+  if (kind === 'direct') {
+    // runs in the gap below the row, under the stand-in boxes, then up into the real system
+    const y = a.y + a.h / 2, g = a.y + a.h + 6;
+    d = `M${a.x + a.w} ${y}C${a.x + a.w + 26} ${y} ${a.x + a.w + 26} ${g} ${a.x + a.w + 50} ${g}L${b.x - 30} ${g}C${b.x - 14} ${g} ${b.x - 16} ${y} ${b.x} ${y}`;
+  } else {
+    d = curve(a.x + a.w, a.y + a.h / 2, b.x, b.y + b.h / 2);
+  }
+  const hidden = kind === 'direct' ? ' hidden' : '';
+  edges.push({ from: f, to: t, kind, el: mk('path', { class: `e ${kind}${hidden}`, d }, eg) });
+}
+
+// nodes
+const nodes = {};
+for (const id of Object.keys(N)) {
+  const n = N[id], b = box(id);
+  const g = mk('g', { class: `node ${n.col}`, tabindex: 0, role: 'button', 'aria-label': `${n.label}: ${n.sub}` });
+  mk('rect', { x: b.x, y: b.y, width: b.w, height: b.h, rx: 6 }, g);
+  const mid = b.y + b.h / 2;
+  mk('text', { class: 't-title', x: b.x + 12, y: mid - 3 }, g).textContent = n.label;
+  mk('text', { class: 't-sub', x: b.x + 12, y: mid + 13 }, g).textContent = n.sub;
+  g.addEventListener('click', ev => { ev.stopPropagation(); pick(id); });
+  g.addEventListener('keydown', ev => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); pick(id); } });
+  nodes[id] = g;
+}
+svg.addEventListener('click', () => pick(null));
+document.addEventListener('keydown', ev => { if (ev.key === 'Escape') pick(null); });
+
+const suitesFor = id => Object.keys(T).filter(s => T[s].includes(id));
+const label = id => N[id].label;
+const panel = document.getElementById('panel');
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+function pick(id) {
+  let on = new Set(), live = new Set();
+  if (id && N[id].col === 'run') {
+    on = new Set([id, ...T[id]]);
+    for (const e of edges) {
+      if (e.kind === 'run') { if (e.from === id) live.add(e); continue; }
+      if (!on.has(e.from) || !on.has(e.to)) continue;
+      if (e.kind === 'direct' && id !== 'you') continue;
+      if (e.kind === 'real' && !(id === 'go' && e.from === 'f_sql')) continue;   // only the opt-in database crosses
+      live.add(e);
+    }
+  } else if (id) {
+    const suites = suitesFor(id);
+    on = new Set([id, ...suites]);
+    for (const e of edges) {
+      if (e.kind === 'run' && e.to === id) live.add(e);
+      if (e.kind !== 'run' && (e.from === id || e.to === id)) { live.add(e); on.add(e.from); on.add(e.to); }
+    }
+    if (N[id].col !== 'code') for (const e of edges) if (e.kind === 'run' && on.has(e.to) && on.has(e.from)) live.add(e);
+    for (const s of Object.keys(T)) if (T[s].includes(id)) on.add(s);
+  }
+  svg.classList.toggle('picked', Boolean(id));
+  for (const k of Object.keys(nodes)) {
+    nodes[k].classList.toggle('sel', k === id);
+    nodes[k].classList.toggle('on', Boolean(id) && on.has(k));
+    nodes[k].classList.toggle('dim', Boolean(id) && !on.has(k));
+    nodes[k].setAttribute('aria-pressed', String(k === id));
+  }
+  for (const e of edges) e.el.classList.toggle('on', live.has(e));
+  render(id);
+}
+
+function render(id) {
+  if (!id) {
+    panel.innerHTML = '<h3>Pick a suite</h3><p class="hint">Click a test suite on the left to see what it runs and what it uses instead of the real systems, or click any box to see what connects to it.</p>' +
+      '<dl>' + Object.keys(T).map(s => `<dt>${esc(label(s))}</dt><dd>${esc(N[s].time)}</dd>`).join('') + '</dl>';
+    return;
+  }
+  const n = N[id];
+  if (n.col === 'run') {
+    const code = T[id].filter(t => N[t].col === 'code');
+    panel.innerHTML = `<h3>${esc(n.label)}</h3><div class="cmd">${esc(n.cmd)}</div><p>${esc(n.text)}</p>
+      <dl><dt>Time</dt><dd>${esc(n.time)}</dd><dt>Needs</dt><dd>${esc(n.needs)}</dd>
+      <dt>Runs</dt><dd>${code.map(c => `${esc(label(c))} <span class="hint">(${esc(VIA[id][c] || '')})</span>`).join('<br>')}</dd></dl>`;
+    return;
+  }
+  const suites = suitesFor(id);
+  let rows = '';
+  if (n.col === 'code') {
+    rows = suites.map(s => `<dt>${esc(label(s))}</dt><dd>${esc(VIA[s][id] || '')}</dd>`).join('');
+  } else {
+    const linked = LINKS.filter(([f, t]) => f === id || t === id).map(([f, t]) => (f === id ? t : f));
+    rows = `<dt>Connects to</dt><dd>${linked.map(l => esc(label(l))).join(', ') || '-'}</dd>` +
+      (suites.length ? `<dt>Used by</dt><dd>${suites.map(s => esc(label(s))).join(', ')}</dd>` : '');
+  }
+  panel.innerHTML = `<h3>${esc(n.label)}</h3><p>${esc(n.text)}</p><dl>${rows || '<dt>Covered by</dt><dd>-</dd>'}</dl>`;
+}
+
+// coverage table
+const suites = Object.keys(T);
+const codeIds = Object.keys(N).filter(k => N[k].col === 'code');
+const table = document.getElementById('matrix');
+table.innerHTML = `<thead><tr><th>Code</th>${suites.map(s => `<th>${esc(label(s))}</th>`).join('')}</tr></thead><tbody>` +
+  codeIds.map(c => `<tr><td>${esc(label(c))}</td>${suites.map(s => {
+    if (!T[s].includes(c)) return '<td class="no">–</td>';
+    return `<td class="${s === 'you' ? 'real' : 'yes'}">${esc(VIA[s][c] || '')}</td>`;
+  }).join('')}</tr>`).join('') + '</tbody>';
+
+pick(N[location.hash.slice(1)] ? location.hash.slice(1) : null);
+window.addEventListener('hashchange', () => pick(N[location.hash.slice(1)] ? location.hash.slice(1) : null));
+</script>
