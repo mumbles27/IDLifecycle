@@ -33,6 +33,7 @@ type User struct {
 	DN         string             `json:"dn"`
 	Sam        string             `json:"sam"`
 	UPN        string             `json:"upn"`
+	SID        string             `json:"sid"` // objectSid as S-1-5-..., for matching the Entra ID user (onPremisesSecurityIdentifier)
 	Enabled    bool               `json:"enabled"`
 	ParentOU   string             `json:"parentOu"`
 	ExternalID string             `json:"externalId"`
@@ -89,6 +90,8 @@ type UpdateItem struct {
 	AddGroups    []string          `json:"addGroups"`
 	RemoveGroups []string          `json:"removeGroups"`
 	MoveTo       string            `json:"moveTo"`
+	Expect       *model.Expect     `json:"expect,omitempty"` // checked before any change (undo); a mismatch fails the item with "drift: ..."
+	Force        bool              `json:"force,omitempty"`  // skip the expect check
 }
 
 type DisableItem struct {
@@ -99,6 +102,11 @@ type DisableItem struct {
 	RemoveGroups []string `json:"removeGroups"`
 	AddGroups    []string `json:"addGroups"` // lifecycle_groups.disabled_add, applied after the account is disabled
 	Description  string   `json:"description"`
+	// Set/Clear work like UpdateItem's (undo of an enable); applied after the account is disabled.
+	Set    map[string]string `json:"set,omitempty"`
+	Clear  []string          `json:"clear,omitempty"`
+	Expect *model.Expect     `json:"expect,omitempty"`
+	Force  bool              `json:"force,omitempty"`
 }
 
 type EnableItem struct {
@@ -108,6 +116,11 @@ type EnableItem struct {
 	MoveTo       string   `json:"moveTo"`
 	AddGroups    []string `json:"addGroups"`
 	RemoveGroups []string `json:"removeGroups"` // lifecycle_groups.disabled_add groups the account still holds
+	// Set/Clear work like UpdateItem's (undo of a disable); applied before the account is enabled.
+	Set    map[string]string `json:"set,omitempty"`
+	Clear  []string          `json:"clear,omitempty"`
+	Expect *model.Expect     `json:"expect,omitempty"`
+	Force  bool              `json:"force,omitempty"`
 }
 
 type RemoveItem struct {
@@ -125,6 +138,8 @@ type Result struct {
 	Sam        string `json:"sam"`
 	UPN        string `json:"upn"`
 	Error      string `json:"error"`
+	// Before is the account before this item touched it (applied and would results), for undo.
+	Before *model.BeforeState `json:"before,omitempty"`
 }
 
 // OK reports whether the item reached its intended end state (or would, in dry-run).

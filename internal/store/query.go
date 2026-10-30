@@ -12,8 +12,9 @@ import (
 const AuditQueryHelp = `words or "a phrase"   must appear (actor, action, entity or detail)
 -word                  must not appear
 actor:alice            who did it (repeat for any of several); actor:system for the service itself
+-actor:system          not done by them (here: everything a person did); also -action:sync.* and -type:run
 action:change.*        what happened; * at the end matches a prefix (change.failed, auth.login_failed ...)
-type:change  id:<id>   the entity it concerns
+type:change  id:<id>   the entity it concerns (source, mapping, role, user, manual_person, identity, change, settings ...)
 level:error            failures only (failed / denied / rejected / blocked, or an error in the detail)
 since:7d  since:2026-10-01   after:  before:2026-10-25T08:00   time range (local time; d h m units)`
 
@@ -43,11 +44,21 @@ func ParseAuditQuery(q string, now time.Time, loc *time.Location) (AuditFilter, 
 			}
 			continue
 		}
-		if neg {
-			return f, fmt.Errorf("-%s: only plain words can be excluded", key)
-		}
 		if val == "" {
 			return f, fmt.Errorf("%s: needs a value", key)
+		}
+		if neg {
+			switch key {
+			case "actor", "user", "by":
+				f.NotActors = append(f.NotActors, val)
+			case "action", "event":
+				f.NotActions = append(f.NotActions, strings.ToLower(val))
+			case "type", "entity":
+				f.NotEntityTypes = append(f.NotEntityTypes, strings.ToLower(val))
+			default:
+				return f, fmt.Errorf("-%s: only plain words, actor:, action: and type: can be excluded", key)
+			}
+			continue
 		}
 		switch key {
 		case "actor", "user", "by":

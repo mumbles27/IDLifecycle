@@ -12,7 +12,7 @@ import (
 
 // BackupTables are the tables a backup carries, in an order that is safe to load (nothing references a later
 // table). sessions (sign-ins on the old server) and schema_migrations (owned by migrate) are left out.
-var BackupTables = []string{"settings", "users", "sources", "manual_people", "mappings", "role_rules", "identities", "identity_choices", "sync_runs", "changes", "audit_log"}
+var BackupTables = []string{"settings", "users", "sources", "manual_people", "mappings", "role_rules", "identities", "identity_choices", "identity_holds", "identity_hold_state", "retention_policies", "identity_retention", "sync_runs", "changes", "change_undo", "change_undo_items", "audit_log"}
 
 // SchemaVersion is the newest migration this build knows; a backup records it and a restore refuses a newer one.
 func SchemaVersion() int {

@@ -318,7 +318,7 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	s.audit(r, "user.create", "user", u.ID, map[string]any{"username": u.Username, "role": u.Role})
+	s.audit(r, "user.create", "user", u.ID, map[string]any{"username": u.Username, "role": u.Role, "fields": auditSnapshot(u, u)})
 	writeJSON(w, http.StatusCreated, u)
 }
 
@@ -382,7 +382,11 @@ func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 	if next.Disabled || in.Password != "" || next.Role != cur.Role {
 		_ = s.Store.DeleteUserSessions(r.Context(), id)
 	}
-	s.audit(r, "user.update", "user", id, map[string]any{"username": next.Username, "role": next.Role, "disabled": next.Disabled, "password_reset": in.Password != ""})
+	changes := auditChanges(cur, next, cur, next)
+	if in.Password != "" {
+		changes["password"] = map[string]any{"changed": true}
+	}
+	s.audit(r, "user.update", "user", id, withChanges(map[string]any{"username": next.Username, "role": next.Role, "disabled": next.Disabled, "password_reset": in.Password != ""}, changes))
 	writeJSON(w, http.StatusOK, next)
 }
 
@@ -407,7 +411,7 @@ func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	s.audit(r, "user.delete", "user", id, map[string]any{"username": cur.Username})
+	s.audit(r, "user.delete", "user", id, map[string]any{"username": cur.Username, "fields": auditSnapshot(cur, cur)})
 	w.WriteHeader(http.StatusNoContent)
 }
 

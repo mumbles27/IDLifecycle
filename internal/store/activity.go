@@ -20,7 +20,8 @@ import (
 
 const identityCols = `i.id, i.source_id, s.name, i.external_id, i.display, i.attrs_json, i.attrs_hash, i.active, i.missing_runs,
 	i.first_seen, i.last_seen, i.ad_guid, i.ad_dn, i.ad_sam, i.applied_json, i.disabled_at, i.lifecycle_state,
-	i.ou_override, i.ou_override_value, i.merged_into, i.link_decision, c.name_override, c.link_rejects`
+	i.ou_override, i.ou_override_value, i.merged_into, i.link_decision, c.name_override, c.link_rejects,
+	i.retention_policy_id, i.retention_assigned_by`
 
 const identityFrom = ` FROM identities i LEFT JOIN sources s ON s.id = i.source_id LEFT JOIN identity_choices c ON c.identity_id = i.id`
 
@@ -31,7 +32,7 @@ func scanIdentity(sc interface{ Scan(...any) error }) (model.Identity, error) {
 	var active int
 	err := sc.Scan(&x.ID, &x.SourceID, &src, &x.ExternalID, &x.Display, &attrs, &x.AttrsHash, &active, &x.MissingRuns,
 		&first, &last, &x.ADGUID, &x.ADDN, &x.ADSam, &applied, &dis, &x.State, &x.OUOverride, &x.OUOverrideValue,
-		&x.MergedInto, &x.LinkDecision, &names, &rejects)
+		&x.MergedInto, &x.LinkDecision, &names, &rejects, &x.RetentionPolicyID, &x.RetentionAssignedBy)
 	x.SourceName = src.String
 	x.Active = active != 0
 	x.Attrs = map[string]string{}
@@ -114,12 +115,18 @@ func (s *Store) ListIdentitiesBySource(ctx context.Context, sourceID string) ([]
 type IdentityFilter struct {
 	Q     string
 	State string
+	// Manual keeps people with at least one hold (Manual pin) still in force at ManualAt.
+	Manual   bool
+	ManualAt time.Time
 }
 
 func (s *Store) ListIdentities(ctx context.Context, f IdentityFilter, p Page) ([]model.Identity, int, error) {
 	w := &where{}
 	if f.State != "" {
 		w.add("i.lifecycle_state = ?", f.State)
+	}
+	if f.Manual {
+		w.add("EXISTS (SELECT 1 FROM identity_holds h WHERE h.identity_id = i.id AND (h.until_at = ? OR h.until_at > ?))", "", ts(f.ManualAt))
 	}
 	w.like(s.driver, f.Q, "i.external_id", "i.display", "i.ad_sam", "i.ad_dn")
 
@@ -247,7 +254,12 @@ func (s *Store) GetChange(ctx context.Context, id string) (model.Change, error) 
 	if errors.Is(err, sql.ErrNoRows) {
 		return c, ErrNotFound
 	}
-	return c, err
+	if err != nil {
+		return c, err
+	}
+	l := []model.Change{c}
+	err = s.attachUndo(ctx, l)
+	return l[0], err
 }
 
 type ChangeFilter struct {
@@ -296,7 +308,11 @@ func (s *Store) ListChanges(ctx context.Context, f ChangeFilter, p Page) ([]mode
 		}
 		out = append(out, c)
 	}
-	return out, total, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	rows.Close()
+	return out, total, s.attachUndo(ctx, out)
 }
 
 // ListChangesWithStatus returns all changes in the given statuses, oldest first.
@@ -458,7 +474,11 @@ type AuditFilter struct {
 	Actions    []string // exact, or a prefix when it ends in '*' (change.* = every change action)
 	Text       []string // case-insensitive, in the actor, action, entity or detail
 	NotText    []string
-	From, To   time.Time // From <= ts < To (zero = open)
+	// NotActors, NotActions (a prefix when it ends in '*') and NotEntityTypes exclude: none of them may match.
+	NotActors      []string
+	NotActions     []string
+	NotEntityTypes []string
+	From, To       time.Time // From <= ts < To (zero = open)
 	// ErrorsOnly keeps failures: actions that end in failed/denied/rejected/blocked, and entries whose detail has a
 	// non-empty "error".
 	ErrorsOnly bool
@@ -493,6 +513,19 @@ func (f AuditFilter) where(driver string) *where {
 	}
 	anyOf("actor", f.Actors)
 	anyOf("action", f.Actions)
+	noneOf := func(col string, vals []string) {
+		for _, v := range vals {
+			if strings.HasSuffix(v, "*") {
+				w.parts = append(w.parts, col+" NOT LIKE "+pat+" ESCAPE '!'")
+				w.args = append(w.args, likeEscape(driver, strings.TrimSuffix(v, "*"))+"%")
+			} else {
+				w.add(col+" <> ?", v)
+			}
+		}
+	}
+	noneOf("actor", f.NotActors)
+	noneOf("action", f.NotActions)
+	noneOf("entity_type", f.NotEntityTypes)
 	cols := []string{"actor", "action", "entity_type", "entity_id", "detail_json"}
 	for _, t := range f.Text {
 		w.like(driver, t, cols...)

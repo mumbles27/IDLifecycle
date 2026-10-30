@@ -20,8 +20,14 @@
     Items where everything already matches are "skipped". One failing item never stops the others.
     The ID attribute, cn/name, memberOf, userAccountControl, password attributes etc. cannot be changed here.
 
+    Undo support: an optional "expect" object ({enabled, dn, attributes:{name: value|null}, memberOf, notMemberOf}) is
+    checked before any change; a mismatch fails the item with error "drift: <each difference>" and nothing is changed
+    ("force": true skips the check, with a WARN). Applied and would results carry "before": {enabled, dn, attributes (the
+    old value of every attribute the item changed, null = was empty), groupsAdded, groupsRemoved (DNs actually added /
+    removed, not no-ops)} - what the engine needs to build the inverse.
+
     Response: {"ok":true,"dryRun":false,"results":[{"changeId","externalId","status":"applied|would|skipped|failed",
-    "message","objectGuid","dn","sam","upn","error"}],"summary":{"total","applied","would","skipped","failed"}}
+    "message","objectGuid","dn","sam","upn","error","before"}],"summary":{"total","applied","would","skipped","failed"}}
 
 .PARAMETER DryRun
     Do every lookup and log/report everything as WOULD: statements, but make NO changes. Successful items
@@ -84,27 +90,16 @@ try{
 
     Write-IDLLog "ActiveDirectory module loaded (version $((Get-Module ActiveDirectory).Version))"
     Test-IDLAdConnection -Server $server
-    $serverParams = Get-IDLServerParams -Server $server
 
     # ---- Phase: bulk resolution (only the properties we need) ----
     $phase = Start-IDLPhase -Name 'Resolve accounts and groups'
     $extraProperties = [System.Collections.Generic.List[string]]::new()
     $allGroups = [System.Collections.Generic.List[string]]::new()
+    $expectNeeds = Get-IDLExpectNeeds -Items $items
+    $extraProperties.AddRange($expectNeeds.Properties)
+    $allGroups.AddRange($expectNeeds.Groups)
     foreach ($item in $items){
-        $setTable = Get-IDLField -Object $item -Name 'set'
-        if ($setTable -is [System.Collections.IDictionary]){
-            foreach ($key in $setTable.Keys){
-                if (Test-IDLAttributeName -Name ([string]$key)){
-                    $extraProperties.Add([string]$key)
-                }
-            }
-        }
-
-        foreach ($key in (Get-IDLStringList -Value (Get-IDLField -Object $item -Name 'clear'))){
-            if (Test-IDLAttributeName -Name $key){
-                $extraProperties.Add($key)
-            }
-        }
+        $extraProperties.AddRange((Get-IDLAttributeRequestNames -Item $item))
 
         $addGroups = Get-IDLStringList -Value (Get-IDLField -Object $item -Name 'addGroups')
         $removeGroups = Get-IDLStringList -Value (Get-IDLField -Object $item -Name 'removeGroups')
@@ -147,57 +142,7 @@ try{
             Write-IDLLog "Processing $changeId ($externalId) -> $userDn"
 
             # ---- validate the item completely before any change ----
-            $setTable = Get-IDLField -Object $item -Name 'set'
-            if (
-                ($null -ne $setTable) -and
-                ($setTable -isnot [System.Collections.IDictionary])
-            ){
-                throw "'set' must be a JSON object"
-            }
-
-            $desired = [ordered]@{}
-            if ($null -ne $setTable){
-                foreach ($key in $setTable.Keys){
-                    $name = [string]$key
-                    if (-not (Test-IDLAttributeName -Name $name)){
-                        throw "invalid attribute name in 'set': $name"
-                    }
-
-                    if (
-                        (Test-IDLProtectedAttribute -Name $name) -or
-                        ($name.ToLowerInvariant() -in $blocked)
-                    ){
-                        throw "attribute '$name' is protected and cannot be changed by Set-IDLUser"
-                    }
-
-                    $text = ConvertTo-IDLString -Value $setTable[$key]
-                    if ([string]::IsNullOrEmpty($text)){
-                        throw "attribute '$name' has an empty value in 'set' (use 'clear' to remove a value)"
-                    }
-
-                    $desired[$name] = $text
-                }
-            }
-
-            $clearNames = [System.Collections.Generic.List[string]]::new()
-            foreach ($name in (Get-IDLStringList -Value (Get-IDLField -Object $item -Name 'clear'))){
-                if (-not (Test-IDLAttributeName -Name $name)){
-                    throw "invalid attribute name in 'clear': $name"
-                }
-
-                if (
-                    (Test-IDLProtectedAttribute -Name $name) -or
-                    ($name.ToLowerInvariant() -in $blocked)
-                ){
-                    throw "attribute '$name' is protected and cannot be cleared by Set-IDLUser"
-                }
-
-                if ($desired.Contains($name)){
-                    throw "attribute '$name' appears in both 'set' and 'clear'"
-                }
-
-                $clearNames.Add($name)
-            }
+            $attributeRequest = Get-IDLAttributeRequest -Item $item -Blocked $blocked -ScriptName 'Set-IDLUser'
 
             # Throws (item fails, nothing changed) for ambiguous or privileged groups.
             $addInfo = Get-IDLGroupDns -Identities (Get-IDLStringList -Value (Get-IDLField -Object $item -Name 'addGroups')) -GroupMap $groupMap -Adding
@@ -225,52 +170,14 @@ try{
                 }
             }
 
-            # ---- attributes: only what differs ----
-            $replace = @{}
-            foreach ($name in $desired.Keys){
-                $current = Get-IDLAdValue -Object $user -Name $name
-                if ($current -cne $desired[$name]){
-                    $replace[$name] = $desired[$name]
-                }
-            }
+            # Nothing has changed yet: refuse when the account is no longer as the request expects (undo).
+            Assert-IDLExpect -Item $item -User $user -GroupMap $groupMap -IdAttribute $idAttribute
 
-            $clear = [System.Collections.Generic.List[string]]::new()
-            foreach ($name in $clearNames){
-                if ($null -ne (Get-IDLAdValue -Object $user -Name $name)){
-                    $clear.Add($name)
-                }
-            }
-
-            $changes = 0
-            $guid = [guid]$user.ObjectGUID
-
-            if (($replace.Count + $clear.Count) -gt 0){
-                $changes++
-                $detail = 'set: {0}; clear: {1}' -f (($replace.Keys | Sort-Object) -join ','), (($clear | Sort-Object) -join ',')
-                if ($DryRun){
-                    Write-IDLLog "  WOULD: update attributes on $identity ($detail)"
-                    Add-IDLReportRow -Action 'SetAttributes' -Result 'Would' -Identity $identity -ObjectIdOrDN $userDn -Details $detail
-                    $done.Add("would update attributes ($detail)")
-                }
-                else{
-                    $setParams = @{ Identity = $guid }
-                    if ($replace.Count -gt 0){
-                        $setParams['Replace'] = $replace
-                    }
-
-                    if ($clear.Count -gt 0){
-                        $setParams['Clear'] = [string[]]$clear.ToArray()
-                    }
-
-                    Set-ADUser @setParams @serverParams
-                    Write-IDLLog "  Updated attributes on $identity ($detail)"
-                    Add-IDLReportRow -Action 'SetAttributes' -Result 'Applied' -Identity $identity -ObjectIdOrDN $userDn -Details $detail
-                    $done.Add("updated attributes ($detail)")
-                }
-            }
+            $before = New-IDLBefore -User $user
+            $changes = Update-IDLUserAttributes -User $user -Desired $attributeRequest.Desired -ClearNames $attributeRequest.Clear -Server $server -DryRun:$DryRun -Done $done -Before $before.attributes
 
             if (($addDns.Count + $removeDns.Count) -gt 0){
-                $changes += Update-IDLGroupMembership -User $user -AddDns $addDns -RemoveDns $removeDns -Server $server -DryRun:$DryRun -Done $done
+                $changes += Update-IDLGroupMembership -User $user -AddDns $addDns -RemoveDns $removeDns -Server $server -DryRun:$DryRun -Done $done -Added $before.groupsAdded -Removed $before.groupsRemoved
             }
 
             $finalDn = $userDn
@@ -288,10 +195,10 @@ try{
                 Add-IDLReportRow -Action 'SetUser' -Result 'Skipped' -Identity $identity -ObjectIdOrDN $userDn -Details 'already in desired state'
             }
             elseif ($DryRun){
-                $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status would -Message ($done -join '; ') @userFields
+                $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status would -Message ($done -join '; ') -Before $before @userFields
             }
             else{
-                $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status applied -Message ($done -join '; ') @userFields
+                $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status applied -Message ($done -join '; ') -Before $before @userFields
             }
         }
         catch{

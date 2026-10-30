@@ -278,3 +278,10 @@ func orUnknown(s string) string {
 	}
 	return s
 }
+
+// RunScript runs another script with this client's settings (other packages' scripts, e.g. the cloud ones). The
+// contract is the same as for the AD scripts: the request on stdin, one JSON document on stdout, exit 1 = some items
+// failed (out is filled and a *ScriptError is returned). redact lists values to scrub from any message (secrets).
+func (c *PowerShellClient) RunScript(ctx context.Context, script string, dryRun bool, req, out any, redact []string) error {
+	return c.run(ctx, script, dryRun, req, out, redact)
+}

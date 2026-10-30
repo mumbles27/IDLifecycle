@@ -326,6 +326,37 @@ To show your company's name, logo and colour instead of IDLifecycle's, copy any 
 
 The web console shows the change within a minute; the tray icon the next time it starts. A file that is invalid or larger than 1 MiB is ignored, and so is the whole folder if anyone other than administrators can change it.
 
+### 5.17 Microsoft 365, Entra ID and Exchange Online groups (optional)
+
+Set this up if role rules or lifecycle groups should also add people to cloud groups. Groups synced from AD, including on-prem Exchange distribution groups, need none of this: pick them under **Active Directory** as before.
+
+| Group type | Changed through | Access needed |
+| --- | --- | --- |
+| Entra ID security group, Microsoft 365 group | Microsoft Graph | Graph application permissions `GroupMember.ReadWrite.All`, Group.Read.All and `User.Read.All` (admin consent) |
+| Mail-enabled security group, distribution list (cloud) | Exchange Online PowerShell | `Exchange.ManageAsApp` (admin consent), an Exchange role group with **Distribution Groups** and **Security Group Creation and Membership** (or the Entra role Exchange Recipient Administrator), and the ExchangeOnlineManagement 3.x module on the server |
+| Dynamic or role-assignable groups | never | none: they are shown greyed out |
+
+1. On the IDLifecycle server, as an administrator, run `scripts\New-IDLCloudCertificate.ps1 -OutDir C:\Temp`. It creates the certificate (the CSP kind that Exchange Online needs), lets the service account read its key, and exports only the public `.cer` file.
+2. In the Entra admin center, create an app registration (this directory only), upload the `.cer` file under **Certificates & secrets**, add the permissions from the table, and grant admin consent.
+3. For Exchange Online groups, run in Exchange Online PowerShell as an Exchange admin, using the *Enterprise application* object id: `New-ServicePrincipal -AppId <client-id> -ObjectId <object-id> -DisplayName IDLifecycle`, then `New-RoleGroup -Name "IDLifecycle Group Membership" -Roles "Distribution Groups","Security Group Creation and Membership"` and `Add-RoleGroupMember -Identity "IDLifecycle Group Membership" -Member <object-id>`. Install the module with `Install-Module ExchangeOnlineManagement -Scope AllUsers`.
+4. In **Settings → Microsoft 365 / Entra ID**, enter the tenant ID, client ID and certificate thumbprint, keep user matching on **SID**, turn on Exchange Online with your `.onmicrosoft.com` domain if needed, and click **Test connection**. Every check should be OK.
+5. The group search in role rules and lifecycle groups now has an **Entra ID / Microsoft 365** switch. Use **Preview impact** before saving.
+
+Cloud group changes show as **Cloud groups** on Approvals and have their own approval policy (it starts with the same value as updates). A new hire gets cloud groups on the first sync after Entra Connect has synced the account, usually within 30 minutes. If you choose *remove all groups* on disable, turning the connection on also plans a one-time cloud clean-up for accounts that are already disabled: review those before approving. **Test connection** warns 30 days before the certificate expires; renew it with the same script and upload the new `.cer`.
+
+### 5.18 Leavers and retention
+
+Decide when someone counts as having left and how long their disabled account is kept before IDLifecycle deletes it.
+
+1. On **Sources**, open each source and, if it has a leaving or termination date, fill in **Leaving date (optional)**: the field, the format (Automatic reads most formats) and how many days after that date the person counts as gone (0 = from the next day). People whose date is still in the future are listed as leaving, nothing happens to them yet.
+2. On **Configure → Lifecycle groups**, set the groups a disabled account keeps and the groups it is added to.
+3. On **Configure → Retention**, edit the **Default** row: the number of days a disabled account is kept (30 by default) and the Disabled OU.
+4. Add a policy for each group of accounts that must be kept longer or elsewhere, for example *Executives* (conditions: AD group `GG-Executives`; 365 days) or *Legal hold* (Never delete automatically; its own OU). Put them in priority order; the first matching policy wins. Use **Test this policy** on a person and **Preview impact** before saving.
+5. To pin one person to a policy, open them under **Identities** and use **Change retention…**.
+6. Check **Operate → Leavers** for upcoming deletions and leavers.
+
+Disables and deletes still go through **Approvals**, the delete limits and the bulk guard. Keep **Approval policy → Delete** on *manual* until you have seen a few deletes go through, or tick *Deletes always wait for a person* on a policy.
+
 ## 6. Optional: Sign in with Microsoft (Entra ID)
 
 Entra ID sign-in is off by default. Turn it on to put console sign-in behind your MFA and Conditional Access policies. It needs HTTPS (section 3, `-Listen` with a certificate).
@@ -360,6 +391,12 @@ After install, all of these should be true:
 - [ ] **Audit log → Verify integrity** reports the chain intact.
 
 To see what happened and why, use **History** (Operate). Search with words or filters such as `level:error since:24h`, `actor:alice` or `action:change.failed`. Click an actor, action or entity to narrow the results, and **Export CSV** saves what you found. The *Search syntax* box on the page lists every filter.
+
+**One person's history.** Open the person under **Identities** and choose the **History** tab: when they were first seen (and from which source, or who added them in the console), every change to their HR record, every change to their account (who approved it, the attributes, groups and OU it set), when it was disabled or removed from AD, and any undo. People are never removed from IDLifecycle's database, so this history stays after the account is gone. Sources, mappings, roles and console users have a **History** link that shows who changed them and what changed (passwords and secrets only as *changed*). **Console activity** on the History page lists everything people did.
+
+**Undoing a change.** If an applied change was wrong, an administrator can open it in **Approvals** (status *applied*) and choose **Undo…**. The dialog shows each step, runs a dry run against AD, and refuses to overwrite anything changed since unless you confirm it twice; you must give a reason and type the account name. The undo then waits in Approvals for approval with the account name typed again (optionally by a second person: **Settings → Undo**). Keep the offered **Manual items** ticked so the next sync does not simply redo the change, and set them back to Auto on the person's page once the source data or rule is fixed. Deleted accounts cannot be undone; restore them from the AD Recycle Bin.
+
+For an update you can undo **only some parts** (tick the attributes or groups to roll back), and on a run's page **Undo changes from this run…** undoes several changes at once as one batch (typed `UNDO <n>`). Everything an undo rolls back becomes **Manual**: IDLifecycle leaves it alone until someone sets it back to **Auto** on the person's **Managed fields** card, where you can also make items or the whole person Manual by hand (for example after fixing something in AD yourself). A person who is Manual as a whole is not disabled when they leave; the run and the identity-issues email list them.
 
 Logs to check:
 

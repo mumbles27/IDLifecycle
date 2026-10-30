@@ -21,6 +21,7 @@ import (
 	"idlifecycle/internal/engine"
 	"idlifecycle/internal/model"
 	"idlifecycle/internal/secrets"
+	"idlifecycle/internal/store"
 	"idlifecycle/internal/store/storetest"
 	"idlifecycle/internal/web"
 )
@@ -73,14 +74,37 @@ func TestGUIEndToEndInHeadlessBrowser(t *testing.T) {
 			Attrs: map[string]string{"givenName": "Maria", "sn": "Lopez"}})
 	}
 	fake.AddUser(ad.FakeUser{DN: "CN=kiosk01,OU=Staff,DC=corp,DC=test", Sam: "kiosk01", UPN: "kiosk01@corp.test", Enabled: true})
+	// For the undo, Manual and retention scenarios: accounts of existing people (Pat Kent E7, Kim Ray E9) whose updates (title
+	// + a lifecycle group) are applied before the browser starts, and a person with a leaving date in the future (E8).
+	fake.AddUser(ad.FakeUser{DN: "CN=Pat Kent,OU=Staff,DC=corp,DC=test", Sam: "pkent", UPN: "pkent@corp.test", Enabled: true, External: "E7",
+		Attrs: map[string]string{"givenName": "Pat", "sn": "Kent", "title": "Analyst"}})
+	fake.AddUser(ad.FakeUser{DN: "CN=Kim Ray,OU=Staff,DC=corp,DC=test", Sam: "kray", UPN: "kray@corp.test", Enabled: true, External: "E9",
+		Attrs: map[string]string{"givenName": "Kim", "sn": "Ray", "title": "Clerk"}})
+	_ = st.CreateMapping(ctx, model.Mapping{ID: uuid.NewString(), Name: "Title", TargetAttr: "title", Template: "{{ .Title }}", Mode: model.ModeSync,
+		OnEmpty: "skip", ValueType: "string", Enabled: true, CreatedAt: time.Now(), UpdatedAt: time.Now()})
+	s.Lifecycle.ActiveAdd = []string{"GG-All"}
+	_ = st.SaveSettings(ctx, s, "e2e")
+	leaves := time.Now().AddDate(0, 0, 20).Format("2006-01-02")
 
 	dir := t.TempDir()
 	seedCSV := filepath.Join(dir, "seed.csv")
-	_ = os.WriteFile(seedCSV, []byte("EmployeeID,FirstName,LastName\nE1,Jane,Doe\nE2,Bob,Smith\nE3,Carl,Name\nE5,Maria,Lopez\n"), 0o600)
+	_ = os.WriteFile(seedCSV, []byte("EmployeeID,FirstName,LastName,Title,LeaveDate\nE1,Jane,Doe,,\nE2,Bob,Smith,,\nE3,Carl,Name,,\nE5,Maria,Lopez,,\n"+
+		"E7,Pat,Kent,Senior Analyst,\nE8,Lee,Leaver,,"+leaves+"\nE9,Kim,Ray,Senior Clerk,\n"), 0o600)
 	_ = st.CreateSource(ctx, model.Source{ID: "seed", Name: "seed", Type: "csv", Enabled: true, CreatedAt: time.Now(), UpdatedAt: time.Now(),
-		Options: model.SourceOptions{ExternalIDField: "EmployeeID"}, Config: map[string]any{"path": seedCSV}})
-	if run, err := eng.RunNow(ctx, "e2e", "e2e"); err != nil || run.Counters["pending"] != 4 {
+		Options: model.SourceOptions{ExternalIDField: "EmployeeID", TerminationDateField: "LeaveDate"}, Config: map[string]any{"path": seedCSV}})
+	run, err := eng.RunNow(ctx, "e2e", "e2e")
+	if err != nil || run.Counters["pending"] != 7 {
 		t.Fatalf("seed run: %v %+v", err, run)
+	}
+	for _, c := range mustChanges(t, st, model.ChangeUpdate) {
+		if c.ExternalID == "E7" || c.ExternalID == "E9" {
+			if _, err := eng.Approve(ctx, c.ID, "admin", "e2e"); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if _, err := eng.Execute(ctx); err != nil {
+		t.Fatal(err)
 	}
 	uiCSV := filepath.Join(dir, "selftest.csv")
 	_ = os.WriteFile(uiCSV, []byte("EmployeeID,FirstName,LastName\nX1,Test,User\n"), 0o600)
@@ -132,6 +156,16 @@ func TestGUIEndToEndInHeadlessBrowser(t *testing.T) {
 	case <-time.After(3 * time.Minute):
 		t.Fatal("browser self-test did not report within 3 minutes")
 	}
+}
+
+// mustChanges lists the pending changes of a type.
+func mustChanges(t *testing.T, st *store.Store, typ string) []model.Change {
+	t.Helper()
+	items, _, err := st.ListChanges(context.Background(), store.ChangeFilter{Status: model.StatusPending, Type: typ}, store.Page{Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return items
 }
 
 func itoa(n int) string {

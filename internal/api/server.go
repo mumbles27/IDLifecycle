@@ -258,6 +258,8 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 		writeErr(w, http.StatusNotFound, "not_found", "not found")
 	case errors.Is(err, store.ErrConflict):
 		writeErr(w, http.StatusConflict, "conflict", conflictMessage(err))
+	case errors.Is(err, engine.ErrForbidden):
+		writeErr(w, http.StatusForbidden, "forbidden", strings.TrimPrefix(err.Error(), engine.ErrForbidden.Error()+": "))
 	case errors.Is(err, engine.ErrInvalid):
 		writeErr(w, http.StatusBadRequest, "invalid", strings.TrimPrefix(err.Error(), engine.ErrInvalid.Error()+": "))
 	case errors.Is(err, engine.ErrRunning):

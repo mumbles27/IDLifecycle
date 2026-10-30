@@ -109,6 +109,9 @@ func Validate(src model.Source) error {
 	if src.Options.MissingGraceRuns < 0 {
 		return fmt.Errorf("options.missing_grace_runs must be >= 0")
 	}
+	if err := validateTermination(src.Options); err != nil {
+		return err
+	}
 	for _, f := range t.Fields {
 		if f.Required && strings.TrimSpace(asString(src.Config[f.Name])) == "" {
 			return fmt.Errorf("config.%s is required", f.Name)

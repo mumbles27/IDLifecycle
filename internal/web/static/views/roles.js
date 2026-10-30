@@ -5,11 +5,12 @@ import {
   h, clear, replaceContent, pageHeader, card, pill, dataTable, listItems, act, confirmDialog, toast,
   errorBox, loading, field, inputText, inputNumber, inputArea, inputCheck, inputSelect, formModal, mutBtn,
   chip, isObject, cellText, reportError,
+  historyLink,
 } from '../ui.js';
 import {
   attributeGrantFields, defaultAttrModel, previewPanel, sampleRecordPicker,
 } from '../components.js';
-import { groupPicker } from '../group-picker.js';
+import { groupPicker, groupLabel, isCloudRef } from '../group-picker.js';
 import { openImpactModal } from './impact.js';
 
 export const OPS = [
@@ -80,7 +81,7 @@ export function conditionText(c) {
   return `${c.attr} ${opLabel(c.op)} ${valueText(c)}`;
 }
 
-function conditionSummary(rule) {
+export function conditionSummary(rule) {
   const conds = Array.isArray(rule.conditions) ? rule.conditions : [];
   if (conds.length === 0) {
     return h('span', null, pill('active', 'everyone'), ' ', h('span', { class: 'muted small' }, 'baseline - no conditions'));
@@ -94,7 +95,8 @@ function grantSummary(rule) {
   const parts = [];
   const groups = Array.isArray(g.groups) ? g.groups : [];
   if (groups.length > 0) {
-    parts.push(`${groups.length} group${groups.length === 1 ? '' : 's'}`);
+    const cloud = groups.filter(isCloudRef).length;
+    parts.push(`${groups.length} group${groups.length === 1 ? '' : 's'}${cloud ? ` (${cloud} cloud)` : ''}`);
   }
   if (g.ou) {
     parts.push('OU');
@@ -108,7 +110,7 @@ function grantSummary(rule) {
 
 // ---------------------------------------------------------------- condition model (editor)
 
-function toModel(c) {
+export function toModel(c) {
   return {
     attr: c.attr || '',
     op: c.op || 'eq',
@@ -117,7 +119,7 @@ function toModel(c) {
   };
 }
 
-function toBody(c) {
+export function toBody(c) {
   if (GROUP_OPS.has(c.op)) {
     return { attr: '', op: c.op, value: '', conditions: c.conditions.map(toBody) };
   }
@@ -135,7 +137,7 @@ function countConditions(list) {
   return list.reduce((n, c) => n + 1 + (GROUP_OPS.has(c.op) ? countConditions(c.conditions) : 0), 0);
 }
 
-function templateConditions(list, prefix = 'conditions') {
+export function templateConditions(list, prefix = 'conditions') {
   const out = [];
   list.forEach((c, i) => {
     const path = `${prefix}[${i}]`;
@@ -153,7 +155,7 @@ function templateConditions(list, prefix = 'conditions') {
  * conditionBuilder(conditions, { onChange }) -> { el, redraw }
  * Edits the array in place. Groups (all_of / any_of) nest up to MAX_DEPTH levels; at most MAX_CONDITIONS in total.
  */
-function conditionBuilder(conditions, { onChange } = {}) {
+export function conditionBuilder(conditions, { onChange } = {}) {
   const root = h('div', { class: 'cond-builder', 'data-test': 'conditions' });
   const counter = h('p', { class: 'help', 'aria-live': 'polite', 'data-test': 'cond-count' });
 
@@ -304,15 +306,14 @@ export async function render(root, ctx) {
       { label: 'Grants', render: grantSummary },
       { label: 'Enabled', render: (r) => pill(r.enabled ? 'enabled' : 'disabled') },
     ];
-    if (isAdmin) {
-      columns.push({
-        label: 'Actions',
-        className: 'col-actions',
-        render: (r) => h('div', { class: 'row-actions' },
-          mutBtn('Edit', { class: 'btn-sm', 'data-test': 'edit-role', onclick: () => openEditor(r) }),
-          mutBtn('Delete', { class: 'btn-sm btn-danger', 'data-test': 'delete-role', onclick: (e) => remove(r, e.currentTarget) })),
-      });
-    }
+    columns.push({
+      label: 'Actions',
+      className: 'col-actions',
+      render: (r) => h('div', { class: 'row-actions' },
+        isAdmin ? mutBtn('Edit', { class: 'btn-sm', 'data-test': 'edit-role', onclick: () => openEditor(r) }) : null,
+        historyLink('role', r.id),
+        isAdmin ? mutBtn('Delete', { class: 'btn-sm btn-danger', 'data-test': 'delete-role', onclick: (e) => remove(r, e.currentTarget) }) : null),
+    });
     replaceContent(listEl, dataTable(columns, items, {
       caption: 'Role rules',
       empty: 'No role rules yet. People will only get what the mappings, lifecycle groups and AD defaults give them.',
@@ -409,7 +410,7 @@ export async function render(root, ctx) {
           builder.el),
         h('fieldset', { class: 'group' },
           h('legend', null, 'Grants'),
-          groupPicker({ model, key: 'groups', label: 'AD groups', dataTest: 'role-groups', help: 'Search AD by name or description; every matching person is added to these groups.' }),
+          groupPicker({ model, key: 'groups', label: 'Groups', dataTest: 'role-groups', help: 'Search AD by name or description (or Entra ID / Microsoft 365 when the Microsoft 365 connection is on); every matching person is added to these groups.' }),
           field('Target OU (optional)', inputText(model, 'ou', { placeholder: 'OU=Finance,OU=Staff,DC=corp,DC=example,DC=com' }), { help: 'New accounts are created here; with "enforce OU" on, existing accounts are moved here.' }),
           h('h3', null, 'Attribute grants'),
           attrBox,
@@ -458,7 +459,7 @@ export async function render(root, ctx) {
 
 // ---------------------------------------------------------------- testing
 
-function explainTable(explain) {
+export function explainTable(explain) {
   return dataTable([
     { label: 'Condition', render: (e) => h('code', { class: 'small' }, e.path || '') },
     { label: 'Field', render: (e) => (e.attr && e.attr !== '*' ? h('code', null, e.attr) : h('span', { class: 'muted' }, e.op === 'template' ? 'whole record' : '-')) },
@@ -477,7 +478,7 @@ function resultBlock(res) {
   const attrs = isObject(res.attributes) ? Object.entries(res.attributes) : [];
   return [
     h('p', null, h('strong', null, 'Matched rules: '), matched.length ? matched.map((m) => chip(m.name || m.id)) : h('span', { class: 'muted' }, 'none')),
-    h('p', null, h('strong', null, 'Groups: '), Array.isArray(res.groups) && res.groups.length ? res.groups.map((g) => chip(g)) : h('span', { class: 'muted' }, 'none')),
+    h('p', null, h('strong', null, 'Groups: '), Array.isArray(res.groups) && res.groups.length ? res.groups.map((g) => chip(groupLabel(g))) : h('span', { class: 'muted' }, 'none')),
     h('p', null, h('strong', null, 'OU: '), res.ou ? h('code', null, res.ou) : h('span', { class: 'muted' }, 'default OU')),
     attrs.length
       ? dataTable([{ label: 'Attribute', render: (r) => h('code', null, r[0]) }, { label: 'Value', render: (r) => cellText(r[1]) }], attrs, { caption: 'Attributes from role rules' })

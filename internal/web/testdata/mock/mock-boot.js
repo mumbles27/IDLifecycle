@@ -1,10 +1,14 @@
 // mock-boot.js - loads the in-memory mock API, optionally signs in, then starts the app or the selftest.
 //   mock.html?autologin=admin#/approvals          -> app, already signed in as that mock user
 //   mock-selftest.html?user=admin&pass=admin-pass -> runs ../selftest/selftest.js against the mock API
+//   mock.html?live=1&autologin=admin#/approvals   -> as above, with dry run off (undo is refused in dry run)
 import { db } from './mock-api.js';
 import { login } from '../api.js';
 
 const params = new URLSearchParams(location.search);
+if (params.get('live') === '1') {
+  db.settings.engine.dry_run = false;
+}
 const auto = params.get('autologin');
 if (auto) {
   const u = db.users.find((x) => x.username === auto);

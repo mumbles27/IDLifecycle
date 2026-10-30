@@ -53,6 +53,11 @@ type LinkItem struct {
 	ExternalID         string           `json:"externalId"`
 	ExpectedExternalID string           `json:"expectedExternalId"`
 	Rename             *model.Candidate `json:"rename"`
+	// Undo of a link: ExternalID "" clears the id attribute (ExpectedExternalID must then be set); ProxyAddresses, when
+	// set, replaces the whole list after the rename.
+	ProxyAddresses []string      `json:"proxyAddresses,omitempty"`
+	Expect         *model.Expect `json:"expect,omitempty"`
+	Force          bool          `json:"force,omitempty"`
 }
 
 func (c *PowerShellClient) CheckNames(ctx context.Context, req NameCheckRequest) ([]TakenName, error) {
@@ -181,13 +186,23 @@ func (f *Fake) Link(_ context.Context, o ActionOpts, items []LinkItem) ([]Result
 			out = append(out, Result{ChangeID: it.ChangeID, Status: StatusFailed, Error: "account not found"})
 			continue
 		}
+		if it.ExternalID == "" && it.ExpectedExternalID == "" {
+			out = append(out, Result{ChangeID: it.ChangeID, Status: StatusFailed, Error: "externalId is required"})
+			continue
+		}
 		if !strings.EqualFold(u.External, it.ExpectedExternalID) {
 			out = append(out, Result{ChangeID: it.ChangeID, Status: StatusFailed, Error: fmt.Sprintf("account has id attribute %q, expected %q", u.External, it.ExpectedExternalID)})
 			continue
 		}
+		if !it.Force {
+			if msg := f.drift(u, it.Expect); msg != "" {
+				out = append(out, Result{ChangeID: it.ChangeID, Status: StatusFailed, Error: msg})
+				continue
+			}
+		}
 		clash := false
 		for _, other := range f.Users {
-			if other != u && strings.EqualFold(other.External, it.ExternalID) {
+			if it.ExternalID != "" && other != u && strings.EqualFold(other.External, it.ExternalID) {
 				clash = true
 			}
 		}
@@ -195,6 +210,8 @@ func (f *Fake) Link(_ context.Context, o ActionOpts, items []LinkItem) ([]Result
 			out = append(out, Result{ChangeID: it.ChangeID, Status: StatusFailed, Error: "another account already has id attribute " + it.ExternalID})
 			continue
 		}
+		mail, _ := attrFold(u, "mail")
+		before := &model.BeforeState{DN: u.DN, IDValue: strPtr(u.External)}
 		dn, sam, upn := u.DN, u.Sam, u.UPN
 		if r := it.Rename; r != nil {
 			ex := map[string]bool{strings.ToLower(u.GUID): true}
@@ -210,20 +227,32 @@ func (f *Fake) Link(_ context.Context, o ActionOpts, items []LinkItem) ([]Result
 				out = append(out, Result{ChangeID: it.ChangeID, Status: StatusFailed, Error: "a new name is already in use"})
 				continue
 			}
+			before.Names = &model.AccountNames{Sam: u.Sam, UPN: u.UPN, CN: rdnValue(u.DN), Mail: mail, ProxyAddresses: append([]string{}, u.ProxyAddresses...)}
 			dn, sam, upn = "CN="+r.CN+","+parentOf(u.DN), r.Sam, r.UPN
 		}
 		if o.DryRun {
-			out = append(out, Result{ChangeID: it.ChangeID, Status: StatusWould, ObjectGUID: u.GUID, DN: dn, Sam: sam, UPN: upn})
+			out = append(out, Result{ChangeID: it.ChangeID, Status: StatusWould, ObjectGUID: u.GUID, DN: dn, Sam: sam, UPN: upn, Before: before})
 			continue
 		}
 		u.External = it.ExternalID
 		if r := it.Rename; r != nil {
 			u.DN, u.Sam, u.UPN = dn, sam, upn
-			if r.Mail != "" {
+			if r.Mail != "" && !strings.EqualFold(r.Mail, mail) {
+				// like Set-IDLLink.ps1: the new address becomes the primary one, the old primary stays as an alias
+				proxies := []string{"SMTP:" + r.Mail}
+				for _, p := range u.ProxyAddresses {
+					if !strings.EqualFold(p, "smtp:"+r.Mail) {
+						proxies = append(proxies, "smtp:"+p[strings.Index(p, ":")+1:])
+					}
+				}
+				u.ProxyAddresses = proxies
 				u.Attrs["mail"] = r.Mail
 			}
 		}
-		out = append(out, Result{ChangeID: it.ChangeID, Status: StatusApplied, ObjectGUID: u.GUID, DN: u.DN, Sam: u.Sam, UPN: u.UPN})
+		if it.ProxyAddresses != nil {
+			u.ProxyAddresses = append([]string{}, it.ProxyAddresses...)
+		}
+		out = append(out, Result{ChangeID: it.ChangeID, Status: StatusApplied, ObjectGUID: u.GUID, DN: u.DN, Sam: u.Sam, UPN: u.UPN, Before: before})
 	}
 	return out, nil
 }

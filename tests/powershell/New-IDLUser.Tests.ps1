@@ -480,3 +480,33 @@ Describe 'New-IDLUser.ps1' {
         ($r.StdOut + $r.StdErr + $r.LogText + $r.ReportText) | Should Not Match ([regex]::Escape($secret))
     }
 }
+
+Describe 'New-IDLUser.ps1 undo support (before)' {
+
+    function New-CreateItem {
+        return [ordered]@{
+            changeId = 'chg-1'; externalId = 'E3001'; ou = "OU=Staff,$script:Root"
+            candidates = @(@{ sam = 'jdoe'; upn = 'jdoe@stub.test'; cn = 'Jane Doe' })
+            attributes = [ordered]@{ givenName = 'Jane'; sn = 'Doe'; displayName = 'Jane Doe' }
+            groups = @(); password = 'S3cr3t!Pa55w0rd#xyz'; enabled = $true; changePasswordAtLogon = $true
+        }
+    }
+
+    It 'marks a created account (applied and DryRun) with before.created; an existing one has no before' {
+        $state = New-StandardState
+        $request = [ordered]@{ server = ''; idAttribute = 'employeeID'; items = @(New-CreateItem) }
+
+        $r = Invoke-IDLScript -Script 'New-IDLUser' -Request $request -StatePath $state -DryRun
+        $r.Json.results[0].status | Should Be 'would'
+        $r.Json.results[0].before.created | Should Be $true
+
+        $r = Invoke-IDLScript -Script 'New-IDLUser' -Request $request -StatePath $state
+        $r.Json.results[0].status | Should Be 'applied'
+        $r.Json.results[0].before.created | Should Be $true
+        $r.Json.results[0].objectGuid | Should Not BeNullOrEmpty
+
+        $r = Invoke-IDLScript -Script 'New-IDLUser' -Request $request -StatePath $state
+        $r.Json.results[0].status | Should Be 'skipped'
+        @($r.Json.results[0].PSObject.Properties | ForEach-Object { $_.Name }) -contains 'before' | Should Be $false
+    }
+}

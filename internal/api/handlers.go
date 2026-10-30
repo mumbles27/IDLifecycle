@@ -50,6 +50,9 @@ func (s *Server) routes(mux *http.ServeMux) {
 	s.route(mux, "POST /api/templates/preview", model.RoleAdmin, s.handleTemplatePreview)
 	s.route(mux, "GET /api/ad/ous", model.RoleApprover, s.handleListOUs)
 	s.route(mux, "GET /api/ad/groups", model.RoleAdmin, s.handleSearchGroups)
+	s.route(mux, "GET /api/cloud/groups", model.RoleAdmin, s.handleSearchCloudGroups)
+	s.route(mux, "GET /api/cloud/groups/resolve", model.RoleAdmin, s.handleResolveCloudGroups)
+	s.route(mux, "POST /api/cloud/test", model.RoleAdmin, s.handleTestCloud)
 	s.route(mux, "POST /api/preview/impact", model.RoleAdmin, s.handlePreviewImpact)
 	s.route(mux, "GET /api/placement/values", model.RoleViewer, s.handlePlacementValues)
 	s.route(mux, "POST /api/changes/{id}/ou", model.RoleApprover, s.handleSetChangeOU)
@@ -78,6 +81,14 @@ func (s *Server) routes(mux *http.ServeMux) {
 	s.route(mux, "GET /api/roles/{id}", model.RoleViewer, s.handleGetRole)
 	s.route(mux, "PUT /api/roles/{id}", model.RoleAdmin, s.handleSaveRole)
 	s.route(mux, "DELETE /api/roles/{id}", model.RoleAdmin, s.handleDeleteRole)
+	s.route(mux, "GET /api/retention-policies", model.RoleViewer, s.handleListRetention)
+	s.route(mux, "POST /api/retention-policies", model.RoleAdmin, s.handleSaveRetention)
+	s.route(mux, "POST /api/retention-policies/test", model.RoleAdmin, s.handleTestRetention)
+	s.route(mux, "GET /api/retention-policies/{id}", model.RoleViewer, s.handleGetRetention)
+	s.route(mux, "PUT /api/retention-policies/{id}", model.RoleAdmin, s.handleSaveRetention)
+	s.route(mux, "DELETE /api/retention-policies/{id}", model.RoleAdmin, s.handleDeleteRetention)
+	s.route(mux, "GET /api/retention/upcoming", model.RoleViewer, s.handleRetentionUpcoming)
+	s.route(mux, "PUT /api/identities/{id}/retention", model.RoleApprover, s.handleSetIdentityRetention)
 	s.route(mux, "POST /api/roles/preview", model.RoleAdmin, s.handleRolePreview)
 
 	s.route(mux, "GET /api/settings", model.RoleViewer, s.handleGetSettings)
@@ -90,6 +101,15 @@ func (s *Server) routes(mux *http.ServeMux) {
 	s.route(mux, "POST /api/changes/{id}/approve", model.RoleApprover, s.decision("approve"))
 	s.route(mux, "POST /api/changes/{id}/reject", model.RoleApprover, s.decision("reject"))
 	s.route(mux, "POST /api/changes/{id}/retry", model.RoleApprover, s.decision("retry"))
+	s.route(mux, "GET /api/changes/{id}/undo", model.RoleAdmin, s.handlePreviewUndo)
+	s.route(mux, "POST /api/changes/{id}/undo", model.RoleAdmin, s.handleRequestUndo)
+	s.route(mux, "GET /api/changes/{id}/undo-check", model.RoleApprover, s.handleUndoCheck)
+	s.route(mux, "GET /api/runs/{id}/undo", model.RoleAdmin, s.handleRunUndoList)
+	s.route(mux, "POST /api/runs/{id}/undo/preview", model.RoleAdmin, s.handleRunUndoPreview)
+	s.route(mux, "POST /api/runs/{id}/undo", model.RoleAdmin, s.handleRunUndoRequest)
+	s.route(mux, "GET /api/undo-batches/{batch}", model.RoleApprover, s.handleUndoBatch)
+	s.route(mux, "POST /api/undo-batches/{batch}/approve", model.RoleApprover, s.handleUndoBatchDecision(true))
+	s.route(mux, "POST /api/undo-batches/{batch}/reject", model.RoleApprover, s.handleUndoBatchDecision(false))
 
 	s.route(mux, "GET /api/runs", model.RoleViewer, s.handleListRuns)
 	s.route(mux, "POST /api/runs", model.RoleAdmin, s.handleStartRun)
@@ -97,6 +117,10 @@ func (s *Server) routes(mux *http.ServeMux) {
 
 	s.route(mux, "GET /api/identities", model.RoleViewer, s.handleListIdentities)
 	s.route(mux, "GET /api/identities/{id}", model.RoleViewer, s.handleGetIdentity)
+	s.route(mux, "GET /api/identities/{id}/history", model.RoleViewer, s.handleIdentityHistory)
+	s.route(mux, "DELETE /api/identities/{id}/holds/{hid}", model.RoleApprover, s.handleReleaseHold)
+	s.route(mux, "POST /api/identities/{id}/holds", model.RoleApprover, s.handlePinManual)
+	s.route(mux, "GET /api/identities/{id}/managed", model.RoleViewer, s.handleManaged)
 
 	s.route(mux, "GET /api/audit", model.RoleViewer, s.handleListAudit)
 	s.route(mux, "GET /api/audit/verify", model.RoleViewer, s.handleVerifyAudit)
@@ -236,7 +260,8 @@ func (s *Server) handleSaveSource(w http.ResponseWriter, r *http.Request) {
 			s.fail(w, r, err)
 			return
 		}
-		s.audit(r, "source.create", "source", in.ID, map[string]any{"name": in.Name, "type": in.Type})
+		s.audit(r, "source.create", "source", in.ID, map[string]any{"name": in.Name, "type": in.Type,
+			"fields": auditSnapshot(in, s.maskSource(in))})
 		writeJSON(w, http.StatusCreated, s.maskSource(in))
 		return
 	}
@@ -245,13 +270,19 @@ func (s *Server) handleSaveSource(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	s.audit(r, "source.update", "source", in.ID, map[string]any{"name": in.Name})
 	out, _ := s.Store.GetSource(r.Context(), in.ID)
+	s.audit(r, "source.update", "source", in.ID, withChanges(map[string]any{"name": in.Name},
+		auditChanges(*prev, out, s.maskSource(*prev), s.maskSource(out))))
 	writeJSON(w, http.StatusOK, s.maskSource(out))
 }
 
 func (s *Server) handleDeleteSource(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	cur, err := s.Store.GetSource(r.Context(), id)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
 	if err := s.Store.DeleteSource(r.Context(), id); err != nil {
 		if errors.Is(err, store.ErrConflict) {
 			writeErr(w, http.StatusConflict, "in_use", "this source still has identities; disable it instead of deleting it")
@@ -260,7 +291,7 @@ func (s *Server) handleDeleteSource(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	s.audit(r, "source.delete", "source", id, nil)
+	s.audit(r, "source.delete", "source", id, map[string]any{"name": cur.Name, "type": cur.Type, "fields": auditSnapshot(cur, s.maskSource(cur))})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -420,8 +451,14 @@ func (s *Server) handleSaveMapping(w http.ResponseWriter, r *http.Request) {
 			s.fail(w, r, err)
 			return
 		}
-		s.audit(r, "mapping.create", "mapping", in.ID, map[string]any{"name": in.Name, "target": in.TargetAttr, "mode": in.Mode})
+		s.audit(r, "mapping.create", "mapping", in.ID, map[string]any{"name": in.Name, "target": in.TargetAttr, "mode": in.Mode,
+			"fields": auditSnapshot(in, in)})
 		writeJSON(w, http.StatusCreated, in)
+		return
+	}
+	prev, err := s.Store.GetMapping(r.Context(), id)
+	if err != nil {
+		s.fail(w, r, err)
 		return
 	}
 	in.ID = id
@@ -429,8 +466,9 @@ func (s *Server) handleSaveMapping(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	s.audit(r, "mapping.update", "mapping", id, map[string]any{"name": in.Name, "target": in.TargetAttr, "mode": in.Mode})
 	out, _ := s.Store.GetMapping(r.Context(), id)
+	s.audit(r, "mapping.update", "mapping", id, withChanges(map[string]any{"name": in.Name, "target": in.TargetAttr, "mode": in.Mode},
+		auditChanges(prev, out, prev, out)))
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -469,11 +507,16 @@ func (s *Server) mappingConflict(r *http.Request, in model.Mapping, selfID strin
 
 func (s *Server) handleDeleteMapping(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	cur, err := s.Store.GetMapping(r.Context(), id)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
 	if err := s.Store.DeleteMapping(r.Context(), id); err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	s.audit(r, "mapping.delete", "mapping", id, nil)
+	s.audit(r, "mapping.delete", "mapping", id, map[string]any{"name": cur.Name, "target": cur.TargetAttr, "fields": auditSnapshot(cur, cur)})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -573,8 +616,13 @@ func (s *Server) handleSaveRole(w http.ResponseWriter, r *http.Request) {
 			s.fail(w, r, err)
 			return
 		}
-		s.audit(r, "role.create", "role", in.ID, map[string]any{"name": in.Name, "groups": in.Grants.Groups})
+		s.audit(r, "role.create", "role", in.ID, map[string]any{"name": in.Name, "groups": in.Grants.Groups, "fields": auditSnapshot(in, in)})
 		writeJSON(w, http.StatusCreated, in)
+		return
+	}
+	prev, err := s.Store.GetRole(r.Context(), id)
+	if err != nil {
+		s.fail(w, r, err)
 		return
 	}
 	in.ID = id
@@ -582,8 +630,9 @@ func (s *Server) handleSaveRole(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	s.audit(r, "role.update", "role", id, map[string]any{"name": in.Name, "groups": in.Grants.Groups})
 	out, _ := s.Store.GetRole(r.Context(), id)
+	s.audit(r, "role.update", "role", id, withChanges(map[string]any{"name": in.Name, "groups": in.Grants.Groups},
+		auditChanges(prev, out, prev, out)))
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -596,11 +645,16 @@ func orDefault(v, d string) string {
 
 func (s *Server) handleDeleteRole(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	cur, err := s.Store.GetRole(r.Context(), id)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
 	if err := s.Store.DeleteRole(r.Context(), id); err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	s.audit(r, "role.delete", "role", id, nil)
+	s.audit(r, "role.delete", "role", id, map[string]any{"name": cur.Name, "fields": auditSnapshot(cur, cur)})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -661,10 +715,16 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	writeJSON(w, http.StatusOK, maskSettings(st))
+}
+
+// maskSettings is the settings as the API shows them: every secret replaced by the mask.
+func maskSettings(st model.Settings) model.Settings {
 	st.Notify = notify.Mask(st.Notify)
 	st.Auth = maskAuth(st.Auth)
 	st.Backup = maskBackup(st.Backup)
-	writeJSON(w, http.StatusOK, st)
+	st.Cloud = maskCloud(st.Cloud)
+	return st
 }
 
 // handleTestNotification sends a test message with the (unsaved) notification settings from the form.
@@ -710,7 +770,9 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 	// sign-in as it is instead of resetting it to the defaults.
 	var body struct {
 		model.Settings
-		Auth *model.AuthSettings `json:"auth"`
+		Auth  *model.AuthSettings  `json:"auth"`
+		Cloud *model.CloudSettings `json:"cloud"` // likewise: omitted = unchanged
+		Undo  *model.UndoSettings  `json:"undo"`  // likewise
 	}
 	if !decode(w, r, &body) {
 		return
@@ -729,6 +791,17 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if in.Auth, err = prepareAuth(a, old.Auth, s.Cipher); err != nil {
+			badRequest(w, err.Error())
+			return
+		}
+	}
+	in.Undo = old.Undo
+	if body.Undo != nil {
+		in.Undo = *body.Undo
+	}
+	in.Cloud = old.Cloud
+	if body.Cloud != nil {
+		if in.Cloud, err = prepareCloud(*body.Cloud, old.Cloud, s.Cipher); err != nil {
 			badRequest(w, err.Error())
 			return
 		}
@@ -776,12 +849,9 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	s.Scheduler.Reload()
 	s.revokeForAuthChange(r, old.Auth, in.Auth)
-	// diffPaths sees ciphertext for secrets, so a changed secret shows up as a path - never as a value.
-	s.audit(r, "settings.update", "settings", "settings", map[string]any{"changed": diffPaths(old, in)})
-	in.Notify = notify.Mask(in.Notify)
-	in.Auth = maskAuth(in.Auth)
-	in.Backup = maskBackup(in.Backup)
-	writeJSON(w, http.StatusOK, in)
+	// Secrets are compared stored and masked: a changed secret shows up as {"changed": true}, never as a value.
+	s.audit(r, "settings.update", "settings", "settings", withChanges(nil, auditChanges(old, in, maskSettings(old), maskSettings(in))))
+	writeJSON(w, http.StatusOK, maskSettings(in))
 }
 
 // revokeForAuthChange signs out the sessions a sign-in change no longer allows: Entra ID accounts when Entra
@@ -810,46 +880,6 @@ func (s *Server) revokeForAuthChange(r *http.Request, prev, next model.AuthSetti
 	s.audit(r, "auth.sessions_revoked", "settings", "auth", map[string]any{"users": n, "oidc_disabled": oidcGone, "local_admins_only": localLimited})
 }
 
-// diffPaths lists dotted JSON paths whose values differ (for the audit log).
-func diffPaths(a, b any) []string {
-	var ma, mb map[string]any
-	ja, _ := json.Marshal(a)
-	jb, _ := json.Marshal(b)
-	_ = json.Unmarshal(ja, &ma)
-	_ = json.Unmarshal(jb, &mb)
-	var out []string
-	var walk func(prefix string, x, y any)
-	walk = func(prefix string, x, y any) {
-		xm, xok := x.(map[string]any)
-		ym, yok := y.(map[string]any)
-		if xok && yok {
-			keys := map[string]bool{}
-			for k := range xm {
-				keys[k] = true
-			}
-			for k := range ym {
-				keys[k] = true
-			}
-			for k := range keys {
-				p := k
-				if prefix != "" {
-					p = prefix + "." + k
-				}
-				walk(p, xm[k], ym[k])
-			}
-			return
-		}
-		xb, _ := json.Marshal(x)
-		yb, _ := json.Marshal(y)
-		if string(xb) != string(yb) {
-			out = append(out, prefix)
-		}
-	}
-	walk("", ma, mb)
-	sort.Strings(out)
-	return out
-}
-
 // ---- changes -----------------------------------------------------------------------
 
 func (s *Server) handleListChanges(w http.ResponseWriter, r *http.Request) {
@@ -874,10 +904,18 @@ func (s *Server) handleGetChange(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) decide(r *http.Request, action, id, note string) (model.Change, error) {
+	return s.decideConfirmed(r, action, id, note, "")
+}
+
+// decideConfirmed is decide with the typed confirmation an undo change needs; without one (bulk) an undo is refused.
+func (s *Server) decideConfirmed(r *http.Request, action, id, note, confirm string) (model.Change, error) {
 	by := principal(r).User.Username
 	ctx := r.Context()
 	switch action {
 	case "approve":
+		if confirm != "" {
+			return s.Engine.ApproveUndo(ctx, id, by, note, confirm)
+		}
 		return s.Engine.Approve(ctx, id, by, note)
 	case "reject":
 		return s.Engine.Reject(ctx, id, by, note)
@@ -890,12 +928,13 @@ func (s *Server) decide(r *http.Request, action, id, note string) (model.Change,
 func (s *Server) decision(action string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var in struct {
-			Note string `json:"note"`
+			Note    string `json:"note"`
+			Confirm string `json:"confirm"` // undo changes: the account name, typed by the approver
 		}
 		if r.ContentLength != 0 && !decode(w, r, &in) {
 			return
 		}
-		c, err := s.decide(r, action, r.PathValue("id"), strings.TrimSpace(in.Note))
+		c, err := s.decideConfirmed(r, action, r.PathValue("id"), strings.TrimSpace(in.Note), in.Confirm)
 		if err != nil {
 			s.fail(w, r, err)
 			return
@@ -974,12 +1013,27 @@ func (s *Server) handleStartRun(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleListIdentities(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	items, total, err := s.Store.ListIdentities(r.Context(), store.IdentityFilter{Q: q.Get("q"), State: q.Get("state")}, pageOf(r))
+	now := s.Engine.Now()
+	manual := q.Get("manual") == "1" || strings.EqualFold(q.Get("manual"), "true")
+	items, total, err := s.Store.ListIdentities(r.Context(), store.IdentityFilter{Q: q.Get("q"), State: q.Get("state"), Manual: manual, ManualAt: now}, pageOf(r))
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	list(w, items, total)
+	counts, err := s.Store.ManualCounts(r.Context(), now)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	type row struct {
+		model.Identity
+		ManualCount int `json:"manual_count"`
+	}
+	out := make([]row, len(items))
+	for i, x := range items {
+		out[i] = row{x, counts[x.ID]}
+	}
+	list(w, out, total)
 }
 
 func (s *Server) handleGetIdentity(w http.ResponseWriter, r *http.Request) {
@@ -988,7 +1042,28 @@ func (s *Server) handleGetIdentity(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, x)
+	holds, err := s.Store.ListHolds(r.Context(), x.ID)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	extra, err := s.identityExtra(r.Context(), x)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	ret, err := s.Engine.IdentityRetentionInfo(r.Context(), x)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		model.Identity
+		identityExtra
+		Holds     []model.Hold            `json:"holds"`
+		Retention model.IdentityRetention `json:"retention"`
+		LeaveDate string                  `json:"leave_date,omitempty"`
+	}{x, extra, holds, ret, ret.LeaveDate})
 }
 
 // handleListAudit searches the history: q is a search box query (store.AuditQueryHelp); actor, action,

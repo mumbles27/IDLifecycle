@@ -7,10 +7,22 @@ import {
   h, clear, replaceContent, pageHeader, pill, dataTable, listItems, act, confirmDialog, toast,
   errorBox, loading, field, inputText, inputNumber, inputArea, inputCheck, inputSelect, formModal, openModal,
   mutBtn, truncCell, chip, fmtTime, csvToList, listToCsv, isObject, notice,
+  historyLink,
 } from '../ui.js';
 import { invalidateSourceCache } from '../components.js';
 
 const MASK = '********';
+
+// options.termination_date_format: "auto", a common Go layout, or a custom one.
+const TERMINATION_FORMATS = [
+  ['auto', 'Automatic'],
+  ['2006-01-02', 'YYYY-MM-DD'],
+  ['01/02/2006', 'MM/DD/YYYY'],
+  ['02/01/2006', 'DD/MM/YYYY'],
+  ['02.01.2006', 'DD.MM.YYYY'],
+  ['2006-01-02T15:04:05Z07:00', 'Date and time (RFC 3339)'],
+  ['custom', 'Custom layout…'],
+];
 
 export async function render(root, ctx) {
   const isAdmin = ctx.can('admin');
@@ -44,16 +56,15 @@ export async function render(root, ctx) {
       { label: 'Last status', render: (s) => (s.last_status ? pill(s.last_status) : '') },
       { label: 'Last error', render: (s) => (s.last_error ? truncCell(s.last_error, 80) : '') },
     ];
-    if (isAdmin) {
-      columns.push({
-        label: 'Actions',
-        className: 'col-actions',
-        render: (s) => h('div', { class: 'row-actions' },
-          mutBtn('Edit', { class: 'btn-sm', 'data-test': 'edit-source', onclick: () => openEditor(s) }),
-          mutBtn('Test', { class: 'btn-sm', 'data-test': 'test-source', onclick: (e) => testSource(s, e.currentTarget) }),
-          mutBtn('Delete', { class: 'btn-sm btn-danger', 'data-test': 'delete-source', onclick: (e) => remove(s, e.currentTarget) })),
-      });
-    }
+    columns.push({
+      label: 'Actions',
+      className: 'col-actions',
+      render: (s) => h('div', { class: 'row-actions' },
+        isAdmin ? mutBtn('Edit', { class: 'btn-sm', 'data-test': 'edit-source', onclick: () => openEditor(s) }) : null,
+        isAdmin ? mutBtn('Test', { class: 'btn-sm', 'data-test': 'test-source', onclick: (e) => testSource(s, e.currentTarget) }) : null,
+        historyLink('source', s.id),
+        isAdmin ? mutBtn('Delete', { class: 'btn-sm btn-danger', 'data-test': 'delete-source', onclick: (e) => remove(s, e.currentTarget) }) : null),
+    });
     replaceContent(listEl, dataTable(columns, items, {
       caption: 'Sources',
       empty: 'No sources yet. Add an HR source to start syncing people.',
@@ -158,7 +169,12 @@ export async function render(root, ctx) {
       terminated_values: listToCsv(opts.terminated_values),
       missing_means_terminated: Boolean(opts.missing_means_terminated),
       missing_grace_runs: opts.missing_grace_runs === undefined ? 3 : opts.missing_grace_runs,
+      termination_date_field: opts.termination_date_field || '',
+      termination_date_format: opts.termination_date_format || 'auto',
+      termination_after_days: opts.termination_after_days === undefined ? 0 : opts.termination_after_days,
     };
+    const knownFormat = TERMINATION_FORMATS.some(([v]) => v === optModel.termination_date_format);
+    const fmtModel = { choice: knownFormat ? optModel.termination_date_format : 'custom', custom: knownFormat ? '' : optModel.termination_date_format };
     let config = existing ? { ...(existing.config || {}) } : {};
     const cfgBox = h('div', { class: 'stack-sm', 'data-test': 'source-config' });
     // A manual source fixes these options on the server (ExternalID / Status / Terminated), so they are hidden for it.
@@ -169,6 +185,43 @@ export async function render(root, ctx) {
       field('Terminated values', inputText(optModel, 'terminated_values', { placeholder: 'T, Terminated' }), { help: 'Comma-separated status values that mean "has left". Matching people are disabled, then deleted after the grace period.' }),
       inputCheck(optModel, 'missing_means_terminated', 'Treat people missing from the feed as terminated'),
       field('Missing grace runs', inputNumber(optModel, 'missing_grace_runs', { min: '0', step: '1' }), { help: 'How many consecutive runs a person may be absent before they count as terminated. Protects against partial feeds.' }));
+
+    // Termination date: works for every source type (a manual source also keeps its own end date field).
+    const fieldList = `term-fields-${Math.random().toString(36).slice(2, 8)}`;
+    const fieldOptions = h('datalist', { id: fieldList });
+    const termField = inputText(optModel, 'termination_date_field', {
+      placeholder: 'TerminationDate', list: fieldList, 'data-test': 'opt-term-field',
+      onfocus: () => loadFieldNames(),
+    });
+    const customFmt = inputText(fmtModel, 'custom', { placeholder: '2006-01-02 (Go layout)', 'data-test': 'opt-term-custom', class: 'mono', hidden: fmtModel.choice !== 'custom' });
+    const fmtSel = inputSelect(fmtModel, 'choice', TERMINATION_FORMATS.map(([value, label]) => ({ value, label })), {
+      'data-test': 'opt-term-format',
+      onchange: () => { customFmt.hidden = fmtModel.choice !== 'custom'; },
+    });
+    let fieldsLoaded = false;
+    async function loadFieldNames() {
+      if (fieldsLoaded || !existing) {
+        return;
+      }
+      fieldsLoaded = true;
+      try {
+        const res = await api.post(`/mapper/sources/${encodeURIComponent(existing.id)}/fields`, {});
+        for (const f of (res && Array.isArray(res.fields) ? res.fields : [])) {
+          fieldOptions.appendChild(h('option', { value: f.name }, Array.isArray(f.samples) && f.samples.length ? `e.g. ${f.samples.join(', ')}` : ''));
+        }
+      }
+      catch (e) {
+        // the field list is only a convenience; typing a name works without it
+      }
+    }
+    const termOpts = h('fieldset', { class: 'group', 'data-test': 'source-termination' },
+      h('legend', null, 'Leaving date (optional)'),
+      h('p', { class: 'help' }, 'When the source has a termination or last-working-day date, people count as having left once it has passed, even if their status still says active. A future date does nothing yet; the person shows "Leaving on" that date.'),
+      fieldOptions,
+      field('Termination date field', termField, { help: existing ? 'The source field with the date. Focus the box to see the fields the source returns.' : 'The source field with the date (save and edit the source to pick from its fields).' }),
+      h('div', { class: 'field-row' },
+        field('Date format', h('div', { class: 'stack-sm' }, fmtSel, customFmt), { help: 'Automatic understands YYYY-MM-DD, date-times, MM/DD/YYYY, DD.MM.YYYY and Excel day numbers. Dates are local to the schedule time zone.' }),
+        field('Days after the date', inputNumber(optModel, 'termination_after_days', { min: '0', step: '1', 'data-test': 'opt-term-days' }), { help: '0 = the day after the date. 7 = a week after it.' })));
 
     function drawConfig() {
       clear(cfgBox);
@@ -229,6 +282,9 @@ export async function render(root, ctx) {
           terminated_values: csvToList(optModel.terminated_values),
           missing_means_terminated: Boolean(optModel.missing_means_terminated),
           missing_grace_runs: Number(optModel.missing_grace_runs) || 0,
+          termination_date_field: String(optModel.termination_date_field || '').trim(),
+          termination_date_format: fmtModel.choice === 'custom' ? String(fmtModel.custom || '').trim() : fmtModel.choice,
+          termination_after_days: Number(optModel.termination_after_days) || 0,
         },
         config: cfg,
       };
@@ -259,6 +315,7 @@ export async function render(root, ctx) {
       inputCheck(model, 'enabled', 'Enabled'),
       h('fieldset', { class: 'group' }, h('legend', null, 'Connection'), cfgBox),
       idOpts,
+      termOpts,
     ];
 
     formModal({

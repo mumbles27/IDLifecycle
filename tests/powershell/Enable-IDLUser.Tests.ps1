@@ -159,3 +159,88 @@ Describe 'Enable-IDLUser.ps1 removeGroups and privileged groups' {
         (Get-StubUser -Path $f.State -Sam 'old1').enabled | Should Be $false
     }
 }
+
+Describe 'Enable-IDLUser.ps1 undo support (before, set/clear, expect)' {
+
+    function New-Fixture {
+        $off = New-StubUserEntry -Sam 'old1' -ExternalId 'E1003' -Cn 'Old One' -Enabled $false -Ou "OU=Disabled,$script:Root" -Attributes @{ description = 'Disabled by IDLifecycle 2026-10-01' } -MemberOf @("CN=GG-Old,OU=Groups,$script:Root")
+        $path = New-StandardState -Users @($off)
+        return @{ State = $path; Off = $off }
+    }
+
+    function New-EnableRequest {
+        param([object[]]$Items)
+        return [ordered]@{ server = ''; idAttribute = 'employeeID'; items = @($Items) }
+    }
+
+    function New-OffItem {
+        param($Off)
+        return [ordered]@{
+            changeId = 'c1'; externalId = 'E1003'; objectGuid = $Off.objectGuid
+            moveTo = "OU=Staff,$script:Root"; addGroups = @('GG-AllStaff', 'GG-Old'); removeGroups = @('GG-Old', 'GG-Sales')
+            set = @{ title = 'Back again' }; clear = @('description')
+        }
+    }
+
+    It 'applies set/clear before enabling and returns before (applied and DryRun)' {
+        foreach ($dry in @($true, $false)){
+            $f = New-Fixture
+            $item = New-OffItem $f.Off
+            $item.addGroups = @('GG-AllStaff')
+            $r = Invoke-IDLScript -Script 'Enable-IDLUser' -Request (New-EnableRequest @($item)) -StatePath $f.State -DryRun:$dry
+
+            $r.ExitCode | Should Be 0
+            $b = $r.Json.results[0].before
+            $b.enabled | Should Be $false
+            $b.dn | Should Be "CN=Old One,OU=Disabled,$script:Root"
+            $b.attributes.description | Should Be 'Disabled by IDLifecycle 2026-10-01'
+            @($b.attributes.PSObject.Properties | ForEach-Object { $_.Name }) -contains 'title' | Should Be $true
+            $b.attributes.title | Should Be $null
+            @($b.groupsAdded) -join '|' | Should Be "CN=GG-AllStaff,OU=Groups,$script:Root"
+            @($b.groupsRemoved) -join '|' | Should Be "CN=GG-Old,OU=Groups,$script:Root"     # GG-Sales: was not a member
+            if ($dry){
+                (Get-StubCalls -Path $f.State).Count | Should Be 0
+            }
+            else{
+                $calls = @(Get-StubCalls -Path $f.State | ForEach-Object { $_.cmdlet })
+                $calls.IndexOf('Set-ADUser') | Should BeLessThan $calls.IndexOf('Enable-ADAccount')
+                $u = Get-StubUser -Path $f.State -Sam 'old1'
+                $u.enabled | Should Be $true
+                $u.attributes.title | Should Be 'Back again'
+            }
+        }
+    }
+
+    It 'drift fails the item before any change; force overrides' {
+        $f = New-Fixture
+        $item = New-OffItem $f.Off
+        $item.addGroups = @('GG-AllStaff')
+        $item['expect'] = [ordered]@{ enabled = $true; notMemberOf = @('GG-Old') }
+        $r = Invoke-IDLScript -Script 'Enable-IDLUser' -Request (New-EnableRequest @($item)) -StatePath $f.State
+        $r.Json.results[0].status | Should Be 'failed'
+        $r.Json.results[0].error | Should Be 'drift: account is disabled, expected enabled; is a member of GG-Old again'
+        (Get-StubCalls -Path $f.State).Count | Should Be 0
+
+        $item['force'] = $true
+        $r = Invoke-IDLScript -Script 'Enable-IDLUser' -Request (New-EnableRequest @($item)) -StatePath $f.State
+        $r.Json.results[0].status | Should Be 'applied'
+    }
+
+    It 'round trip: Disable-IDLUser with the inverse built from before puts the account back exactly' {
+        $f = New-Fixture
+        $original = Get-StubUserShape -Path $f.State -Guid $f.Off.objectGuid
+        $item = New-OffItem $f.Off
+        $item.addGroups = @('GG-AllStaff')
+        $r = Invoke-IDLScript -Script 'Enable-IDLUser' -Request (New-EnableRequest @($item)) -StatePath $f.State
+        $applied = $r.Json.results[0]
+        $applied.status | Should Be 'applied'
+
+        $expect = [ordered]@{ enabled = $true; dn = $applied.dn; attributes = @{ title = 'Back again'; description = $null }; memberOf = @($applied.before.groupsAdded); notMemberOf = @($applied.before.groupsRemoved) }
+        $undo = New-UndoItem -Result $applied -Expect $expect
+        $r = Invoke-IDLScript -Script 'Disable-IDLUser' -Request (New-EnableRequest @($undo)) -StatePath $f.State
+
+        $r.ExitCode | Should Be 0
+        $r.Json.results[0].status | Should Be 'applied'
+        (Get-StubUserShape -Path $f.State -Guid $f.Off.objectGuid) | Should Be $original
+    }
+}

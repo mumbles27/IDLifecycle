@@ -248,4 +248,16 @@ func TestInitFlagsAndCheck(t *testing.T) {
 		t.Errorf("admin check should pass now:\n%s", out)
 	}
 	_ = code // scripts_unblocked/powershell depend on this machine; covered by their own tests
+
+	// -cloud adds one check after the fixed list; with the connection off it is skipped (never fails an install).
+	_, out, _ = run(t, "check", "-config", cfgPath, "-json", "-skip-ad-module", "-cloud")
+	var doc struct {
+		Checks []checkResult `json:"checks"`
+	}
+	if err := json.Unmarshal([]byte(out), &doc); err != nil || len(doc.Checks) != len(CheckNames)+1 {
+		t.Fatalf("check -cloud: %v %s", err, out)
+	}
+	if last := doc.Checks[len(doc.Checks)-1]; last.Name != "cloud" || !last.Skipped || !strings.Contains(last.Detail, "connection is off") {
+		t.Errorf("cloud check: %+v", last)
+	}
 }

@@ -26,8 +26,14 @@
     when the account has proxyAddresses - the new address becomes the primary SMTP: entry and the old mail is kept as
     a secondary smtp: entry. A changed cn is applied last with Rename-ADObject. One failing item never stops the others.
 
+    Undo support: externalId "" with a non-empty expectedExternalId CLEARS the ID attribute (unlink; no holder checks).
+    "proxyAddresses" (optional array of type:address) is set exactly, in the same call, when it differs from the current
+    list (an empty array clears it). "expect" ({idValue, dn, names:{sam,upn,cn,mail}, attributes}) is checked before any
+    change ("drift: ..."; "force": true skips it). Applied and would results carry "before": {idValue ("" = was unset),
+    dn, and - only when names or proxyAddresses change - names:{sam,upn,cn,mail,proxyAddresses (the full old list)}}.
+
     Response: {"ok":true,"dryRun":false,"results":[{"changeId","externalId","status":"applied|would|skipped|failed",
-    "message","objectGuid","dn","sam","upn","error"}],"summary":{"total","applied","would","skipped","failed"}}
+    "message","objectGuid","dn","sam","upn","error","before"}],"summary":{"total","applied","would","skipped","failed"}}
     "externalId" in a result is the NEW external id; dn/sam/upn are the values after the change (in DryRun: the
     values the change would produce). "skipped" = already linked and nothing to rename.
 
@@ -89,6 +95,8 @@ try{
             Expected   = ''
             Guid       = [guid]::Empty
             Rename     = $null
+            Unlink     = $false
+            Proxy      = $null
             Error      = $null
         }
 
@@ -97,17 +105,43 @@ try{
                 throw 'item is not a JSON object'
             }
 
-            if ([string]::IsNullOrWhiteSpace($p.ExternalId)){
-                throw 'externalId is required'
-            }
-
-            $p.ExternalId = $p.ExternalId.Trim()
-            if (($p.ExternalId.Length -gt 256) -or ($p.ExternalId -cmatch '[\x00-\x1f\x7f]')){
-                throw 'externalId must be 1-256 printable characters'
-            }
-
             $expected = ConvertTo-IDLString -Value (Get-IDLField -Object $item -Name 'expectedExternalId')
             $p.Expected = (($null -eq $expected) ? ('') : ($expected.Trim()))
+
+            # An empty externalId clears the ID attribute (undo of a link); only with the id it must have now.
+            if ([string]::IsNullOrWhiteSpace($p.ExternalId)){
+                if ($p.Expected -eq ''){
+                    throw 'externalId is required (an empty externalId, to clear the ID attribute, needs expectedExternalId)'
+                }
+
+                $p.ExternalId = ''
+                $p.Unlink = $true
+            }
+            else{
+                $p.ExternalId = $p.ExternalId.Trim()
+                if (($p.ExternalId.Length -gt 256) -or ($p.ExternalId -cmatch '[\x00-\x1f\x7f]')){
+                    throw 'externalId must be 1-256 printable characters'
+                }
+            }
+
+            # proxyAddresses (optional): the exact list to set after the rename (undo restores the old list).
+            $rawProxy = Get-IDLField -Object $item -Name 'proxyAddresses'
+            if ($null -ne $rawProxy){
+                if ($rawProxy -isnot [System.Collections.IList]){
+                    throw "'proxyAddresses' must be an array"
+                }
+
+                $proxyList = [string[]](Get-IDLStringList -Value $rawProxy)
+                foreach ($proxy in $proxyList){
+                    if ($proxy -notmatch '^[A-Za-z0-9]+:\S.*$'){
+                        throw "proxyAddresses entry '$proxy' is not of the form type:address"
+                    }
+                }
+
+                $p.Proxy = $proxyList
+            }
+
+            $null = Get-IDLExpect -Item $item
 
             $guidText = ConvertTo-IDLString -Value (Get-IDLField -Object $item -Name 'objectGuid')
             $guid = [guid]::Empty
@@ -190,7 +224,9 @@ try{
     $valid = @($parsed | Where-Object { $null -eq $_.Error })
 
     # 1. the accounts
-    $byGuid = Find-IDLUsersByGuid -Guids ([guid[]]@($valid | ForEach-Object { $_.Guid })) -Server $server -Properties @($idAttribute, 'userPrincipalName', 'mail', 'proxyAddresses', 'adminCount', 'memberOf')
+    $expectNeeds = Get-IDLExpectNeeds -Items $items
+    $properties = [string[]]@(@($idAttribute, 'userPrincipalName', 'mail', 'proxyAddresses', 'adminCount', 'memberOf') + @($expectNeeds.Properties) | Select-Object -Unique)
+    $byGuid = Find-IDLUsersByGuid -Guids ([guid[]]@($valid | ForEach-Object { $_.Guid })) -Server $server -Properties $properties
 
     # 1b. direct group memberships of those accounts, to refuse privileged accounts (defence in depth)
     $memberDns = [System.Collections.Generic.List[string]]::new()
@@ -202,7 +238,7 @@ try{
 
     # 2. objects that already carry one of the new external ids (any object class)
     $holders = [hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
-    $extValues = [string[]]@($valid | ForEach-Object { $_.ExternalId } | Select-Object -Unique)
+    $extValues = [string[]]@($valid | Where-Object { -not $_.Unlink } | ForEach-Object { $_.ExternalId } | Select-Object -Unique)
     if ($extValues.Count -gt 0){
         foreach ($chunk in (Split-IDLChunk -InputArray $extValues -Size 50)){
             $terms = [string[]]@($chunk | ForEach-Object { '({0}={1})' -f $idAttribute, (ConvertTo-IDLLdapFilterValue -Value $_) })
@@ -291,7 +327,7 @@ try{
             }
 
             $current = Get-IDLAdValue -Object $user -Name $idAttribute
-            $alreadyLinked = ($null -ne $current) -and ($current -ieq $externalId)
+            $alreadyLinked = (($p.Unlink) ? ($null -eq $current) : (($null -ne $current) -and ($current -ieq $externalId)))
             if (-not $alreadyLinked){
                 $shown = (($null -eq $current) ? ('(unset)') : ("'$current'"))
                 if (($p.Expected -eq '') -and ($null -ne $current)){
@@ -303,14 +339,14 @@ try{
                 }
             }
 
-            if ($holders.ContainsKey($externalId)){
+            if ((-not $p.Unlink) -and $holders.ContainsKey($externalId)){
                 $others = @($holders[$externalId] | Where-Object { ([guid]$_.ObjectGUID).ToString() -ne $guidKey })
                 if ($others.Count -gt 0){
                     throw "$idAttribute '$externalId' is already used by $($others[0].DistinguishedName)"
                 }
             }
 
-            if ($usedExt.Contains($externalId)){
+            if ((-not $p.Unlink) -and $usedExt.Contains($externalId)){
                 throw "$idAttribute '$externalId' was linked to another account earlier in this batch"
             }
 
@@ -350,7 +386,21 @@ try{
                 }
             }
 
-            if ($alreadyLinked -and ($new.Count -eq 0)){
+            # proxyAddresses to restore exactly (only when different from the current list).
+            $currentProxies = [string[]](Get-IDLAdValues -Object $user -Name 'proxyAddresses')
+            $setProxies = $null
+            if ($null -ne $p.Proxy){
+                $have = (@($currentProxies | Sort-Object -CaseSensitive) -join "`n")
+                $want = (@($p.Proxy | Sort-Object -CaseSensitive) -join "`n")
+                if ($have -cne $want){
+                    $setProxies = $p.Proxy
+                }
+            }
+
+            # Nothing has changed yet: refuse when the account is no longer as the request expects (undo).
+            Assert-IDLExpect -Item $items[$i] -User $user -GroupMap $null -IdAttribute $idAttribute
+
+            if ($alreadyLinked -and ($new.Count -eq 0) -and ($null -eq $setProxies)){
                 $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status skipped -Message 'already linked' @userFields
                 Add-IDLReportRow -Action 'LinkUser' -Result 'Skipped' -Identity $identity -ObjectIdOrDN $userDn -Details 'already linked'
                 $results.Add($result)
@@ -360,10 +410,29 @@ try{
             }
 
             # ---- one Set-ADUser call: link key, sam, upn, mail (+ proxyAddresses) ----
+            $before = [ordered]@{
+                idValue = (($null -eq $current) ? ('') : ($current))
+                dn      = $userDn
+            }
+            if (($new.Count -gt 0) -or ($null -ne $setProxies)){
+                $before['names'] = [ordered]@{
+                    sam            = $currentNames.sam
+                    upn            = $currentNames.upn
+                    cn             = $currentNames.cn
+                    mail           = $currentNames.mail
+                    proxyAddresses = $currentProxies
+                }
+            }
+
             $setParams = @{}
             $replace = @{}
+            $clear = [System.Collections.Generic.List[string]]::new()
             $steps = [System.Collections.Generic.List[string]]::new()
-            if (-not $alreadyLinked){
+            if ((-not $alreadyLinked) -and $p.Unlink){
+                $clear.Add($idAttribute)
+                $steps.Add("clear $idAttribute")
+            }
+            elseif (-not $alreadyLinked){
                 $replace[$idAttribute] = $externalId
                 $steps.Add("set $idAttribute")
             }
@@ -406,8 +475,23 @@ try{
                 }
             }
 
+            if ($null -ne $setProxies){
+                $steps.Add('set proxyAddresses')
+                if ($setProxies.Count -gt 0){
+                    $replace['proxyAddresses'] = $setProxies
+                }
+                else{
+                    $null = $replace.Remove('proxyAddresses')
+                    $clear.Add('proxyAddresses')
+                }
+            }
+
             if ($replace.Count -gt 0){
                 $setParams['Replace'] = $replace
+            }
+
+            if ($clear.Count -gt 0){
+                $setParams['Clear'] = [string[]]$clear.ToArray()
             }
 
             $renamed = @($new.Keys | Where-Object { $_ -ne 'cn' } | Sort-Object | ForEach-Object { "$($labels[$_]) '$($currentNames[$_])' -> '$($new[$_])'" })
@@ -420,7 +504,8 @@ try{
             $finalDn = $userDn
 
             if ($setParams.Count -gt 0){
-                $detail = 'link: {0}; rename: {1}' -f (-not $alreadyLinked), ((@($new.Keys | Where-Object { $_ -ne 'cn' } | Sort-Object)) -join ',')
+                $linkStep = (($alreadyLinked) ? ('none') : ((($p.Unlink) ? ('clear') : ('set'))))
+                $detail = 'link: {0}; rename: {1}; proxyAddresses: {2}' -f $linkStep, ((@($new.Keys | Where-Object { $_ -ne 'cn' } | Sort-Object)) -join ','), ($null -ne $setProxies)
                 if ($DryRun){
                     Write-IDLLog "  WOULD: update $identity ($detail)"
                     Add-IDLReportRow -Action 'LinkUser' -Result 'Would' -Identity $identity -ObjectIdOrDN $userDn -Details $detail
@@ -458,14 +543,17 @@ try{
             }
 
             $userFields = @{ ObjectGuid = $guidKey; Dn = $finalDn; Sam = $finalSam; Upn = $finalUpn }
-            $null = $usedExt.Add($externalId)
+            if (-not $p.Unlink){
+                $null = $usedExt.Add($externalId)
+            }
+
             foreach ($field in $new.Keys){
                 $key = (($field -eq 'cn') ? ("cn|$($parent.ToLowerInvariant())|$($new[$field])") : ("$field|$($new[$field])"))
                 $null = $usedNames.Add($key)
             }
 
             $status = (($DryRun) ? ('would') : ('applied'))
-            $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status $status -Message ($done -join '; ') @userFields
+            $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status $status -Message ($done -join '; ') -Before $before @userFields
         }
         catch{
             $errorText = Protect-IDLText -Text $_.Exception.Message

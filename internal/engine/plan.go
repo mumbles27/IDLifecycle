@@ -103,6 +103,19 @@ type PlanContext struct {
 	MappingProps []string // properties to fetch from AD
 	// Links are correlation proposals by identity id (people without an account by id attribute).
 	Links map[string]*model.LinkPayload
+	// Holds are active holds by identity id; OnHold counts the planned items they suppressed.
+	Holds  map[string][]model.Hold
+	OnHold int
+	// Suppressed is what each hold (by id) kept the planner from doing; ManualLeft names inactive people whose disable
+	// or delete a Manual (all / state) hold stopped.
+	Suppressed map[string][]string
+	ManualLeft []string
+	// RetentionPolicies are every retention policy in priority order (disabled ones too: their OUs count as disabled OUs);
+	// Retention is the policy resolved per identity id in this pass; SourceNames / SourceTypes by source id feed conditions.
+	RetentionPolicies []model.RetentionPolicy
+	Retention         map[string]ResolvedRetention
+	SourceNames       map[string]string
+	SourceTypes       map[string]string
 }
 
 // Planned is the planner's output for one identity.
@@ -118,10 +131,22 @@ type Planned struct {
 	place   Placement         // create: where the OU came from (for the summary)
 	tail    []string          // create: summary lines after the "Create account" line
 	renames []model.Candidate // link: names to try when the account is renamed (the name check picks the first free one)
+	// manualPolicy names the retention policy that requires a person to approve this delete ("" = normal approval).
+	manualPolicy string
 }
 
 // PlanIdentity decides what (if anything) must change for one person. acct is nil when no AD account is linked.
+// A state hold (an undone create, link, disable or enable) drops a lifecycle change; attribute, group and OU holds are
+// applied while planning an update.
 func PlanIdentity(pc *PlanContext, id model.Identity, acct *ad.User) (*Planned, []string, error) {
+	p, warnings, err := planIdentity(pc, id, acct)
+	if err == nil && pc.heldWhole(id, p) {
+		return nil, warnings, nil
+	}
+	return p, warnings, err
+}
+
+func planIdentity(pc *PlanContext, id model.Identity, acct *ad.User) (*Planned, []string, error) {
 	var warnings []string
 	res := ResolveRolesAt(pc.Rules, id.Attrs, pc.now())
 	maps := mergeMappings(pc.Mappings, res.Attrs)
@@ -147,7 +172,7 @@ func PlanIdentity(pc *PlanContext, id model.Identity, acct *ad.User) (*Planned, 
 	}
 
 	// Lifecycle: every active account is in lifecycle_groups.active_add, like a role that matches everyone.
-	groupDNs, w := resolveGroups(pc, append(append([]string{}, res.Groups...), pc.Settings.Lifecycle.ActiveAdd...))
+	groupDNs, w := resolveGroups(pc, adGroupsOnly(append(append([]string{}, res.Groups...), pc.Settings.Lifecycle.ActiveAdd...)))
 	warnings = append(warnings, w...)
 	place := ResolvePlacement(pc.Settings, id, res.OU)
 	if place.Reason != "" && !place.Needs && (acct == nil || !acct.Enabled) {
@@ -325,19 +350,27 @@ func nameFieldLabel(f string) string {
 	return f
 }
 
+// planDeactivate disables a leaver's account under their retention policy (its disabled OU and extra kept groups),
+// and deletes it once the policy's days since the disable have passed (0 days = never).
 func planDeactivate(pc *PlanContext, id model.Identity, acct *ad.User) *Planned {
 	s := pc.Settings
+	ret := pc.retentionFor(id, acct)
+	pol := ret.Policy
 	if acct.Enabled {
 		p := &Planned{Type: model.ChangeDisable, Payload: model.ChangePayload{
 			ObjectGUID: acct.ObjectGUID,
 			DN:         acct.DN,
 		}}
 		p.Summary = append(p.Summary, fmt.Sprintf("Disable account %s", acct.Sam))
-		if s.AD.DisabledOU != "" && !strings.EqualFold(parentDN(acct.DN), s.AD.DisabledOU) {
-			p.Payload.MoveTo = s.AD.DisabledOU
-			p.Summary = append(p.Summary, "Move to "+s.AD.DisabledOU)
+		ou := firstNonEmpty(pol.DisabledOU, s.AD.DisabledOU)
+		if ou != "" && !strings.EqualFold(parentDN(acct.DN), ou) {
+			p.Payload.MoveTo = ou
+			p.Summary = append(p.Summary, "Move to "+ou)
 		}
-		p.Payload.RemoveGroups, p.Payload.AddGroups = disableGroups(pc, acct)
+		if ret.Reason != model.RetentionReasonDefault {
+			p.Summary = append(p.Summary, "Retention policy: "+retentionText(ret))
+		}
+		p.Payload.RemoveGroups, p.Payload.AddGroups = disableGroups(pc, acct, pol.ExtraKeepGroups...)
 		if n := len(p.Payload.RemoveGroups); n > 0 {
 			p.Summary = append(p.Summary, fmt.Sprintf("Remove from %d group(s)", n))
 		}
@@ -347,23 +380,35 @@ func planDeactivate(pc *PlanContext, id model.Identity, acct *ad.User) *Planned 
 		return p
 	}
 
-	days := s.Engine.DeleteAfterDays
-	if days <= 0 || id.DisabledAt == nil {
-		return nil
-	}
-	if pc.Now.Sub(*id.DisabledAt) < time.Duration(days)*24*time.Hour {
+	due := deleteDue(pol, id.DisabledAt)
+	if due == nil || pc.Now.Before(*due) {
 		return nil
 	}
 	p := &Planned{Type: model.ChangeDelete, Payload: model.ChangePayload{ObjectGUID: acct.ObjectGUID, DN: acct.DN}}
-	p.Summary = append(p.Summary, fmt.Sprintf("Delete account %s (disabled since %s, retention %d days)", acct.Sam, id.DisabledAt.UTC().Format("2006-01-02"), days))
+	p.Summary = append(p.Summary, fmt.Sprintf("Delete account %s (disabled since %s, policy %s: %d days)", acct.Sam,
+		id.DisabledAt.UTC().Format("2006-01-02"), pol.Name, pol.DeleteAfterDays))
+	if pol.Approval == model.RetentionApprovalManual {
+		p.manualPolicy = pol.Name
+	}
 	return p
+}
+
+// retentionText names a resolved policy and why it applies ("Executives (matched rule)").
+func retentionText(r ResolvedRetention) string {
+	why := map[string]string{model.RetentionReasonAssigned: "assigned by a person", model.RetentionReasonRule: "matched rule",
+		model.RetentionReasonDefault: "default"}[r.Reason]
+	days := "never deleted automatically"
+	if r.Policy.DeleteAfterDays > 0 {
+		days = fmt.Sprintf("deleted %d days after the disable", r.Policy.DeleteAfterDays)
+	}
+	return fmt.Sprintf("%s (%s; %s)", r.Policy.Name, why, days)
 }
 
 func planEnable(pc *PlanContext, acct *ad.User, groupDNs []string, ou string) *Planned {
 	p := &Planned{Type: model.ChangeEnable, Payload: model.ChangePayload{ObjectGUID: acct.ObjectGUID, DN: acct.DN, AddGroups: groupDNs}}
 	p.Summary = append(p.Summary, fmt.Sprintf("Re-enable account %s (active again in source)", acct.Sam))
 	if ou != "" && !strings.EqualFold(parentDN(acct.DN), ou) &&
-		(pc.Settings.Engine.EnforceOU || (pc.Settings.AD.DisabledOU != "" && strings.EqualFold(parentDN(acct.DN), pc.Settings.AD.DisabledOU))) {
+		(pc.Settings.Engine.EnforceOU || pc.isDisabledOU(parentDN(acct.DN))) {
 		p.Payload.MoveTo = ou
 		p.Summary = append(p.Summary, "Move to "+ou)
 	}
@@ -415,8 +460,14 @@ func planUpdate(pc *PlanContext, id model.Identity, acct *ad.User, maps []effect
 			if m.OnEmpty != "clear" || current == "" {
 				continue
 			}
+			if pc.hold(id.ID, model.HoldAttribute, m.Attr, "would clear "+m.Attr) {
+				continue
+			}
 			p.Payload.Clear = append(p.Payload.Clear, m.Attr)
 			p.Summary = append(p.Summary, fmt.Sprintf("Clear %s (was %q) [%s]", m.Attr, current, m.Mode))
+			continue
+		}
+		if pc.hold(id.ID, model.HoldAttribute, m.Attr, fmt.Sprintf("would set %s to '%s'", m.Attr, r.Value)) {
 			continue
 		}
 		p.Payload.Set[m.Attr] = model.AttrDiff{From: current, To: r.Value, Mode: m.Mode}
@@ -435,6 +486,9 @@ func planUpdate(pc *PlanContext, id model.Identity, acct *ad.User, maps []effect
 	for _, g := range groupDNs {
 		want[strings.ToLower(g)] = true
 		if !have[strings.ToLower(g)] {
+			if pc.hold(id.ID, model.HoldGroup, g, "would add to group "+shortCN(g)) {
+				continue
+			}
 			p.Payload.AddGroups = append(p.Payload.AddGroups, g)
 			p.Summary = append(p.Summary, "Add to group "+shortCN(g))
 		}
@@ -443,6 +497,9 @@ func planUpdate(pc *PlanContext, id model.Identity, acct *ad.User, maps []effect
 		for _, g := range acct.MemberOf {
 			l := strings.ToLower(g)
 			if pc.ManagedDNs[l] && !want[l] {
+				if pc.hold(id.ID, model.HoldGroup, g, "would remove from group "+shortCN(g)) {
+					continue
+				}
 				p.Payload.RemoveGroups = append(p.Payload.RemoveGroups, g)
 				p.Summary = append(p.Summary, "Remove from group "+shortCN(g))
 			}
@@ -477,6 +534,7 @@ func planUpdate(pc *PlanContext, id model.Identity, acct *ad.User, maps []effect
 		}
 	}
 
+	pc.dropHeldMove(id.ID, p)
 	if len(p.Summary) == 0 {
 		if len(observed) == 0 {
 			return nil
@@ -574,9 +632,9 @@ func disabledRemoveMode(s model.Settings) string {
 // disableGroups decides group changes when an account is disabled: which memberships to remove (by
 // lifecycle_groups.disabled_remove, never disabled_keep or disabled_add) and which disabled_add groups to add.
 // Privileged groups are still listed for removal; the script keeps them and says so.
-func disableGroups(pc *PlanContext, acct *ad.User) (remove, add []string) {
+func disableGroups(pc *PlanContext, acct *ad.User, extraKeep ...string) (remove, add []string) {
 	keep := map[string]bool{}
-	for _, g := range lifecycleDNs(pc, pc.Settings.Lifecycle.DisabledKeep) {
+	for _, g := range lifecycleDNs(pc, append(append([]string{}, pc.Settings.Lifecycle.DisabledKeep...), extraKeep...)) {
 		keep[strings.ToLower(g)] = true
 	}
 	addDNs := lifecycleDNs(pc, pc.Settings.Lifecycle.DisabledAdd)

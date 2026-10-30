@@ -348,7 +348,7 @@ func (s *Server) handleCreateManualPerson(w http.ResponseWriter, r *http.Request
 		s.fail(w, r, err)
 		return
 	}
-	s.audit(r, "manual.create", "manual_person", p.ID, map[string]any{"source": info.Name, "external_id": p.ExternalID, "attrs": attrs})
+	s.audit(r, "manual.create", "manual_person", p.ID, map[string]any{"source": info.Name, "source_id": info.ID, "external_id": p.ExternalID, "attrs": attrs})
 	out := map[string]any{"id": p.ID, "source_id": p.SourceID, "external_id": p.ExternalID, "attrs": p.Attrs, "ended": false,
 		"created_by": p.CreatedBy, "created_at": p.CreatedAt, "updated_by": p.UpdatedBy, "updated_at": p.UpdatedAt}
 	if in.Sync {
@@ -386,7 +386,8 @@ func (s *Server) handleUpdateManualPerson(w http.ResponseWriter, r *http.Request
 		s.fail(w, r, err)
 		return
 	}
-	s.audit(r, "manual.update", "manual_person", p.ID, map[string]any{"source": info.Name, "external_id": p.ExternalID, "before": before, "after": attrs})
+	s.audit(r, "manual.update", "manual_person", p.ID, withChanges(map[string]any{"source": info.Name, "source_id": info.ID, "external_id": p.ExternalID, "before": before, "after": attrs},
+		auditChanges(before, attrs, before, attrs)))
 	writeJSON(w, http.StatusOK, p)
 }
 
@@ -409,7 +410,7 @@ func (s *Server) handleEndManualPerson(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	s.audit(r, "manual.end", "manual_person", p.ID, map[string]any{"source": info.Name, "external_id": p.ExternalID, "note": strings.TrimSpace(in.Note)})
+	s.audit(r, "manual.end", "manual_person", p.ID, map[string]any{"source": info.Name, "source_id": info.ID, "external_id": p.ExternalID, "note": strings.TrimSpace(in.Note)})
 	writeJSON(w, http.StatusOK, p)
 }
 
@@ -438,6 +439,6 @@ func (s *Server) handleDeleteManualPerson(w http.ResponseWriter, r *http.Request
 		s.fail(w, r, err)
 		return
 	}
-	s.audit(r, "manual.delete", "manual_person", p.ID, map[string]any{"source": info.Name, "external_id": p.ExternalID})
+	s.audit(r, "manual.delete", "manual_person", p.ID, map[string]any{"source": info.Name, "source_id": info.ID, "external_id": p.ExternalID, "attrs": p.Attrs})
 	w.WriteHeader(http.StatusNoContent)
 }

@@ -18,10 +18,12 @@
     privileged group (adminCount=1 or a protected RID) or an ambiguous one fails the item before any change; a
     removeGroups entry that is privileged or ambiguous is KEPT (WARN log, 'Skipped' report row, "kept ... group(s)" note)
     and an unknown one is ignored with a WARN - never a failure.
+    Optional "set" / "clear" (Set-IDLUser semantics) are applied before the account is enabled. "expect" / "force" and the
+    "before" record work as in Set-IDLUser (before: enabled, dn, attributes, groupsAdded, groupsRemoved).
     Idempotent: nothing to do => status "skipped". One failing item never stops the others.
 
     Response: {"ok":true,"dryRun":false,"results":[{"changeId","externalId","status":"applied|would|skipped|failed",
-    "message","objectGuid","dn","sam","upn","error"}],"summary":{"total","applied","would","skipped","failed"}}
+    "message","objectGuid","dn","sam","upn","error","before"}],"summary":{"total","applied","would","skipped","failed"}}
 
 .PARAMETER DryRun
     Do every lookup and log/report everything as WOULD: statements, but make NO changes. Successful items
@@ -67,6 +69,8 @@ try{
     Add-IDLCounter -Name 'Total' -By $items.Count
     Write-IDLLog ("Request: server='{0}' idAttribute={1} items={2}" -f $server, $idAttribute, $items.Count)
 
+    $blocked = @(Get-IDLProtectedAttributes) + @('cn', 'name', $idAttribute.ToLowerInvariant())
+
     # ---- Phase: dependencies and connection ----
     try{
         Import-Module ActiveDirectory -Global -ErrorAction Stop
@@ -86,7 +90,12 @@ try{
     $phase = Start-IDLPhase -Name 'Resolve accounts and groups'
     $needMemberOf = $false
     $allGroups = [System.Collections.Generic.List[string]]::new()
+    $expectNeeds = Get-IDLExpectNeeds -Items $items
+    $allGroups.AddRange($expectNeeds.Groups)
+    $extraProperties = @($expectNeeds.Properties)
     foreach ($item in $items){
+        $extraProperties += Get-IDLAttributeRequestNames -Item $item
+
         $groups = Get-IDLStringList -Value (Get-IDLField -Object $item -Name 'addGroups')
         if ($groups.Count -gt 0){
             $needMemberOf = $true
@@ -100,7 +109,6 @@ try{
         }
     }
 
-    $extraProperties = @()
     if ($needMemberOf){
         $extraProperties += 'memberOf'
     }
@@ -139,7 +147,11 @@ try{
             $moveTo = ConvertTo-IDLString -Value (Get-IDLField -Object $item -Name 'moveTo')
             $moveTo = (($null -eq $moveTo) ? ('') : ($moveTo.Trim()))
 
-            # Validate everything up front so a bad group/OU fails the item before any change is made.
+            # Validate everything up front so a bad group/OU fails the item before any change is made, and refuse when
+            # the account is no longer as the request expects (undo).
+            Assert-IDLExpect -Item $item -User $user -GroupMap $groupMap -IdAttribute $idAttribute
+            $attributeRequest = Get-IDLAttributeRequest -Item $item -Blocked $blocked -ScriptName 'Enable-IDLUser'
+
             # Throws (item fails, nothing changed) for ambiguous or privileged groups.
             $addInfo = Get-IDLGroupDns -Identities (Get-IDLStringList -Value (Get-IDLField -Object $item -Name 'addGroups')) -GroupMap $groupMap -Adding
             if ($addInfo.Missing.Count -gt 0){
@@ -161,8 +173,11 @@ try{
                 }
             }
 
-            $changes = 0
+            $before = New-IDLBefore -User $user
             $guid = [guid]$user.ObjectGUID
+
+            # Attributes first: the account is enabled with its values already restored.
+            $changes = Update-IDLUserAttributes -User $user -Desired $attributeRequest.Desired -ClearNames $attributeRequest.Clear -Server $server -DryRun:$DryRun -Done $done -Before $before.attributes
 
             if (-not [bool]$user.Enabled){
                 $changes++
@@ -183,7 +198,7 @@ try{
             }
 
             if ($addDns.Count -gt 0){
-                $changes += Update-IDLGroupMembership -User $user -AddDns $addDns -Server $server -DryRun:$DryRun -Done $done
+                $changes += Update-IDLGroupMembership -User $user -AddDns $addDns -Server $server -DryRun:$DryRun -Done $done -Added $before.groupsAdded
             }
 
             foreach ($missingGroup in $removeInfo.Missing){
@@ -199,7 +214,7 @@ try{
             }
 
             if ($removeInfo.Dns.Count -gt 0){
-                $changes += Update-IDLGroupMembership -User $user -RemoveDns $removeInfo.Dns -Server $server -DryRun:$DryRun -Done $done
+                $changes += Update-IDLGroupMembership -User $user -RemoveDns $removeInfo.Dns -Server $server -DryRun:$DryRun -Done $done -Removed $before.groupsRemoved
             }
 
             $finalDn = $userDn
@@ -217,10 +232,10 @@ try{
                 Add-IDLReportRow -Action 'EnableUser' -Result 'Skipped' -Identity $identity -ObjectIdOrDN $userDn -Details 'already in desired state'
             }
             elseif ($DryRun){
-                $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status would -Message ((@($done) + $notes) -join '; ') @userFields
+                $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status would -Message ((@($done) + $notes) -join '; ') -Before $before @userFields
             }
             else{
-                $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status applied -Message ((@($done) + $notes) -join '; ') @userFields
+                $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status applied -Message ((@($done) + $notes) -join '; ') -Before $before @userFields
             }
         }
         catch{

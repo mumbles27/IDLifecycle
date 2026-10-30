@@ -59,20 +59,21 @@ func (s *Server) handleSearchGroups(w http.ResponseWriter, r *http.Request) {
 // compared to the saved ones (see engine.PreviewImpact). Every part of the body is optional.
 func (s *Server) handlePreviewImpact(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Roles       *[]model.RoleRule `json:"roles"`
-		Mappings    *[]model.Mapping  `json:"mappings"`
-		Settings    json.RawMessage   `json:"settings"`
-		Refresh     bool              `json:"refresh"`
-		Q           string            `json:"q"`
-		OnlyChanged *bool             `json:"only_changed"`
-		Type        string            `json:"type"`
-		Offset      int               `json:"offset"`
-		Limit       int               `json:"limit"`
+		Roles             *[]model.RoleRule        `json:"roles"`
+		Mappings          *[]model.Mapping         `json:"mappings"`
+		RetentionPolicies *[]model.RetentionPolicy `json:"retention_policies"`
+		Settings          json.RawMessage          `json:"settings"`
+		Refresh           bool                     `json:"refresh"`
+		Q                 string                   `json:"q"`
+		OnlyChanged       *bool                    `json:"only_changed"`
+		Type              string                   `json:"type"`
+		Offset            int                      `json:"offset"`
+		Limit             int                      `json:"limit"`
 	}
 	if !decode(w, r, &in) {
 		return
 	}
-	req := engine.ImpactRequest{Roles: in.Roles, Mappings: in.Mappings, Refresh: in.Refresh, Q: in.Q, OnlyChanged: true,
+	req := engine.ImpactRequest{Roles: in.Roles, Mappings: in.Mappings, RetentionPolicies: in.RetentionPolicies, Refresh: in.Refresh, Q: in.Q, OnlyChanged: true,
 		Type: in.Type, Offset: in.Offset, Limit: in.Limit, By: principal(r).User.Username}
 	if in.OnlyChanged != nil {
 		req.OnlyChanged = *in.OnlyChanged

@@ -6,18 +6,22 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"idlifecycle/internal/model"
 )
 
 // FakeUser is an account in the Fake directory.
 type FakeUser struct {
-	GUID     string
-	DN       string
-	Sam      string
-	UPN      string
-	Enabled  bool
-	External string
-	Attrs    map[string]string
-	MemberOf []string // group DNs
+	GUID           string
+	DN             string
+	Sam            string
+	UPN            string
+	SID            string // objectSid (S-1-5-21-...); set on create
+	Enabled        bool
+	External       string
+	Attrs          map[string]string
+	MemberOf       []string // group DNs
+	ProxyAddresses []string // proxyAddresses (a link rename changes them)
 }
 
 // Fake is an in-memory directory implementing Client with the same semantics the PowerShell
@@ -114,6 +118,7 @@ func cloneUser(u *FakeUser) FakeUser {
 		c.Attrs[k] = v
 	}
 	c.MemberOf = append([]string(nil), u.MemberOf...)
+	c.ProxyAddresses = append([]string(nil), u.ProxyAddresses...)
 	return c
 }
 
@@ -168,7 +173,7 @@ func (f *Fake) Snapshot(_ context.Context, req SnapshotRequest) (*Snapshot, erro
 			attrs[p] = val
 		}
 		snap.Users = append(snap.Users, User{
-			ObjectGUID: u.GUID, DN: u.DN, Sam: u.Sam, UPN: u.UPN, Enabled: u.Enabled,
+			ObjectGUID: u.GUID, DN: u.DN, Sam: u.Sam, UPN: u.UPN, SID: u.SID, Enabled: u.Enabled,
 			ParentOU: parentOf(u.DN), ExternalID: u.External, Attributes: attrs, MemberOf: append([]string{}, u.MemberOf...),
 		})
 	}
@@ -281,7 +286,7 @@ func (f *Fake) Create(_ context.Context, o ActionOpts, items []CreateItem) ([]Re
 				continue
 			}
 			f.guid++
-			u := &FakeUser{GUID: fmt.Sprintf("guid-%04d", f.guid), DN: dn, Sam: chosen.sam, UPN: chosen.upn, Enabled: it.Enabled, External: it.ExternalID, Attrs: map[string]string{}}
+			u := &FakeUser{GUID: fmt.Sprintf("guid-%04d", f.guid), SID: fmt.Sprintf("S-1-5-21-100-200-300-%d", 1000+f.guid), DN: dn, Sam: chosen.sam, UPN: chosen.upn, Enabled: it.Enabled, External: it.ExternalID, Attrs: map[string]string{}}
 			for k, v := range it.Attributes {
 				u.Attrs[k] = v
 			}
@@ -297,7 +302,7 @@ func (f *Fake) Create(_ context.Context, o ActionOpts, items []CreateItem) ([]Re
 					missing = append(missing, g)
 				}
 			}
-			r := Result{ChangeID: it.ChangeID, Status: StatusApplied, ObjectGUID: u.GUID, DN: u.DN, Sam: u.Sam, UPN: u.UPN}
+			r := Result{ChangeID: it.ChangeID, Status: StatusApplied, ObjectGUID: u.GUID, DN: u.DN, Sam: u.Sam, UPN: u.UPN, Before: &model.BeforeState{Created: true}}
 			if len(missing) > 0 {
 				r.Status, r.Error = StatusFailed, "account created but groups not found: "+strings.Join(missing, ", ")
 			}
@@ -337,49 +342,9 @@ func (f *Fake) Update(_ context.Context, o ActionOpts, items []UpdateItem) ([]Re
 			out = append(out, *fail)
 			continue
 		}
-		changed := false
-		var missing []string
-		if o.DryRun {
-			out = append(out, Result{ChangeID: it.ChangeID, Status: StatusWould, ObjectGUID: u.GUID, DN: u.DN, Sam: u.Sam, UPN: u.UPN})
-			continue
-		}
-		for k, v := range it.Set {
-			if u.Attrs[k] != v {
-				u.Attrs[k], changed = v, true
-			}
-		}
-		for _, k := range it.Clear {
-			if _, ok := u.Attrs[k]; ok {
-				delete(u.Attrs, k)
-				changed = true
-			}
-		}
-		for _, g := range it.AddGroups {
-			if dn, ok := f.resolveGroup(g); ok {
-				before := len(u.MemberOf)
-				addMember(u, dn)
-				changed = changed || len(u.MemberOf) != before
-			} else {
-				missing = append(missing, g)
-			}
-		}
-		for _, g := range it.RemoveGroups {
-			if dn, ok := f.resolveGroup(g); ok && removeMember(u, dn) {
-				changed = true
-			}
-		}
-		if it.MoveTo != "" && !strings.EqualFold(parentOf(u.DN), it.MoveTo) {
-			u.DN = strings.SplitN(u.DN, ",", 2)[0] + "," + it.MoveTo
-			changed = true
-		}
-		r := Result{ChangeID: it.ChangeID, Status: StatusApplied, ObjectGUID: u.GUID, DN: u.DN, Sam: u.Sam, UPN: u.UPN}
-		switch {
-		case len(missing) > 0:
-			r.Status, r.Error = StatusFailed, "groups not found: "+strings.Join(missing, ", ")
-		case !changed:
-			r.Status = StatusSkipped
-		}
-		out = append(out, r)
+		out = append(out, f.runOps(u, o.DryRun, it.ChangeID, it.Expect, it.Force, fakeOps{
+			set: it.Set, clear: it.Clear, add: it.AddGroups, remove: it.RemoveGroups, moveTo: it.MoveTo, reportMissing: true,
+		}))
 	}
 	return out, nil
 }
@@ -391,6 +356,7 @@ func (f *Fake) Disable(_ context.Context, o ActionOpts, items []DisableItem) ([]
 		return nil, err
 	}
 	var out []Result
+	off := false
 	for _, it := range items {
 		if r, bad := f.failFor(it.ExternalID, it.ChangeID); bad {
 			out = append(out, r)
@@ -401,36 +367,16 @@ func (f *Fake) Disable(_ context.Context, o ActionOpts, items []DisableItem) ([]
 			out = append(out, *fail)
 			continue
 		}
-		if o.DryRun {
-			out = append(out, Result{ChangeID: it.ChangeID, Status: StatusWould, ObjectGUID: u.GUID, DN: u.DN, Sam: u.Sam, UPN: u.UPN})
-			continue
-		}
-		changed := u.Enabled
-		u.Enabled = false
-		for _, g := range it.RemoveGroups {
-			if dn, ok := f.resolveGroup(g); ok && removeMember(u, dn) {
-				changed = true
+		set := it.Set
+		if it.Description != "" {
+			set = map[string]string{"description": it.Description}
+			for k, v := range it.Set {
+				set[k] = v
 			}
 		}
-		for _, g := range it.AddGroups {
-			if dn, ok := f.resolveGroup(g); ok {
-				before := len(u.MemberOf)
-				addMember(u, dn)
-				changed = changed || len(u.MemberOf) != before
-			}
-		}
-		if it.Description != "" && u.Attrs["description"] != it.Description {
-			u.Attrs["description"], changed = it.Description, true
-		}
-		if it.MoveTo != "" && !strings.EqualFold(parentOf(u.DN), it.MoveTo) {
-			u.DN = strings.SplitN(u.DN, ",", 2)[0] + "," + it.MoveTo
-			changed = true
-		}
-		st := StatusApplied
-		if !changed {
-			st = StatusSkipped
-		}
-		out = append(out, Result{ChangeID: it.ChangeID, Status: st, ObjectGUID: u.GUID, DN: u.DN, Sam: u.Sam, UPN: u.UPN})
+		out = append(out, f.runOps(u, o.DryRun, it.ChangeID, it.Expect, it.Force, fakeOps{
+			enabled: &off, set: set, clear: it.Clear, add: it.AddGroups, remove: it.RemoveGroups, moveTo: it.MoveTo,
+		}))
 	}
 	return out, nil
 }
@@ -442,6 +388,7 @@ func (f *Fake) Enable(_ context.Context, o ActionOpts, items []EnableItem) ([]Re
 		return nil, err
 	}
 	var out []Result
+	on := true
 	for _, it := range items {
 		if r, bad := f.failFor(it.ExternalID, it.ChangeID); bad {
 			out = append(out, r)
@@ -452,33 +399,9 @@ func (f *Fake) Enable(_ context.Context, o ActionOpts, items []EnableItem) ([]Re
 			out = append(out, *fail)
 			continue
 		}
-		if o.DryRun {
-			out = append(out, Result{ChangeID: it.ChangeID, Status: StatusWould, ObjectGUID: u.GUID, DN: u.DN, Sam: u.Sam, UPN: u.UPN})
-			continue
-		}
-		changed := !u.Enabled
-		u.Enabled = true
-		for _, g := range it.RemoveGroups {
-			if dn, ok := f.resolveGroup(g); ok && removeMember(u, dn) {
-				changed = true
-			}
-		}
-		for _, g := range it.AddGroups {
-			if dn, ok := f.resolveGroup(g); ok {
-				before := len(u.MemberOf)
-				addMember(u, dn)
-				changed = changed || len(u.MemberOf) != before
-			}
-		}
-		if it.MoveTo != "" && !strings.EqualFold(parentOf(u.DN), it.MoveTo) {
-			u.DN = strings.SplitN(u.DN, ",", 2)[0] + "," + it.MoveTo
-			changed = true
-		}
-		st := StatusApplied
-		if !changed {
-			st = StatusSkipped
-		}
-		out = append(out, Result{ChangeID: it.ChangeID, Status: st, ObjectGUID: u.GUID, DN: u.DN, Sam: u.Sam, UPN: u.UPN})
+		out = append(out, f.runOps(u, o.DryRun, it.ChangeID, it.Expect, it.Force, fakeOps{
+			enabled: &on, set: it.Set, clear: it.Clear, add: it.AddGroups, remove: it.RemoveGroups, moveTo: it.MoveTo,
+		}))
 	}
 	return out, nil
 }

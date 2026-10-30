@@ -4,18 +4,89 @@ import { api } from '../api.js';
 import {
   h, replaceContent, pageHeader, pill, fmtTime, relTime, dataTable, pager, listItems, debounce,
   act, confirmDialog, noteDialog, toast, errorBox, loading, field, codeBlock, dl, pretty, truncCell,
-  formModal, notice, openModal,
+  formModal, notice, openModal, typeTag, changeTypeName,
 } from '../ui.js';
 import { ouPicker, conflictList, fieldMatches, NAME_FIELDS } from '../components.js';
+import { groupLabel, resolveCloudGroups, isCloudRef, CLOUD_PREFIX } from '../group-picker.js';
+import { requestUndo, approveUndo, approveBatch } from '../undo.js';
 
 const STATUSES = ['pending', 'approved', 'applying', 'applied', 'failed', 'rejected', 'superseded', 'simulated'];
-const TYPES = ['create', 'update', 'disable', 'enable', 'delete', 'link'];
+const TYPES = ['create', 'update', 'disable', 'enable', 'delete', 'link', 'cloud_groups', 'undo'];
+
+/** Changes whose items (attributes, groups, OU, cloud groups) can be undone one by one. */
+const ITEM_TYPES = new Set(['update', 'cloud_groups']);
+
+const undoneItemCount = (change) => (change.undone_items && typeof change.undone_items === 'object' ? Object.keys(change.undone_items).length : 0);
+
+/** Pills next to the status: rolled back (wholly or partly), or an undo waiting. */
+export function undoPills(change) {
+  const pills = [];
+  if (change.undone_by) {
+    pills.push(h('span', { class: 'pill pill-undone', 'data-test': 'undone-pill', title: `Rolled back by the undo change ${change.undone_by}` }, 'undone'));
+  }
+  else if (undoneItemCount(change) > 0) {
+    const n = undoneItemCount(change);
+    pills.push(h('span', { class: 'pill pill-partly_undone', 'data-test': 'partly-undone-pill', title: `${n} item${n === 1 ? '' : 's'} rolled back: ${Object.keys(change.undone_items).join(', ')}` }, 'partly undone'));
+  }
+  if (!change.undone_by && change.undo_pending) {
+    pills.push(h('span', { class: 'pill pill-undo_pending', 'data-test': 'undo-pending-pill', title: `Undo change ${change.undo_pending} is waiting` }, 'undo pending'));
+  }
+  return pills.length ? pills : null;
+}
+
+/** Whether to offer Undo…: whole changes once, item changes while any item may remain (the dialog says which). */
+function offersUndo(change) {
+  if (change.undone_by) {
+    return false;
+  }
+  return !change.undo_pending || ITEM_TYPES.has(change.type) || (change.type === 'undo' && ((change.payload || {}).undo || {}).script === 'set');
+}
+
+/** For an undo change: which change it rolls back. */
+function undoOfLine(change) {
+  const u = (change.payload && change.payload.undo) || {};
+  const of = u.of || change.undo_of;
+  if (change.type !== 'undo' || !of) {
+    return null;
+  }
+  return h('div', { class: 'undo-of muted', 'data-test': 'undo-of' },
+    `Undo of the ${changeTypeName(u.of_type || 'earlier')} change `,
+    h('a', { href: `#/approvals?status=&q=${encodeURIComponent(change.external_id || '')}` }, of),
+    u.requested_by ? ` (requested by ${u.requested_by})` : '',
+    Array.isArray(u.items) && u.items.length ? ` · ${u.items.length} item${u.items.length === 1 ? '' : 's'}` : '',
+    u.batch ? h('span', { 'data-test': 'undo-batch' }, ` · batch ${u.batch}`) : '');
+}
 
 const SAM_PATTERN = '[A-Za-z0-9._\\-]{1,20}';
 
 function linkOf(change) {
   const p = change.payload || {};
   return p.link && typeof p.link === 'object' ? p.link : null;
+}
+
+/** The cloud group lists of a cloud_groups change; group names are looked up for admins (the look-up is admin-only). */
+function cloudGroupsDetail(p, canResolve) {
+  const refs = (list) => (Array.isArray(list) ? list : []).map((id) => (isCloudRef(id) ? String(id) : `${CLOUD_PREFIX}${id}`));
+  const add = refs(p.cloud_add);
+  const remove = refs(p.cloud_remove);
+  const keep = refs(p.cloud_keep);
+  const box = h('div', { class: 'stack', 'data-test': 'cloud-detail' });
+  const groupList = (list, empty) => (list.length
+    ? h('ul', { class: 'summary-list' }, list.map((r) => h('li', { title: r }, groupLabel(r))))
+    : h('p', { class: 'muted' }, empty));
+  const draw = () => replaceContent(box,
+    h('h3', null, 'Cloud groups (Entra ID / Microsoft 365 / Exchange Online)'),
+    dl([
+      ['Entra user ID', p.cloud_user_id ? h('span', { class: 'mono' }, p.cloud_user_id) : ''],
+      ['Add to', groupList(add, 'none')],
+      ['Remove from', p.cloud_remove_all ? h('span', null, 'every cloud group it is a direct member of, except: ', keep.length ? keep.map(groupLabel).join(', ') : 'none') : groupList(remove, 'none')],
+    ]),
+    p.cloud_remove_all ? h('p', { class: 'help' }, 'Role-assignable groups, dynamic groups and groups synced from AD are always left alone.') : null);
+  draw();
+  if (canResolve) {
+    resolveCloudGroups([...add, ...remove, ...keep]).then((got) => got && draw());
+  }
+  return box;
 }
 
 /** Why Approve is not possible yet ('' = it is). */
@@ -97,6 +168,17 @@ export async function render(root, ctx) {
     offset: 0,
   };
   const selected = new Set();
+  const isAdmin = ctx.can('admin');
+  // Undo is offered only when the server has it and it is switched on (settings.undo).
+  let undoCfg = null;
+  try {
+    const s = await api.get('/settings');
+    undoCfg = s && s.undo && typeof s.undo === 'object' ? s.undo : null;
+  }
+  catch (e) {
+    undoCfg = null;
+  }
+  const undoOn = !!(undoCfg && undoCfg.enabled !== false);
 
   const statusSel = h('select', {
     id: 'flt-status',
@@ -110,7 +192,7 @@ export async function render(root, ctx) {
     'data-test': 'flt-type',
     value: state.type,
     onchange: () => { state.type = typeSel.value; state.offset = 0; load(); },
-  }, h('option', { value: '' }, 'All types'), TYPES.map((s) => h('option', { value: s }, s)));
+  }, h('option', { value: '' }, 'All types'), TYPES.map((s) => h('option', { value: s }, changeTypeName(s))));
 
   const search = h('input', {
     id: 'flt-q',
@@ -195,7 +277,7 @@ export async function render(root, ctx) {
         title: link ? 'Not this person' : 'Reject change',
         message: link
           ? `Rejecting records that ${link.chosen ? 'the chosen account is' : 'none of these accounts is'} ${change.display || change.external_id}. The next sync tries any remaining candidates, or proposes a new account.`
-          : `Reject ${change.type} for ${change.display || change.external_id}? It will never be applied.`,
+          : `Reject the ${changeTypeName(change.type)} change for ${change.display || change.external_id}? It will never be applied.`,
         label: 'Reason for rejection',
         required: true,
         confirmLabel: 'Reject',
@@ -221,9 +303,25 @@ export async function render(root, ctx) {
       const summary = Array.isArray(c.summary) ? c.summary : [];
       const p = c.payload || {};
       const link = linkOf(c);
+      const u = p.undo || null;
       replaceContent(box,
+        c.type === 'undo' && u ? h('div', { class: 'notice notice-warn', 'data-test': 'undo-detail' },
+          h('p', null, h('strong', null, 'This rolls back an applied change. '), undoOfLine(c)),
+          h('p', null, h('strong', null, 'Reason: '), u.reason || ''),
+          u.force ? h('p', null, h('strong', null, 'Overwrites later changes to the account.')) : null,
+          Array.isArray(u.items) && u.items.length
+            ? h('p', { 'data-test': 'undo-detail-items' }, h('strong', null, 'Only these items: '), u.items.join(', '))
+            : null,
+          Array.isArray(u.holds) && u.holds.length
+            ? h('p', null, h('strong', null, 'Made Manual when applied: '), u.holds.map((x) => `${x.kind}${x.key ? ` ${x.key}` : ''}`).join(', '))
+            : null) : null,
+        c.undone_by ? notice('info', `This change was rolled back by the undo change ${c.undone_by}.`) : null,
+        !c.undone_by && undoneItemCount(c) > 0
+          ? notice('info', 'Partly rolled back: ', Object.entries(c.undone_items).map(([k, v]) => `${k} (by ${v})`).join(', '), '. The other items are as the change left them.')
+          : null,
         link ? h('div', { class: 'stack' }, h('h3', null, 'Possible AD accounts'), linkCandidatesTable(link)) : null,
         p.needs_name ? h('div', { class: 'stack' }, h('h3', null, 'Names already taken'), conflictList(p.name_conflicts, { empty: h('p', { class: 'muted' }, 'No candidate name is free.') })) : null,
+        c.type === 'cloud_groups' ? cloudGroupsDetail(p, ctx.can('admin')) : null,
         h('div', { class: 'detail-cols' },
           h('div', null,
             h('h3', null, 'What will happen'),
@@ -458,12 +556,61 @@ export async function render(root, ctx) {
           onclick: () => reviewLink(change),
         }, !link.chosen ? 'Choose account…' : 'Review match…'));
       }
+      if (change.type === 'undo') {
+        // An undo is approved one at a time, in a dialog with a fresh dry run and a typed confirmation.
+        cell.append(h('button', {
+          type: 'button', class: 'btn btn-sm btn-danger', 'data-mutating': '', 'data-id': change.id, 'data-test': 'approve-undo',
+          onclick: async (e) => {
+            const btnEl = e.currentTarget;
+            btnEl.disabled = true;
+            try {
+              if (await approveUndo(change, { me: (ctx.user && ctx.user.username) || '', secondPerson: !!(undoCfg && undoCfg.second_person) })) {
+                await load();
+                ctx.refreshStatus();
+              }
+            }
+            finally {
+              if (btnEl.isConnected) {
+                btnEl.disabled = false;
+              }
+            }
+          },
+        }, 'Approve undo…'));
+        const batch = ((change.payload || {}).undo || {}).batch;
+        if (batch) {
+          // A run undo: every waiting undo of the batch can be approved together, after one typed "UNDO n".
+          cell.append(h('button', {
+            type: 'button', class: 'btn btn-sm btn-danger', 'data-mutating': '', 'data-batch': batch, 'data-test': 'approve-batch',
+            title: 'Approve every waiting undo of this batch (shows a fresh check of each first)',
+            onclick: (e) => act(e.currentTarget, async () => {
+              if (await approveBatch(batch, { me: (ctx.user && ctx.user.username) || '', secondPerson: !!(undoCfg && undoCfg.second_person) })) {
+                await load();
+                ctx.refreshStatus();
+              }
+            }),
+          }, 'Approve batch…'));
+        }
+      }
+      else {
+        cell.append(h('button', { type: 'button', class: blocker ? 'btn btn-sm' : 'btn btn-sm btn-primary', 'data-mutating': '', 'data-id': change.id, 'data-test': 'approve', disabled: !!blocker, title: blocker, onclick: (e) => decide(change, 'approve', e.currentTarget) }, 'Approve'));
+      }
       cell.append(
-        h('button', { type: 'button', class: blocker ? 'btn btn-sm' : 'btn btn-sm btn-primary', 'data-mutating': '', 'data-id': change.id, 'data-test': 'approve', disabled: !!blocker, title: blocker, onclick: (e) => decide(change, 'approve', e.currentTarget) }, 'Approve'),
         h('button', { type: 'button', class: 'btn btn-sm btn-danger', 'data-mutating': '', 'data-test': 'reject', onclick: (e) => decide(change, 'reject', e.currentTarget) }, change.type === 'link' ? 'Not this person…' : 'Reject…'));
     }
     else if (change.status === 'failed') {
       cell.append(h('button', { type: 'button', class: 'btn btn-sm', 'data-mutating': '', 'data-test': 'retry', onclick: (e) => decide(change, 'retry', e.currentTarget) }, 'Retry'));
+    }
+    else if (change.status === 'applied' && isAdmin && undoOn && offersUndo(change)) {
+      cell.append(h('button', {
+        type: 'button', class: 'btn btn-sm', 'data-mutating': '', 'data-id': change.id, 'data-test': 'undo',
+        title: 'Roll this change back (shows exactly what would happen first)',
+        onclick: (e) => act(e.currentTarget, async () => {
+          if (await requestUndo(change)) {
+            await load();
+            ctx.refreshStatus();
+          }
+        }),
+      }, 'Undo…'));
     }
     return cell;
   }
@@ -481,7 +628,8 @@ export async function render(root, ctx) {
     }
     const items = listItems(resp);
     const total = resp && Number.isFinite(resp.total) ? resp.total : items.length;
-    const pageIds = items.filter((c) => c.status === 'pending').map((c) => c.id);
+    // Undo changes are never bulk-approved: they have their own confirmation.
+    const pageIds = items.filter((c) => c.status === 'pending' && c.type !== 'undo').map((c) => c.id);
     for (const id of Array.from(selected)) {
       if (!pageIds.includes(id)) {
         selected.delete(id);
@@ -516,6 +664,9 @@ export async function render(root, ctx) {
           if (c.status !== 'pending') {
             return '';
           }
+          if (c.type === 'undo') {
+            return h('span', { class: 'sr-only' }, 'Undo changes are approved one at a time');
+          }
           const cb = h('input', {
             type: 'checkbox',
             checked: selected.has(c.id),
@@ -540,12 +691,12 @@ export async function render(root, ctx) {
     }
     columns.push(
       { label: 'Created', render: (c) => h('span', { title: fmtTime(c.created_at) }, relTime(c.created_at) || fmtTime(c.created_at)) },
-      { label: 'Type', render: (c) => h('span', { class: `type-tag type-${c.type}` }, c.type) },
+      { label: 'Type', render: (c) => typeTag(c.type) },
       {
         label: 'Identity',
         render: (c) => h('div', null, h('div', null, c.display || c.external_id), c.display && c.external_id ? h('div', { class: 'muted small' }, c.external_id) : null),
       },
-      { label: 'Status', render: (c) => pill(c.status) },
+      { label: 'Status', render: (c) => h('span', null, pill(c.status), ' ', undoPills(c)) },
       {
         label: 'Summary',
         render: (c) => {
@@ -553,7 +704,7 @@ export async function render(root, ctx) {
           if (s.length === 0) {
             return c.error ? truncCell(c.error, 80) : '';
           }
-          return h('div', null, truncCell(s[0], 90), s.length > 1 ? h('span', { class: 'muted small' }, ` (+${s.length - 1} more)`) : null);
+          return h('div', null, truncCell(s[0], 90), s.length > 1 ? h('span', { class: 'muted small' }, ` (+${s.length - 1} more)`) : null, undoOfLine(c));
         },
       },
       { label: 'Decided by', render: (c) => c.decided_by || '' },

@@ -709,10 +709,12 @@ function New-IDLResult {
         [AllowNull()][string]$Dn,
         [AllowNull()][string]$Sam,
         [AllowNull()][string]$Upn,
-        [AllowNull()][string]$ErrorText
+        [AllowNull()][string]$ErrorText,
+        # The account as it was before this item touched it (undo); omitted from the result when $null.
+        [AllowNull()]$Before
     )
 
-    return [ordered]@{
+    $result = [ordered]@{
         changeId   = $ChangeId
         externalId = $ExternalId
         status     = $Status
@@ -723,6 +725,12 @@ function New-IDLResult {
         upn        = $Upn
         error      = (Protect-IDLText -Text $ErrorText)
     }
+
+    if ($null -ne $Before){
+        $result['before'] = $Before
+    }
+
+    return $result
 }
 
 function Register-IDLResult {
@@ -1556,7 +1564,10 @@ function Update-IDLGroupMembership {
         [string[]]$RemoveDns = @(),
         [AllowNull()][AllowEmptyString()][string]$Server,
         [switch]$DryRun,
-        [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[string]]$Done
+        [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[string]]$Done,
+        # Optional: receive the DNs actually added / removed (or that would be, in DryRun) - the undo record.
+        [AllowNull()][System.Collections.Generic.List[string]]$Added,
+        [AllowNull()][System.Collections.Generic.List[string]]$Removed
     )
 
     $serverParams = Get-IDLServerParams -Server $Server
@@ -1576,6 +1587,10 @@ function Update-IDLGroupMembership {
         }
 
         $changes++
+        if ($null -ne $Added){
+            $Added.Add($groupDn)
+        }
+
         if ($DryRun){
             Write-IDLLog "  WOULD: add $identity to $groupDn"
             Add-IDLReportRow -Action 'AddGroupMember' -Result 'Would' -Identity $identity -ObjectIdOrDN $userDn -Details $groupDn
@@ -1596,6 +1611,10 @@ function Update-IDLGroupMembership {
         }
 
         $changes++
+        if ($null -ne $Removed){
+            $Removed.Add($groupDn)
+        }
+
         if ($DryRun){
             Write-IDLLog "  WOULD: remove $identity from $groupDn"
             Add-IDLReportRow -Action 'RemoveGroupMember' -Result 'Would' -Identity $identity -ObjectIdOrDN $userDn -Details $groupDn
@@ -1798,6 +1817,473 @@ function Get-IDLGroupDns {
         Skipped = [object[]]$skipped.ToArray()
     }
 }
+
+#region Undo support (set/clear requests, the "before" record and the expect/drift check)
+
+function Get-IDLAttributeRequestNames {
+    <#
+    .SYNOPSIS
+        The valid attribute names an item's "set" and "clear" mention (to fetch them with the account).
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()]$Item
+    )
+
+    $names = [System.Collections.Generic.List[string]]::new()
+    $setTable = Get-IDLField -Object $Item -Name 'set'
+    if ($setTable -is [System.Collections.IDictionary]){
+        foreach ($key in $setTable.Keys){
+            if (Test-IDLAttributeName -Name ([string]$key)){
+                $names.Add([string]$key)
+            }
+        }
+    }
+
+    foreach ($key in (Get-IDLStringList -Value (Get-IDLField -Object $Item -Name 'clear'))){
+        if (Test-IDLAttributeName -Name $key){
+            $names.Add($key)
+        }
+    }
+
+    return , [string[]]$names.ToArray()
+}
+
+function Get-IDLAttributeRequest {
+    <#
+    .SYNOPSIS
+        Validates an item's "set" (object of LDAP name -> non-empty value) and "clear" (names). Returns {Desired; Clear}.
+    .DESCRIPTION
+        Throws (the item fails before any change) on a bad shape, an invalid or protected name ($Blocked are extra
+        lower-case names the caller refuses, e.g. cn and the ID attribute), an empty value in set, or a name in both.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()]$Item,
+        [string[]]$Blocked = @(),
+        [string]$ScriptName = 'this script'
+    )
+
+    $setTable = Get-IDLField -Object $Item -Name 'set'
+    if (
+        ($null -ne $setTable) -and
+        ($setTable -isnot [System.Collections.IDictionary])
+    ){
+        throw "'set' must be a JSON object"
+    }
+
+    $desired = [ordered]@{}
+    if ($null -ne $setTable){
+        foreach ($key in $setTable.Keys){
+            $name = [string]$key
+            if (-not (Test-IDLAttributeName -Name $name)){
+                throw "invalid attribute name in 'set': $name"
+            }
+
+            if (
+                (Test-IDLProtectedAttribute -Name $name) -or
+                ($name.ToLowerInvariant() -in $Blocked)
+            ){
+                throw "attribute '$name' is protected and cannot be changed by $ScriptName"
+            }
+
+            $text = ConvertTo-IDLString -Value $setTable[$key]
+            if ([string]::IsNullOrEmpty($text)){
+                throw "attribute '$name' has an empty value in 'set' (use 'clear' to remove a value)"
+            }
+
+            $desired[$name] = $text
+        }
+    }
+
+    $clearNames = [System.Collections.Generic.List[string]]::new()
+    foreach ($name in (Get-IDLStringList -Value (Get-IDLField -Object $Item -Name 'clear'))){
+        if (-not (Test-IDLAttributeName -Name $name)){
+            throw "invalid attribute name in 'clear': $name"
+        }
+
+        if (
+            (Test-IDLProtectedAttribute -Name $name) -or
+            ($name.ToLowerInvariant() -in $Blocked)
+        ){
+            throw "attribute '$name' is protected and cannot be cleared by $ScriptName"
+        }
+
+        if ($desired.Contains($name)){
+            throw "attribute '$name' appears in both 'set' and 'clear'"
+        }
+
+        $clearNames.Add($name)
+    }
+
+    return [pscustomobject]@{
+        Desired = $desired
+        Clear   = [string[]]$clearNames.ToArray()
+    }
+}
+
+function Update-IDLUserAttributes {
+    <#
+    .SYNOPSIS
+        Applies only the set/clear values that differ, in ONE Set-ADUser call (honours DryRun). Returns 1 if anything
+        changed (or would), else 0. The previous value of every changed attribute ($null = was empty) goes to $Before.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$User,
+        [AllowNull()][System.Collections.IDictionary]$Desired,
+        [string[]]$ClearNames = @(),
+        [AllowNull()][AllowEmptyString()][string]$Server,
+        [switch]$DryRun,
+        [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[string]]$Done,
+        [AllowNull()][System.Collections.IDictionary]$Before
+    )
+
+    $replace = @{}
+    if ($null -ne $Desired){
+        foreach ($name in $Desired.Keys){
+            $current = Get-IDLAdValue -Object $User -Name $name
+            if ($current -cne $Desired[$name]){
+                $replace[$name] = $Desired[$name]
+                if ($null -ne $Before){
+                    $Before[$name] = $current
+                }
+            }
+        }
+    }
+
+    $clear = [System.Collections.Generic.List[string]]::new()
+    foreach ($name in $ClearNames){
+        $current = Get-IDLAdValue -Object $User -Name $name
+        if ($null -ne $current){
+            $clear.Add($name)
+            if ($null -ne $Before){
+                $Before[$name] = $current
+            }
+        }
+    }
+
+    if (($replace.Count + $clear.Count) -eq 0){
+        return 0
+    }
+
+    $identity = [string]$User.SamAccountName
+    $userDn = [string]$User.DistinguishedName
+    $detail = 'set: {0}; clear: {1}' -f (($replace.Keys | Sort-Object) -join ','), (($clear | Sort-Object) -join ',')
+    if ($DryRun){
+        Write-IDLLog "  WOULD: update attributes on $identity ($detail)"
+        Add-IDLReportRow -Action 'SetAttributes' -Result 'Would' -Identity $identity -ObjectIdOrDN $userDn -Details $detail
+        $Done.Add("would update attributes ($detail)")
+        return 1
+    }
+
+    $setParams = @{ Identity = ([guid]$User.ObjectGUID) }
+    if ($replace.Count -gt 0){
+        $setParams['Replace'] = $replace
+    }
+
+    if ($clear.Count -gt 0){
+        $setParams['Clear'] = [string[]]$clear.ToArray()
+    }
+
+    $serverParams = Get-IDLServerParams -Server $Server
+    Set-ADUser @setParams @serverParams
+    Write-IDLLog "  Updated attributes on $identity ($detail)"
+    Add-IDLReportRow -Action 'SetAttributes' -Result 'Applied' -Identity $identity -ObjectIdOrDN $userDn -Details $detail
+    $Done.Add("updated attributes ($detail)")
+    return 1
+}
+
+function New-IDLBefore {
+    <#
+    .SYNOPSIS
+        Starts the "before" record of an item (undo): the account's enabled state and DN as read, plus empty
+        attributes / groupsAdded / groupsRemoved for the item to fill in as it changes things.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$User
+    )
+
+    return [ordered]@{
+        enabled       = [bool]$User.Enabled
+        dn            = [string]$User.DistinguishedName
+        attributes    = [ordered]@{}
+        groupsAdded   = [System.Collections.Generic.List[string]]::new()
+        groupsRemoved = [System.Collections.Generic.List[string]]::new()
+    }
+}
+
+function Get-IDLExpect {
+    <#
+    .SYNOPSIS
+        Parses an item's optional "expect" object. Returns $null when absent; throws on a bad shape.
+    .DESCRIPTION
+        expect: {enabled, dn, attributes:{name: value|null}, memberOf:[], notMemberOf:[], idValue, names:{sam,upn,cn,mail}}.
+        Every key is optional. HasIdValue tells a present idValue ("" = must be unset) from an absent one.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()]$Item
+    )
+
+    $raw = Get-IDLField -Object $Item -Name 'expect'
+    if ($null -eq $raw){
+        return $null
+    }
+
+    if ($raw -isnot [System.Collections.IDictionary]){
+        throw "'expect' must be a JSON object"
+    }
+
+    $spec = [pscustomobject]@{
+        Enabled     = $null
+        Dn          = $null
+        Attributes  = [ordered]@{}
+        MemberOf    = [string[]](Get-IDLStringList -Value (Get-IDLField -Object $raw -Name 'memberOf'))
+        NotMemberOf = [string[]](Get-IDLStringList -Value (Get-IDLField -Object $raw -Name 'notMemberOf'))
+        HasIdValue  = $false
+        IdValue     = ''
+        Names       = [ordered]@{}
+    }
+
+    $enabled = Get-IDLField -Object $raw -Name 'enabled'
+    if ($null -ne $enabled){
+        if ($enabled -isnot [bool]){
+            throw 'expect.enabled must be true or false'
+        }
+
+        $spec.Enabled = $enabled
+    }
+
+    $dn = ConvertTo-IDLString -Value (Get-IDLField -Object $raw -Name 'dn')
+    if (-not [string]::IsNullOrWhiteSpace($dn)){
+        $spec.Dn = $dn.Trim()
+    }
+
+    $attributes = Get-IDLField -Object $raw -Name 'attributes'
+    if ($null -ne $attributes){
+        if ($attributes -isnot [System.Collections.IDictionary]){
+            throw 'expect.attributes must be a JSON object'
+        }
+
+        foreach ($key in $attributes.Keys){
+            if (-not (Test-IDLAttributeName -Name ([string]$key))){
+                throw "invalid attribute name in expect.attributes: $key"
+            }
+
+            $value = ConvertTo-IDLString -Value $attributes[$key]
+            $spec.Attributes[[string]$key] = (([string]::IsNullOrEmpty($value)) ? ($null) : ($value))
+        }
+    }
+
+    foreach ($key in $raw.Keys){
+        if ([string]$key -ieq 'idValue'){
+            $spec.HasIdValue = $true
+            $value = ConvertTo-IDLString -Value $raw[$key]
+            $spec.IdValue = (($null -eq $value) ? ('') : ($value.Trim()))
+        }
+    }
+
+    $names = Get-IDLField -Object $raw -Name 'names'
+    if ($null -ne $names){
+        if ($names -isnot [System.Collections.IDictionary]){
+            throw 'expect.names must be a JSON object'
+        }
+
+        foreach ($field in @('sam', 'upn', 'cn', 'mail')){
+            $value = ConvertTo-IDLString -Value (Get-IDLField -Object $names -Name $field)
+            if (-not [string]::IsNullOrWhiteSpace($value)){
+                $spec.Names[$field] = $value.Trim()
+            }
+        }
+    }
+
+    return $spec
+}
+
+function Get-IDLExpectNeeds {
+    <#
+    .SYNOPSIS
+        What the expect checks of a batch need read: account properties and groups to resolve. Returns {Properties; Groups}.
+        Items with a malformed expect are ignored here (they fail on their own later).
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()][object[]]$Items = @()
+    )
+
+    $properties = [System.Collections.Generic.List[string]]::new()
+    $groups = [System.Collections.Generic.List[string]]::new()
+    foreach ($item in $Items){
+        try{
+            $spec = Get-IDLExpect -Item $item
+        }
+        catch{
+            continue
+        }
+
+        if ($null -eq $spec){
+            continue
+        }
+
+        $properties.AddRange([string[]]@($spec.Attributes.Keys))
+        if (($spec.MemberOf.Count + $spec.NotMemberOf.Count) -gt 0){
+            $properties.Add('memberOf')
+            $groups.AddRange($spec.MemberOf)
+            $groups.AddRange($spec.NotMemberOf)
+        }
+
+        if ($spec.Names.Contains('mail')){
+            $properties.Add('mail')
+        }
+    }
+
+    return [pscustomobject]@{
+        Properties = [string[]]@($properties | Select-Object -Unique)
+        Groups     = [string[]]@($groups | Select-Object -Unique)
+    }
+}
+
+function Get-IDLDrift {
+    <#
+    .SYNOPSIS
+        Compares an account with an expect spec. Returns one text per mismatch (empty = no drift).
+    .DESCRIPTION
+        DNs and groups compare case-insensitively, attribute values and names exactly. Groups in memberOf /
+        notMemberOf may be DNs or sAMAccountNames, looked up in a Resolve-IDLGroups map.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$User,
+        [Parameter(Mandatory)]$Expect,
+        [AllowNull()]$GroupMap,
+        [Parameter(Mandatory)][string]$IdAttribute
+    )
+
+    $drift = [System.Collections.Generic.List[string]]::new()
+    $show = { param($v) (($null -eq $v) ? ('empty') : ("'$v'")) }
+
+    if ($null -ne $Expect.Enabled){
+        $actual = [bool]$User.Enabled
+        if ($actual -ne $Expect.Enabled){
+            $drift.Add(('account is {0}, expected {1}' -f (($actual) ? ('enabled') : ('disabled')), (($Expect.Enabled) ? ('enabled') : ('disabled'))))
+        }
+    }
+
+    if ($null -ne $Expect.Dn){
+        $dn = [string]$User.DistinguishedName
+        if ($dn -ine $Expect.Dn){
+            $drift.Add("account is at $dn, expected $($Expect.Dn)")
+        }
+    }
+
+    foreach ($name in $Expect.Attributes.Keys){
+        $actual = Get-IDLAdValue -Object $User -Name $name
+        $wanted = $Expect.Attributes[$name]
+        if ($actual -cne $wanted){
+            $drift.Add(('{0} is {1}, expected {2}' -f $name, (& $show $actual), (& $show $wanted)))
+        }
+    }
+
+    if (($Expect.MemberOf.Count + $Expect.NotMemberOf.Count) -gt 0){
+        $memberships = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($groupDn in (Get-IDLAdValues -Object $User -Name 'memberOf')){
+            $null = $memberships.Add($groupDn)
+        }
+
+        foreach ($group in $Expect.MemberOf){
+            if (-not $memberships.Contains((Get-IDLExpectGroupDn -Group $group -GroupMap $GroupMap))){
+                $drift.Add("no longer a member of $group")
+            }
+        }
+
+        foreach ($group in $Expect.NotMemberOf){
+            if ($memberships.Contains((Get-IDLExpectGroupDn -Group $group -GroupMap $GroupMap))){
+                $drift.Add("is a member of $group again")
+            }
+        }
+    }
+
+    if ($Expect.HasIdValue){
+        $actual = Get-IDLAdValue -Object $User -Name $IdAttribute
+        $wanted = (([string]::IsNullOrEmpty($Expect.IdValue)) ? ($null) : ($Expect.IdValue))
+        if ($actual -ine $wanted){
+            $drift.Add(('{0} is {1}, expected {2}' -f $IdAttribute, (& $show $actual), (& $show $wanted)))
+        }
+    }
+
+    $names = @{
+        sam  = Get-IDLAdValue -Object $User -Name 'SamAccountName'
+        upn  = Get-IDLAdValue -Object $User -Name 'UserPrincipalName'
+        cn   = Get-IDLAdValue -Object $User -Name 'Name'
+        mail = Get-IDLAdValue -Object $User -Name 'mail'
+    }
+    foreach ($field in $Expect.Names.Keys){
+        if ($names[$field] -cne $Expect.Names[$field]){
+            $drift.Add(('{0} is {1}, expected {2}' -f $field, (& $show $names[$field]), (& $show $Expect.Names[$field])))
+        }
+    }
+
+    return , [string[]]$drift.ToArray()
+}
+
+function Get-IDLExpectGroupDn {
+    # A group named in expect as its DN: resolved through the group map when it is a known, unambiguous group.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Group,
+        [AllowNull()]$GroupMap
+    )
+
+    if ($null -eq $GroupMap){
+        return $Group
+    }
+
+    $entry = $GroupMap[$Group]
+    if (
+        ($null -ne $entry) -and
+        $entry.Found -and
+        (-not $entry.Ambiguous)
+    ){
+        return [string]$entry.Dn
+    }
+
+    return $Group
+}
+
+function Assert-IDLExpect {
+    <#
+    .SYNOPSIS
+        Runs an item's expect check before any change: throws "drift: ..." on a mismatch (the item fails, nothing is
+        changed), unless the item has force:true (then a WARN is logged and the check is skipped).
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()]$Item,
+        [Parameter(Mandatory)]$User,
+        [AllowNull()]$GroupMap,
+        [Parameter(Mandatory)][string]$IdAttribute
+    )
+
+    $spec = Get-IDLExpect -Item $Item
+    if ($null -eq $spec){
+        return
+    }
+
+    if ([bool](Get-IDLField -Object $Item -Name 'force' -Default $false)){
+        Write-IDLLog '  expect check skipped (force)' 'WARN'
+        return
+    }
+
+    $drift = Get-IDLDrift -User $User -Expect $spec -GroupMap $GroupMap -IdAttribute $IdAttribute
+    if ($drift.Count -gt 0){
+        Add-IDLCounter -Name 'Drift'
+        throw ('drift: ' + ($drift -join '; '))
+    }
+}
+
+#endregion
 
 #region Directory ACL lockdown (used by the installer)
 
@@ -3515,7 +4001,8 @@ Export-ModuleMember -Function @(
     'Test-IDLAdConnection', 'Test-IDLContainerExists', 'Find-IDLUsersByGuid', 'Find-IDLUsersByAttribute', 'Find-IDLTakenNames',
     'Resolve-IDLTargetUsers', 'Resolve-IDLGroups', 'Update-IDLGroupMembership', 'Move-IDLUser',
     'Get-IDLProtectedAttributes', 'Get-IDLUserFields', 'Test-IDLProtectedAttribute', 'Test-IDLDnShape', 'Get-IDLGroupDns',
-    'Get-IDLPrivilegedReason', 'Test-IDLDirectoryLockedDown', 'Set-IDLDirectoryLockdown', 'Get-IDLDirectoryDacl',
+    'Get-IDLPrivilegedReason', 'Get-IDLAttributeRequestNames', 'Get-IDLAttributeRequest', 'Update-IDLUserAttributes', 'New-IDLBefore',
+    'Get-IDLExpect', 'Get-IDLExpectNeeds', 'Get-IDLDrift', 'Get-IDLExpectGroupDn', 'Assert-IDLExpect', 'Test-IDLDirectoryLockedDown', 'Set-IDLDirectoryLockdown', 'Get-IDLDirectoryDacl',
     'Get-IDLTrustedOwnerSids', 'Get-IDLOwnerSid', 'Test-IDLTrustedOwner', 'Test-IDLProcessElevated', 'Set-IDLAdministratorsOwner',
     'Test-IDLPathWithin', 'Get-IDLUnsafePathReason', 'ConvertTo-IDLAccountName', 'Get-IDLUntrustedAclReason', 'Get-IDLUntrustedTreeReason',
     'Read-IDLManifest', 'New-IDLManifestText', 'Copy-IDLReleaseFiles', 'Expand-IDLZipSafe', 'Register-IDLDsnSecrets', 'Get-IDLDsnTarget', 'Initialize-IDLProtectedDir',

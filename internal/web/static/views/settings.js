@@ -6,6 +6,7 @@ import {
   inputCheck, inputSelect, act, confirmDialog, toast, notice, linesToList, listToLines, isObject, pill,
 } from '../ui.js';
 import { previewPanel } from '../components.js';
+import { resetCloudStatus } from '../group-picker.js';
 
 const CHANGE_TYPES = [
   ['create', 'Create', 'New AD accounts for new hires.'],
@@ -14,6 +15,7 @@ const CHANGE_TYPES = [
   ['enable', 'Enable', 'Re-enable accounts (rehires).'],
   ['delete', 'Delete', 'Permanently delete accounts after the grace period.'],
   ['link', 'Link', 'Link a person to an existing AD account found by Matching. Only full, unambiguous matches are ever approved automatically; partial matches always wait for a person.'],
+  ['cloud_groups', 'Cloud group', 'Entra ID / Microsoft 365 / Exchange Online group memberships. Planned separately from the AD change of the same person, so each is approved on its own.'],
 ];
 
 const CONFLICT_MODES = [
@@ -271,6 +273,151 @@ function notificationsCard(doc, isAdmin) {
   return { el, collect };
 }
 
+// ---------------------------------------------------------------- Microsoft 365 / Entra ID (cloud groups)
+
+const CLOUD_ENVIRONMENTS = [
+  { value: 'global', label: 'Global (commercial / GCC)' },
+  { value: 'usgov', label: 'US Government (GCC High)' },
+  { value: 'usgovdod', label: 'US Government (DoD)' },
+  { value: 'china', label: 'China (operated by 21Vianet)' },
+];
+
+const CLOUD_AUTH = [
+  { value: 'certificate', label: 'Certificate (recommended; required for Exchange Online)' },
+  { value: 'secret', label: 'Client secret (Graph only)' },
+];
+
+const USER_MATCH = [
+  { value: 'sid', label: 'Security identifier (recommended)', help: 'Matches the AD account\'s objectSid to the Entra user\'s onPremisesSecurityIdentifier. Works with Entra Connect and Cloud Sync whatever the source anchor is.' },
+  { value: 'immutable_id', label: 'Immutable ID (objectGUID)', help: 'Matches the base64 objectGUID to onPremisesImmutableId. Use only when your sync uses objectGUID / ms-DS-ConsistencyGuid as the source anchor.' },
+  { value: 'upn', label: 'User principal name', help: 'Matches the AD UPN to the Entra UPN. Simple, but breaks when a UPN is changed or uses a different suffix in the cloud.' },
+];
+
+const CLOUD_CHECKS = {
+  token: 'Sign-in (token)',
+  graph_permissions: 'Graph permissions',
+  graph_read: 'Read the directory',
+  certificate: 'Certificate',
+  exchange_module: 'Exchange Online module',
+  exchange_connect: 'Exchange Online connection',
+  exchange_permissions: 'Exchange Online permissions',
+};
+
+/** The "Microsoft 365 / Entra ID" card bound to doc.cloud. Returns { el, collect }. */
+function cloudCard(doc, isAdmin) {
+  const c = section(doc, 'cloud');
+  const ex = section(c, 'exchange');
+  for (const [k, v] of [['environment', 'global'], ['auth', 'certificate'], ['user_match', 'sid']]) {
+    if (!c[k]) {
+      c[k] = v;
+    }
+  }
+  const status = h('div', { 'aria-live': 'polite', 'data-test': 'set-cloud-result' });
+
+  const thumbBox = field('Certificate thumbprint', inputText(c, 'cert_thumbprint', { class: 'mono', placeholder: '40 hexadecimal characters', 'data-test': 'set-cloud-thumb' }),
+    { help: 'The certificate in Local Computer › Personal (Cert:\\LocalMachine\\My). The service account needs Read access to its private key; New-IDLCloudCertificate.ps1 sets that up.' });
+  const secretBox = field('Client secret', inputText(c, 'client_secret', { type: 'password', autocomplete: 'new-password', 'data-test': 'set-cloud-secret' }),
+    { help: secretHelp('client secret') });
+  const secretWarn = notice('warn', 'Exchange Online accepts only a certificate. With a client secret, mail-enabled security groups and distribution lists cannot be changed.');
+  const orgBox = field('Exchange organization', inputText(ex, 'organization', { placeholder: 'contoso.onmicrosoft.com', 'data-test': 'set-cloud-org' }),
+    { help: 'The tenant\'s initial .onmicrosoft.com domain.' });
+  const matchHelp = h('p', { class: 'help', 'aria-live': 'polite', 'data-test': 'set-cloud-match-help' });
+
+  const sync = () => {
+    const cert = c.auth !== 'secret';
+    thumbBox.hidden = !cert;
+    secretBox.hidden = cert;
+    secretWarn.hidden = cert || !ex.enabled;
+    orgBox.hidden = !ex.enabled;
+    const m = USER_MATCH.find((u) => u.value === c.user_match);
+    matchHelp.textContent = m ? m.help : '';
+  };
+
+  const collect = () => {
+    for (const k of ['tenant_id', 'client_id', 'cert_thumbprint']) {
+      if (typeof c[k] === 'string') {
+        c[k] = c[k].trim();
+      }
+    }
+    if (typeof c.cert_thumbprint === 'string') {
+      // Thumbprints copied from the certificate dialog often carry spaces and an invisible mark.
+      c.cert_thumbprint = c.cert_thumbprint.replace(/[^0-9a-fA-F]/g, '').toUpperCase();
+    }
+    if (typeof ex.organization === 'string') {
+      ex.organization = ex.organization.trim();
+    }
+    return c;
+  };
+
+  const showChecks = (res) => {
+    const checks = res && Array.isArray(res.checks) ? res.checks : [];
+    const bad = checks.filter((k) => !k.ok);
+    replaceContent(status,
+      res && res.error ? notice('error', `Test failed: ${res.error}`) : null,
+      checks.length && bad.length === 0 ? notice('ok', 'Every check passed. Save the settings to use the connection.') : null,
+      checks.length && bad.length ? notice('warn', `${bad.length} of ${checks.length} checks found a problem - see below.`) : null,
+      checks.length ? h('ul', { class: 'cloud-checks', 'data-test': 'set-cloud-checks' }, checks.map((k) => h('li', { class: 'cloud-check', 'data-test': 'set-cloud-check', 'data-ok': String(Boolean(k.ok)) },
+        pill(k.ok ? (k.warning ? 'pending' : 'ok') : 'failed', k.ok ? (k.warning ? 'Warning' : 'OK') : 'Problem'),
+        h('span', { class: 'cloud-check-name' }, CLOUD_CHECKS[k.name] || k.name),
+        k.detail ? h('span', { class: 'cloud-check-detail small muted' }, k.detail) : null))) : null);
+  };
+
+  const testBtn = isAdmin ? h('button', {
+    type: 'button',
+    class: 'btn',
+    'data-test': 'set-cloud-test',
+    'data-mutating': '',
+    onclick: () => act(testBtn, async () => {
+      replaceContent(status, h('p', { class: 'muted' }, 'Checking… (connecting to Exchange Online can take half a minute)'));
+      try {
+        showChecks(await api.post('/cloud/test', { cloud: JSON.parse(JSON.stringify(collect())) }));
+      }
+      catch (e) {
+        replaceContent(status, notice('error', `Test failed: ${e.message}`));
+      }
+    }),
+  }, 'Test connection') : null;
+
+  const access = h('details', { class: 'help', 'data-test': 'set-cloud-access' },
+    h('summary', null, 'Access required (app registration in Entra ID)'),
+    h('ol', { class: 'access-list' },
+      h('li', null, 'On the server, run ', h('code', null, '.\\New-IDLCloudCertificate.ps1'), ' (elevated) from the scripts folder. It creates a certificate in Local Computer › Personal, lets the service account read its private key and exports the public ', h('code', null, '.cer'), '. Exchange Online needs a CSP (not CNG) key; the script creates one.'),
+      h('li', null, 'Entra admin center → App registrations → New registration (this organizational directory only). Certificates & secrets → upload the ', h('code', null, '.cer'), '. Copy the tenant ID and application (client) ID into this form.'),
+      h('li', null, 'API permissions → Microsoft Graph → Application permissions: ',
+        h('strong', null, 'GroupMember.ReadWrite.All'), ', ', h('strong', null, 'Group.Read.All'), ' and ', h('strong', null, 'User.Read.All'),
+        ' (Group.Read.All lets the service see whether a group is role-assignable; without it such groups are refused as unverified). Grant admin consent.'),
+      h('li', null, 'For mail-enabled security groups and distribution lists (Exchange Online): API permissions → APIs my organization uses → Office 365 Exchange Online → Application → ',
+        h('strong', null, 'Exchange.ManageAsApp'), ', admin consent. Then give the app an Exchange role: least privilege is a custom role group with the ',
+        h('strong', null, 'Distribution Groups'), ' and ', h('strong', null, 'Security Group Creation and Membership'), ' roles (', h('code', null, 'New-ServicePrincipal'), ' + ', h('code', null, 'Add-RoleGroupMember'),
+        '), or assign the Entra role ', h('strong', null, 'Exchange Recipient Administrator'), '. Install the ExchangeOnlineManagement module (3.x) for all users on this server.'),
+      h('li', null, 'Role-assignable groups, dynamic groups and groups synced from AD are never changed in the cloud: synced groups are managed through Active Directory.')),
+    h('p', null, 'The full steps are in the setup guide (section "Microsoft 365 / Entra ID groups").'));
+
+  const el = card('Microsoft 365 / Entra ID',
+    h('p', { class: 'help' }, 'Lets role rules and lifecycle groups add accounts to Entra ID security groups, Microsoft 365 groups and - through Exchange Online - mail-enabled security groups and distribution lists. Accounts are matched to their synced Entra user, so a new account gets its cloud groups on the first sync after Entra Connect has synced it.'),
+    inputCheck(c, 'enabled', 'Manage cloud group memberships', { 'data-test': 'set-cloud-enabled' }),
+    access,
+    h('div', { class: 'grid grid-2' },
+      field('Cloud', inputSelect(c, 'environment', CLOUD_ENVIRONMENTS, { 'data-test': 'set-cloud-env' })),
+      field('Directory (tenant) ID', inputText(c, 'tenant_id', { class: 'mono', placeholder: '00000000-0000-0000-0000-000000000000 or contoso.onmicrosoft.com', 'data-test': 'set-cloud-tenant' })),
+      field('Application (client) ID', inputText(c, 'client_id', { class: 'mono', placeholder: '00000000-0000-0000-0000-000000000000', 'data-test': 'set-cloud-client' })),
+      field('Authentication', inputSelect(c, 'auth', CLOUD_AUTH, { onchange: sync, 'data-test': 'set-cloud-auth' })),
+      thumbBox,
+      secretBox),
+    field('Match AD accounts to Entra users by', inputSelect(c, 'user_match', USER_MATCH.map(({ value, label }) => ({ value, label })), { onchange: sync, 'data-test': 'set-cloud-match' })),
+    matchHelp,
+    h('h3', null, 'Exchange Online'),
+    inputCheck(ex, 'enabled', 'Also manage mail-enabled security groups and distribution lists (Exchange Online)', { onchange: sync, 'data-test': 'set-cloud-exchange' }),
+    secretWarn,
+    orgBox,
+    testBtn ? h('div', { class: 'row-gap' }, testBtn,
+      h('span', { class: 'help' }, `Uses the values in this form, even unsaved ones. "${MASKED}" uses the saved secret.`)) : null,
+    status);
+
+  sync();
+  return { el, collect };
+}
+
 // ---------------------------------------------------------------- sign-in (Entra ID)
 
 const CALLBACK_PATH = '/api/auth/oidc/callback';
@@ -519,7 +666,8 @@ export async function render(root, ctx) {
     };
     const rows = CHANGE_TYPES.map(([key, label, help]) => {
       if (!approval[key]) {
-        approval[key] = 'manual';
+        // Cloud group changes follow the update policy until someone sets them.
+        approval[key] = key === 'cloud_groups' ? (approval.update || 'manual') : 'manual';
       }
       const sel = inputSelect(approval, key, [
         { value: 'manual', label: 'manual - a human must approve' },
@@ -558,6 +706,22 @@ export async function render(root, ctx) {
       h('div', { class: 'quick-toggle' }, allAutoToggle,
         h('p', { class: 'help' }, 'Quick switch: sets every type below to auto (or back to manual).')),
       h('div', { class: 'grid grid-2' }, rows));
+
+    // ---- undo (only when the server reports the setting)
+    let undoCard = null;
+    if (isObject(doc.undo)) {
+      const undo = doc.undo;
+      if (undo.enabled === undefined) {
+        undo.enabled = true;
+      }
+      const undoToggle = inputCheck(undo, 'enabled', 'Allow administrators to undo applied changes', { 'data-test': 'set-undo-enabled' });
+      const secondToggle = inputCheck(undo, 'second_person', 'Require a second person to approve an undo', { 'data-test': 'set-undo-second' });
+      undoCard = card('Undo',
+        h('p', { class: 'help' }, 'An administrator can roll back one applied AD or group change from Approvals. Every undo shows a live dry run first, needs a reason and a typed confirmation, and waits in Approvals: it is never approved automatically. Deletes cannot be undone.'),
+        undoToggle,
+        secondToggle,
+        h('p', { class: 'help' }, 'With a second person required, whoever requested the undo cannot approve it.'));
+    }
 
     // ---- engine
     const dryToggle = inputCheck(engine, 'dry_run', 'Dry run (plan and simulate only; never write to Active Directory)', { 'data-test': 'set-dry-run' });
@@ -700,6 +864,7 @@ export async function render(root, ctx) {
     syncPwMode();
 
     const notifyCard = notificationsCard(doc, isAdmin);
+    const cloudCardObj = cloudCard(doc, isAdmin);
     const authCard = signInCard(doc, isAdmin);
     const backupCard = backupsCard(doc, isAdmin);
 
@@ -713,6 +878,7 @@ export async function render(root, ctx) {
         act(saveBtn, async () => {
           ad.search_bases = linesToList(view.bases);
           notifyCard.collect();
+          cloudCardObj.collect();
           authCard.collect();
           for (const [sec, key] of [[schedule, 'interval_minutes'], [engine, 'max_destructive_per_run'], [engine, 'delete_after_days'], [engine, 'max_deletes_per_run'], [engine, 'max_deletes_per_day'], [naming, 'max_candidates'], [naming, 'conflict_random_digits'], [newUser, 'password_length'], [section(doc, 'backup'), 'interval_hours'], [section(doc, 'backup'), 'keep']]) {
             if (sec[key] === '') {
@@ -720,6 +886,7 @@ export async function render(root, ctx) {
             }
           }
           const saved = await api.put('/settings', doc);
+          resetCloudStatus();
           toast('Settings saved.', 'ok');
           ctx.refreshStatus();
           if (isObject(saved) && isObject(saved.engine)) {
@@ -732,7 +899,7 @@ export async function render(root, ctx) {
       },
     },
     isAdmin ? null : notice('info', 'Read-only: only administrators can change settings. Your role is ', pill(ctx.role), '.'),
-    h('fieldset', { class: 'plain', disabled: !isAdmin }, h('div', { class: 'stack' }, scheduleCard, approvalCard, engineCard, adCard, namingCard, newUserCard, notifyCard.el, authCard.el, backupCard.el)),
+    h('fieldset', { class: 'plain', disabled: !isAdmin }, h('div', { class: 'stack' }, scheduleCard, approvalCard, undoCard, engineCard, adCard, cloudCardObj.el, namingCard, newUserCard, notifyCard.el, authCard.el, backupCard.el)),
     isAdmin ? h('div', { class: 'savebar' }, reloadBtn, h('span', { class: 'spacer' }), saveBtn) : null);
 
     replaceContent(body, form);

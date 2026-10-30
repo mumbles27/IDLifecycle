@@ -28,6 +28,8 @@ type ApprovalSettings struct {
 	Delete  string `json:"delete"`
 	// Link: a full, unambiguous correlation match (other links always wait for a person).
 	Link string `json:"link"`
+	// CloudGroups: Entra ID / Microsoft 365 group membership changes (default: the value of update).
+	CloudGroups string `json:"cloud_groups"`
 }
 
 // For returns the approval mode ("manual" | "auto") for a change type.
@@ -45,6 +47,8 @@ func (a ApprovalSettings) For(changeType string) string {
 		return a.Delete
 	case ChangeLink:
 		return a.Link
+	case ChangeCloudGroups:
+		return a.CloudGroups
 	}
 	return "manual"
 }
@@ -212,6 +216,10 @@ type LifecycleGroups struct {
 
 // ApplyDefaults fills values derived from older settings documents (call after loading a stored document).
 func (s *Settings) ApplyDefaults() {
+	if s.Approval.CloudGroups == "" {
+		s.Approval.CloudGroups = s.Approval.Update
+	}
+	s.Cloud.applyDefaults()
 	l := &s.Lifecycle
 	if l.DisabledRemove == "" {
 		l.DisabledRemove = DisabledRemoveNone
@@ -242,6 +250,13 @@ func (l *LifecycleGroups) validate() error {
 			}
 			if len(g) > 512 || strings.ContainsAny(g, "\r\n") {
 				return fmt.Errorf("lifecycle_groups.%s: %q is not a group name or DN", name, g)
+			}
+			if IsCloudGroupRef(g) {
+				id, ok := CloudGroupID(g)
+				if !ok {
+					return fmt.Errorf("lifecycle_groups.%s: %q is not a cloud group reference (entra:<group object id>)", name, g)
+				}
+				g = CloudGroupPrefix + id
 			}
 			seen[strings.ToLower(g)] = true
 			clean = append(clean, g)
@@ -361,6 +376,8 @@ type Settings struct {
 	Placement PlacementSettings   `json:"placement"`
 	Correlate CorrelationSettings `json:"correlation"`
 	Lifecycle LifecycleGroups     `json:"lifecycle_groups"`
+	Cloud     CloudSettings       `json:"cloud"`
+	Undo      UndoSettings        `json:"undo"`
 }
 
 // DefaultSettings are deliberately conservative: dry-run on, everything manual.
@@ -397,6 +414,8 @@ func DefaultSettings() Settings {
 			},
 			Rename: RenameTransitions, MaxAutoLinksPerRun: 25, ReportUncorrelated: true, IgnoreAccounts: []string{},
 		},
+		Cloud: DefaultCloud(),
+		Undo:  UndoSettings{Enabled: true},
 	}
 }
 
@@ -439,9 +458,12 @@ func (s *Settings) Validate() error {
 	if s.Approval.Link == "" {
 		s.Approval.Link = DefaultSettings().Approval.Link
 	}
+	if s.Approval.CloudGroups == "" {
+		s.Approval.CloudGroups = s.Approval.Update
+	}
 	for name, v := range map[string]string{
 		"create": s.Approval.Create, "update": s.Approval.Update, "disable": s.Approval.Disable,
-		"enable": s.Approval.Enable, "delete": s.Approval.Delete, "link": s.Approval.Link,
+		"enable": s.Approval.Enable, "delete": s.Approval.Delete, "link": s.Approval.Link, "cloud_groups": s.Approval.CloudGroups,
 	} {
 		if v != "manual" && v != "auto" {
 			return fmt.Errorf("approval.%s must be manual or auto", name)
@@ -515,6 +537,9 @@ func (s *Settings) Validate() error {
 	}
 	// The old switch follows the new mode, for anything that still reads it.
 	s.AD.StripGroupsOnDisable = s.Lifecycle.DisabledRemove != DisabledRemoveNone
+	if err := s.Cloud.Validate(); err != nil {
+		return err
+	}
 
 	pl := &s.Placement
 	pl.Field = strings.TrimSpace(pl.Field)

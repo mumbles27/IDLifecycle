@@ -27,6 +27,11 @@ const (
 	ChangeDelete  = "delete"
 	// ChangeLink hands an existing AD account to an identity (correlation): sets the id attribute, optionally renames.
 	ChangeLink = "link"
+	// ChangeCloudGroups changes a person's Entra ID / Microsoft 365 / Exchange Online group memberships (separate from
+	// the AD change of the same person, so the two are approved and fail independently).
+	ChangeCloudGroups = "cloud_groups"
+	// ChangeUndo rolls back one applied change (always approved by a person; see UndoPayload).
+	ChangeUndo = "undo"
 )
 
 // Change statuses.
@@ -98,6 +103,11 @@ type SourceOptions struct {
 	TerminatedValues       []string `json:"terminated_values"`
 	MissingMeansTerminated bool     `json:"missing_means_terminated"`
 	MissingGraceRuns       int      `json:"missing_grace_runs"`
+	// Termination date: a person counts as terminated once the date in TerminationDateField (plus TerminationAfterDays)
+	// has passed, in schedule.timezone. TerminationDateFormat is "" or "auto" (common formats) or a Go layout.
+	TerminationDateField  string `json:"termination_date_field"`
+	TerminationDateFormat string `json:"termination_date_format"`
+	TerminationAfterDays  int    `json:"termination_after_days"`
 }
 
 type Source struct {
@@ -197,6 +207,10 @@ type Identity struct {
 	MergedInto   string   `json:"merged_into,omitempty"`
 	LinkRejects  []string `json:"link_rejects,omitempty"`
 	LinkDecision string   `json:"link_decision,omitempty"`
+	// RetentionPolicyID is a retention policy a person assigned to this identity ("" = automatic, "default" = the
+	// default policy); RetentionAssignedBy is who did. Set only by SetIdentityRetention, never by a sync.
+	RetentionPolicyID   string `json:"retention_policy_id,omitempty"`
+	RetentionAssignedBy string `json:"retention_assigned_by,omitempty"`
 }
 
 // Identity.LinkDecision values.
@@ -313,6 +327,15 @@ type ChangePayload struct {
 	NameConflicts []NameConflict `json:"name_conflicts,omitempty"`
 	// Link (change type link): ObjectGUID/DN are the chosen account.
 	Link *LinkPayload `json:"link,omitempty"`
+	// Cloud groups (change type cloud_groups): the Entra user and group object ids. CloudRemoveAll removes every
+	// direct cloud membership the user has except CloudKeep (a disable with lifecycle_groups.disabled_remove all_except).
+	CloudUserID    string   `json:"cloud_user_id,omitempty"`
+	CloudAdd       []string `json:"cloud_add,omitempty"`
+	CloudRemove    []string `json:"cloud_remove,omitempty"`
+	CloudRemoveAll bool     `json:"cloud_remove_all,omitempty"`
+	CloudKeep      []string `json:"cloud_keep,omitempty"`
+	// Undo (change type undo): what is rolled back and how; the inverse operations use the fields above.
+	Undo *UndoPayload `json:"undo,omitempty"`
 }
 
 type Change struct {
@@ -333,6 +356,17 @@ type Change struct {
 	AppliedAt    *time.Time    `json:"applied_at"`
 	Error        string        `json:"error"`
 	Attempts     int           `json:"attempts"`
+	// Undo bookkeeping (filled by the store when a change is read, never part of the payload hash):
+	// AppliedState is what the account looked like before this change, UndoneBy the undo change that rolled it back,
+	// UndoPending an undo waiting for approval or running, UndoOf the change an undo change rolls back.
+	AppliedState *AppliedState `json:"applied_state,omitempty"`
+	UndoneBy     string        `json:"undone_by,omitempty"`
+	UndoPending  string        `json:"undo_pending,omitempty"`
+	UndoOf       string        `json:"undo_of,omitempty"`
+	// Per-item undo of an update / cloud_groups change: the parts already undone and the parts an open undo covers
+	// (item key -> undo change id). UndoneBy is set once every part is undone; UndoPending only for a whole-change undo.
+	UndoneItems      map[string]string `json:"undone_items,omitempty"`
+	UndoPendingItems map[string]string `json:"undo_pending_items,omitempty"`
 }
 
 type Run struct {

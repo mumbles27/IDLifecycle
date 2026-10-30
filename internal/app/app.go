@@ -21,6 +21,7 @@ import (
 	"idlifecycle/internal/ad"
 	"idlifecycle/internal/api"
 	"idlifecycle/internal/backup"
+	"idlifecycle/internal/cloud"
 	"idlifecycle/internal/config"
 	"idlifecycle/internal/datadir"
 	"idlifecycle/internal/engine"
@@ -127,6 +128,7 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error)
 
 	notifier := &notify.Service{Settings: st.GetSettings, Cipher: cipher, Log: log}
 	eng := engine.New(st, pwsh, cipher, log)
+	eng.Cloud = cloud.NewPowerShell(pwsh)
 	eng.Notifier = notifier
 	if err := eng.Recover(ctx); err != nil {
 		_ = st.Close()

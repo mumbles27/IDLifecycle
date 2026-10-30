@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"idlifecycle/internal/ad"
+	"idlifecycle/internal/cloud"
 	"idlifecycle/internal/model"
 	"idlifecycle/internal/secrets"
 	"idlifecycle/internal/store"
@@ -22,12 +23,16 @@ import (
 var (
 	ErrRunning = errors.New("a sync run is already in progress")
 	ErrInvalid = errors.New("invalid request")
+	// ErrForbidden: the request is valid but this person may not do it (an undo they requested themselves).
+	ErrForbidden = errors.New("not allowed")
 )
 
 // Engine orchestrates sync runs and executes approved changes. Both are single-flight.
 type Engine struct {
-	Store  *store.Store
-	AD     ad.Client
+	Store *store.Store
+	AD    ad.Client
+	// Cloud changes Entra ID / Microsoft 365 group memberships (optional; nil = no cloud groups).
+	Cloud  cloud.Client
 	Cipher *secrets.Cipher
 	Log    *slog.Logger
 	Now    func() time.Time
@@ -41,6 +46,7 @@ type Engine struct {
 
 	snapMu     sync.Mutex
 	snapCache  *cachedSnapshot // the last AD snapshot (sync or impact preview), reused by previews
+	cloudCache *cachedCloud    // the last cloud snapshot, likewise
 	previewing atomic.Bool
 
 	runCtx    context.Context
@@ -205,6 +211,10 @@ func (e *Engine) sync(ctx context.Context, run *model.Run, notes *runNotes) erro
 		return err
 	}
 
+	loc, err := time.LoadLocation(settings.Schedule.Timezone)
+	if err != nil || settings.Schedule.Timezone == "" {
+		loc = time.UTC
+	}
 	// 1. ingest every enabled source (failures are isolated per source).
 	var idents []model.Identity
 	var srcErrs []string
@@ -214,7 +224,7 @@ func (e *Engine) sync(ctx context.Context, run *model.Run, notes *runNotes) erro
 			continue
 		}
 		enabled++
-		list, err := e.ingest(ctx, s, cnt)
+		list, err := e.ingest(ctx, s, cnt, loc, notes)
 		if err != nil {
 			cnt["source_errors"]++
 			srcErrs = append(srcErrs, fmt.Sprintf("source %q: %v", s.Name, err))
@@ -237,7 +247,15 @@ func (e *Engine) sync(ctx context.Context, run *model.Run, notes *runNotes) erro
 	cnt["identities"] = len(idents)
 
 	// 2. AD snapshot (kept for the impact preview).
-	cfg := planConfig{Settings: settings, Mappings: mappings, Rules: rules}
+	holds, err := st.ActiveHolds(ctx, e.Now())
+	if err != nil {
+		return err
+	}
+	retention, err := st.ListRetentionPolicies(ctx)
+	if err != nil {
+		return err
+	}
+	cfg := planConfig{Settings: settings, Mappings: mappings, Rules: rules, Holds: holds, Retention: retention, Sources: srcs}
 	req := snapshotRequestFor(cfg)
 	snap, err := e.AD.Snapshot(ctx, req)
 	if err != nil {
@@ -245,8 +263,24 @@ func (e *Engine) sync(ctx context.Context, run *model.Run, notes *runNotes) erro
 	}
 	e.cacheSnapshot(req, snap)
 
+	// 2b. Entra ID snapshot for cloud groups. A failure only stops cloud changes this run; AD work goes on.
+	var cv *cloudView
+	cloudFailed := false
+	if needsCloud(cfg) {
+		if cv, _, err = e.cloudSnapshot(ctx, settings, cloudGroupIDs(cfg), false); err != nil {
+			cloudFailed, cv = true, nil
+			cnt["warnings"]++
+			cnt["cloud_errors"]++
+			e.Log.Error("cloud snapshot failed; no cloud group changes this run", "error", err)
+			if run.Error != "" {
+				run.Error += "; "
+			}
+			run.Error += "Microsoft 365 groups: " + err.Error() + " (no cloud group changes this run)"
+		}
+	}
+
 	// 3. correlate, link + plan (pure), then persist what changed on the identities.
-	pass, err := planEveryone(cfg, snap, idents, e.Now(), cnt, func(msg string, args ...any) { e.Log.Warn(msg, args...) })
+	pass, err := planEveryone(cfg, snap, cv, idents, e.Now(), cnt, func(msg string, args ...any) { e.Log.Warn(msg, args...) })
 	if err != nil {
 		return err
 	}
@@ -255,11 +289,22 @@ func (e *Engine) sync(ctx context.Context, run *model.Run, notes *runNotes) erro
 			return fmt.Errorf("update identity %s: %w", id.ExternalID, err)
 		}
 	}
+	for _, ev := range pass.events {
+		e.audit(ctx, "system", ev.action, "identity", ev.identityID, ev.detail)
+	}
 	pc, plans, processed, decided, planErrs := pass.pc, pass.plans, pass.processed, pass.decided, pass.errList
+	e.recordSuppressed(ctx, holds, pc.Suppressed)
+	e.recordRetention(ctx, pc, pass.byID)
+	if n := len(pc.ManualLeft); n > 0 {
+		cnt["manual_not_disabled"] = n
+		notes.issues = append(notes.issues, fmt.Sprintf("%d person(s) who left the source are Manual and were not disabled. Set them back to Auto on their page under Identities, or disable them by hand:", n))
+		notes.issues = append(notes.issues, pc.ManualLeft...)
+	}
 	for _, w := range e.checkNames(ctx, settings, plans) {
 		cnt["warnings"]++
 		e.Log.Warn("name check", "warning", w)
 	}
+	plans = append(plans[:len(plans):len(plans)], pass.cloud...)
 
 	if len(planErrs) > 0 {
 		shown := planErrs
@@ -352,7 +397,7 @@ func (e *Engine) sync(ctx context.Context, run *model.Run, notes *runNotes) erro
 		}
 		destructiveChange := p.Type == model.ChangeDisable || p.Type == model.ChangeDelete
 		var holds []string
-		if held && destructiveChange {
+		if held && (destructiveChange || (cloudRemovals(p) && !pl.id.Active)) {
 			holds = append(holds, fmt.Sprintf("HELD for manual approval: %d disables/deletes in one run exceeds the limit of %d", destructive, settings.Engine.MaxDestructivePerRun))
 		}
 		if p.Payload.NeedsOU {
@@ -360,6 +405,9 @@ func (e *Engine) sync(ctx context.Context, run *model.Run, notes *runNotes) erro
 		}
 		if heldDeletes && p.Type == model.ChangeDelete {
 			holds = append(holds, fmt.Sprintf("HELD for manual approval: %d deletes in one run exceeds the limit of %d", deletes, settings.Engine.MaxDeletesPerRun))
+		}
+		if p.manualPolicy != "" && p.Type == model.ChangeDelete {
+			holds = append(holds, fmt.Sprintf("HELD for manual approval: retention policy %q requires a person to approve deletes", p.manualPolicy))
 		}
 		if p.Payload.NeedsName {
 			holds = append(holds, "WAITING for a username: choose one with Set name, then approve")
@@ -401,7 +449,7 @@ func (e *Engine) sync(ctx context.Context, run *model.Run, notes *runNotes) erro
 		}
 		cnt["planned_"+p.Type]++
 		keep[c.ID] = true
-		e.audit(ctx, "system", "change.create", "change", c.ID, map[string]any{"type": c.Type, "status": c.Status, "external_id": c.ExternalID, "run": run.ID})
+		e.audit(ctx, "system", "change.create", "change", c.ID, map[string]any{"type": c.Type, "status": c.Status, "external_id": c.ExternalID, "identity_id": c.IdentityID, "run": run.ID})
 
 		// A newer plan for the same identity+type replaces earlier pending/simulated ones.
 		for _, oc := range openBy[k] {
@@ -415,8 +463,14 @@ func (e *Engine) sync(ctx context.Context, run *model.Run, notes *runNotes) erro
 	// obsolete - including approved ones that have not run yet (e.g. approved during dry-run): applying a
 	// decision about a state that no longer exists is how a rehire gets disabled.
 	for _, oc := range open {
+		if oc.Type == model.ChangeUndo {
+			continue // an undo is a person's decision about one applied change, not a plan of this run
+		}
 		stale := oc.Status == model.StatusPending || oc.Status == model.StatusSimulated ||
 			(oc.Status == model.StatusApproved && decided[oc.IdentityID]) // a plan error is not a verdict
+		if oc.Type == model.ChangeCloudGroups && cloudFailed {
+			continue // nothing was planned for the cloud this run: that is not a verdict either
+		}
 		if stale && processed[oc.IdentityID] && !keep[oc.ID] {
 			e.supersede(ctx, oc, cnt)
 		}
@@ -486,15 +540,26 @@ func displayName(attrs map[string]string, fallback string) string {
 
 // snapshotBases returns the search bases plus the disabled-accounts OU (when it lies outside them),
 // otherwise a disabled account would drop out of view the moment it is moved there.
-func snapshotBases(a model.ADSettings) []string {
+// snapshotBases are the search bases plus every OU disabled accounts are moved to (ad.disabled_ou and the retention
+// policies' own), unless a search base already covers it: a disabled account must stay visible, or it would look
+// deleted.
+func snapshotBases(a model.ADSettings, extra ...string) []string {
 	bases := append([]string(nil), a.SearchBases...)
-	if a.DisabledOU == "" {
-		return bases
-	}
-	for _, b := range bases {
-		if strings.EqualFold(a.DisabledOU, b) || strings.HasSuffix(strings.ToLower(a.DisabledOU), ","+strings.ToLower(b)) {
-			return bases
+	for _, ou := range append([]string{a.DisabledOU}, extra...) {
+		ou = strings.TrimSpace(ou)
+		if ou == "" {
+			continue
+		}
+		covered := false
+		for _, b := range bases {
+			if strings.EqualFold(ou, b) || strings.HasSuffix(strings.ToLower(ou), ","+strings.ToLower(b)) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			bases = append(bases, ou)
 		}
 	}
-	return append(bases, a.DisabledOU)
+	return bases
 }

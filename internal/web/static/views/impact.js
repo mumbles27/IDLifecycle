@@ -1,5 +1,5 @@
-// Impact preview: what the next sync would do to every person - and, with a proposal (unsaved role rules, mappings or
-// settings), what would change compared with the saved configuration. A page of its own and a panel the editors open.
+// Impact preview: what the next sync would do to every person - and, with a proposal (unsaved role rules, mappings,
+// retention policies or settings), what would change compared with the saved configuration. A page of its own and a panel the editors open.
 
 import { api } from '../api.js';
 import {
@@ -15,6 +15,7 @@ const TYPE_LABELS = {
   enable: 'enable account',
   delete: 'delete account',
   link: 'link to an existing account',
+  cloud_groups: 'change cloud groups',
   error: 'cannot be planned',
 };
 
@@ -100,7 +101,7 @@ function countChips(list, kind) {
 
 /**
  * impactPanel({ proposal, onlyChanged }) -> { el, load }
- * proposal: { roles?, mappings?, settings? } - the unsaved configuration; {} means "what the next sync would do".
+ * proposal: { roles?, mappings?, retention_policies?, settings? } - the unsaved configuration; {} means "what the next sync would do".
  */
 export function impactPanel({ proposal = {}, onlyChanged = true } = {}) {
   const hasProposal = Object.keys(proposal).length > 0;

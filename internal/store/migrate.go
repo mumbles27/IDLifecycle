@@ -242,6 +242,72 @@ var migrations = []struct {
 			updated_at {TS} NOT NULL){OPTS}`,
 		`CREATE UNIQUE INDEX ux_manual_src_ext ON manual_people (source_id, external_id)`,
 	}},
+	// Undo: the state each applied change found (so it can be rolled back) and the undo that rolled it back; holds that
+	// stop the planner from redoing what a person rolled back.
+	{5, []string{
+		`CREATE TABLE change_undo (
+			change_id {ID} NOT NULL PRIMARY KEY,
+			applied_state {TEXT} NOT NULL,
+			undone_by {ID} NOT NULL,
+			updated_at {TS} NOT NULL){OPTS}`,
+		`CREATE TABLE identity_holds (
+			id {ID} NOT NULL PRIMARY KEY,
+			identity_id {ID} NOT NULL,
+			kind VARCHAR(20) NOT NULL,
+			hold_key {STR} NOT NULL,
+			until_at {TS} NOT NULL,
+			reason {TEXT} NOT NULL,
+			created_by {STR} NOT NULL,
+			created_at {TS} NOT NULL,
+			change_id {ID} NOT NULL){OPTS}`,
+		`CREATE INDEX ix_identity_holds_identity ON identity_holds (identity_id)`,
+	}},
+	// History per object: an identity's (or a source's, a role's...) audit rows are looked up by entity.
+	{6, []string{
+		`CREATE INDEX ix_audit_entity ON audit_log (entity_type, entity_id)`,
+	}},
+	// Undo per item (the parts of a change already rolled back) and what a Manual pin kept the planner from doing.
+	{7, []string{
+		`CREATE TABLE change_undo_items (
+			id {ID} NOT NULL PRIMARY KEY,
+			change_id {ID} NOT NULL,
+			item_key {TEXT} NOT NULL,
+			undo_change_id {ID} NOT NULL,
+			created_at {TS} NOT NULL){OPTS}`,
+		`CREATE INDEX ix_change_undo_items_change ON change_undo_items (change_id)`,
+		`CREATE TABLE identity_hold_state (
+			hold_id {ID} NOT NULL PRIMARY KEY,
+			suppressed {TEXT} NOT NULL,
+			updated_at {TS} NOT NULL){OPTS}`,
+	}},
+	// Retention: policies for leavers (how long a disabled account is kept, where it goes), a policy a person assigned to
+	// an identity, and the policy a sync resolved for each identity with its delete date.
+	{8, []string{
+		`CREATE TABLE retention_policies (
+			id {ID} NOT NULL PRIMARY KEY,
+			name {STR} NOT NULL,
+			description {TEXT} NOT NULL,
+			enabled {INT} NOT NULL,
+			priority {INT} NOT NULL,
+			match_mode VARCHAR(10) NOT NULL,
+			conditions_json {TEXT} NOT NULL,
+			delete_after_days {INT} NOT NULL,
+			disabled_ou {TEXT} NOT NULL,
+			keep_groups_json {TEXT} NOT NULL,
+			approval VARCHAR(20) NOT NULL,
+			created_at {TS} NOT NULL,
+			updated_at {TS} NOT NULL){OPTS}`,
+		`CREATE UNIQUE INDEX ux_retention_policies_name ON retention_policies (name)`,
+		`ALTER TABLE identities {ADDCOL} retention_policy_id {ID} NOT NULL DEFAULT ''`,
+		`ALTER TABLE identities {ADDCOL} retention_assigned_by {STR} NOT NULL DEFAULT ''`,
+		`CREATE TABLE identity_retention (
+			identity_id {ID} NOT NULL PRIMARY KEY,
+			policy_id {ID} NOT NULL,
+			policy_name {STR} NOT NULL,
+			reason VARCHAR(20) NOT NULL,
+			delete_due {TS} NOT NULL,
+			resolved_at {TS} NOT NULL){OPTS}`,
+	}},
 }
 
 // db2MigrationsExists checks the catalog: CREATE TABLE IF NOT EXISTS is not available on

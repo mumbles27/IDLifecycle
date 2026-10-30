@@ -7,16 +7,26 @@ import {
 } from '../ui.js';
 
 // Category -> action filter added to the query (q syntax: action:<prefix>*).
+// What people did in the console: everything except the service itself, accounts created at Entra ID sign-in and
+// failed sign-ins of unknown names (those are under Sign-ins).
+const CONSOLE_ACTIVITY = '-actor:system -actor:oidc -actor:anonymous';
+
 const CATEGORIES = [
   ['', 'Everything'],
+  [CONSOLE_ACTIVITY, 'Console activity (what people did)'],
+  ['action:auth.login action:auth.login_failed action:auth.logout', 'Sign-ins'],
   ['action:change.*', 'Changes (proposals, approvals, AD results)'],
+  ['action:identity.*', 'People (identity events)'],
   ['action:sync.*', 'Sync runs'],
-  ['action:auth.*', 'Sign-in and sessions'],
+  ['action:auth.*', 'Sign-in and sessions (all)'],
   ['action:settings.* action:mapping.* action:role.* action:source.*', 'Configuration'],
   ['action:user.*', 'GUI users'],
   ['action:backup.*', 'Backups and restores'],
   ['action:service.* action:notifications.*', 'Service and notifications'],
 ];
+
+// ?preset=... links (e.g. from the dashboard or the docs) pick a category.
+const PRESETS = { console: CONSOLE_ACTIVITY, signins: CATEGORIES[2][0] };
 
 const RANGES = [
   ['', 'Any time'],
@@ -37,10 +47,38 @@ const HELP = [
   ['since:7d   since:2026-10-01   before:2026-10-25T08:00', 'a time range (your local time)'],
 ];
 
+const shown = (v) => {
+  if (v === null || v === undefined || v === '') {
+    return h('span', { class: 'muted' }, '(empty)');
+  }
+  return h('span', { class: 'mono small wrap' }, typeof v === 'string' ? v : cellText(v));
+};
+
+/** `changes: {field: {from, to}}` from a create/update entry as a field / before / after table (secrets: "changed"). */
+export function changesTable(changes) {
+  if (!changes || typeof changes !== 'object' || Array.isArray(changes) || Object.keys(changes).length === 0) {
+    return null;
+  }
+  const rows = Object.entries(changes).sort((x, y) => x[0].localeCompare(y[0]));
+  return h('table', { class: 'data compact audit-changes', 'data-test': 'audit-changes' },
+    h('caption', { class: 'sr-only' }, 'What changed'),
+    h('thead', null, h('tr', null, h('th', null, 'Field'), h('th', null, 'Before'), h('th', null, 'After'))),
+    h('tbody', null, rows.map(([k, v]) => {
+      const secret = v && typeof v === 'object' && v.changed === true && !('from' in v) && !('to' in v);
+      const pair = v && typeof v === 'object' && ('from' in v || 'to' in v);
+      return h('tr', null,
+        h('td', null, h('code', null, k)),
+        secret
+          ? h('td', { colspan: '2', class: 'muted' }, 'changed (secret value not recorded)')
+          : h('td', null, shown(pair ? v.from : undefined)),
+        secret ? null : h('td', null, shown(pair ? v.to : v)));
+    })));
+}
+
 export async function render(root, ctx) {
   const state = {
     q: ctx.query.get('q') || '',
-    category: '',
+    category: PRESETS[ctx.query.get('preset')] || '',
     range: '',
     errors: ctx.query.get('errors') === '1',
     limit: 50,
@@ -76,6 +114,11 @@ export async function render(root, ctx) {
     s.value = state[key];
     return s;
   };
+  const catSel = select(CATEGORIES, 'category', 'history-category');
+  const presetBtn = (label, value, test) => h('button', {
+    type: 'button', class: 'btn btn-sm', 'data-test': test,
+    onclick: () => { state.category = value; catSel.value = value; state.offset = 0; load(); },
+  }, label);
   const errorsBox = h('input', { type: 'checkbox', id: 'history-errors', checked: state.errors, 'data-test': 'history-errors', onchange: () => { state.errors = errorsBox.checked; reload(); } });
 
   // Clicking an actor, action or entity adds it to the search.
@@ -122,7 +165,10 @@ export async function render(root, ctx) {
         h('summary', null, 'Search syntax'),
         h('table', { class: 'data compact' }, h('tbody', null, HELP.map(([ex, what]) => h('tr', null, h('td', null, h('code', null, ex)), h('td', null, what)))))),
       h('div', { class: 'filters' },
-        field('What', select(CATEGORIES, 'category', 'history-category')),
+        field('What', catSel),
+        h('div', { class: 'row-gap history-presets' },
+          presetBtn('Console activity', PRESETS.console, 'history-preset-console'),
+          presetBtn('Sign-ins', PRESETS.signins, 'history-preset-signins')),
         field('When', select(RANGES, 'range', 'history-range')),
         h('div', { class: 'check' }, errorsBox, h('label', { for: 'history-errors' }, 'Errors and failures only')))),
     problem,
@@ -133,6 +179,11 @@ export async function render(root, ctx) {
     if (!d || (typeof d === 'object' && Object.keys(d).length === 0)) {
       return h('span', { class: 'muted' }, '—');
     }
+    if (typeof d === 'object' && changesTable(d.changes)) {
+      const rest = { ...d };
+      delete rest.changes;
+      return h('div', { class: 'stack-tight' }, changesTable(d.changes), Object.keys(rest).length ? detailView({ detail: rest }) : null);
+    }
     const text = typeof d === 'string' ? d : JSON.stringify(d, null, 2);
     const short = typeof d === 'string' ? d : cellText(d);
     if (text.length <= 90 && !text.includes('\n')) {
@@ -141,14 +192,23 @@ export async function render(root, ctx) {
     return h('details', null, h('summary', { class: 'mono small' }, `${short.slice(0, 90)}…`), h('pre', { class: 'detail-json' }, text));
   }
 
+  // Only the newest search may draw: an older, slower response must not replace it.
+  let loadSeq = 0;
   async function load() {
     syncExport();
+    const seq = ++loadSeq;
     let resp;
     try {
       resp = await api.get('/audit', { q: fullQuery(), limit: state.limit, offset: state.offset });
+      if (seq !== loadSeq) {
+        return;
+      }
       clear(problem);
     }
     catch (e) {
+      if (seq !== loadSeq) {
+        return;
+      }
       replaceContent(problem, notice('error', e.message));
       clear(listEl);
       return;

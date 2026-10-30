@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"idlifecycle/internal/ad"
+	"idlifecycle/internal/cloud"
 	"idlifecycle/internal/model"
 	"idlifecycle/internal/store"
 )
@@ -26,7 +27,35 @@ func (e *Engine) Approve(ctx context.Context, id, by, note string) (model.Change
 			return c, fmt.Errorf("%w: choose a username for this change first (%s)", ErrInvalid, conflictText(c.Payload.NameConflicts))
 		case c.Type == model.ChangeLink && (c.Payload.Link == nil || c.Payload.Link.Chosen == ""):
 			return c, fmt.Errorf("%w: choose the matching account first, or create a new account instead", ErrInvalid)
+		case c.Type == model.ChangeUndo:
+			return c, fmt.Errorf("%w: undo changes are approved one at a time, with the typed confirmation", ErrInvalid)
 		}
+	}
+	return e.decide(ctx, id, model.StatusPending, model.StatusApproved, by, note, "change.approve")
+}
+
+// ApproveUndo approves an undo change. confirm must be the account name the request showed (typed by the approver);
+// with undo.second_person the approver must not be the person who requested it. Other changes go to Approve.
+func (e *Engine) ApproveUndo(ctx context.Context, id, by, note, confirm string) (model.Change, error) {
+	c, err := e.Store.GetChange(ctx, id)
+	if err != nil {
+		return c, err
+	}
+	if c.Type != model.ChangeUndo || c.Payload.Undo == nil {
+		return e.Approve(ctx, id, by, note)
+	}
+	s, err := e.Store.GetSettings(ctx)
+	if err != nil {
+		return c, err
+	}
+	u := c.Payload.Undo
+	switch {
+	case !s.Undo.Enabled:
+		return c, fmt.Errorf("%w: undo is turned off in Settings", ErrInvalid)
+	case !strings.EqualFold(strings.TrimSpace(confirm), u.ConfirmText):
+		return c, fmt.Errorf("%w: type %s to confirm this undo", ErrInvalid, u.ConfirmText)
+	case s.Undo.SecondPerson && strings.EqualFold(by, u.RequestedBy):
+		return c, fmt.Errorf("%w: undo.second_person is on: someone other than %s must approve this undo", ErrForbidden, u.RequestedBy)
 	}
 	return e.decide(ctx, id, model.StatusPending, model.StatusApproved, by, note, "change.approve")
 }
@@ -79,7 +108,7 @@ func (e *Engine) decide(ctx context.Context, id, from, to, by, note, action stri
 
 // ---- execution -------------------------------------------------------------------
 
-var executionOrder = []string{model.ChangeLink, model.ChangeCreate, model.ChangeUpdate, model.ChangeEnable, model.ChangeDisable, model.ChangeDelete}
+var executionOrder = []string{model.ChangeLink, model.ChangeCreate, model.ChangeUpdate, model.ChangeEnable, model.ChangeDisable, model.ChangeCloudGroups, model.ChangeDelete, model.ChangeUndo}
 
 // ExecuteChunk caps the items sent to one PowerShell invocation, so a large batch (the first load of a
 // whole HR population) never runs into the script timeout as a single all-or-nothing call.
@@ -169,7 +198,8 @@ func (e *Engine) applyBatch(ctx context.Context, s model.Settings, typ string, b
 
 	var results []ad.Result
 	var callErr error
-	refused := map[string]ad.Result{} // changes failed before the AD call (their own reason wins over callErr)
+	refused := map[string]ad.Result{}        // changes failed before the AD call (their own reason wins over callErr)
+	wrote := map[string]map[string]*string{} // attribute values each change writes (nil = cleared), kept for undo
 	switch typ {
 	case model.ChangeCreate:
 		items := make([]ad.CreateItem, 0, len(claimed))
@@ -199,6 +229,7 @@ func (e *Engine) applyBatch(ctx context.Context, s model.Settings, typ string, b
 			for k, d := range c.Payload.Set {
 				set[k] = d.To
 			}
+			wrote[c.ID] = wroteBy(c.Payload)
 			items = append(items, ad.UpdateItem{ChangeID: c.ID, ExternalID: c.ExternalID, ObjectGUID: c.Payload.ObjectGUID,
 				Set: set, Clear: c.Payload.Clear, AddGroups: c.Payload.AddGroups, RemoveGroups: c.Payload.RemoveGroups, MoveTo: c.Payload.MoveTo})
 		}
@@ -212,9 +243,10 @@ func (e *Engine) applyBatch(ctx context.Context, s model.Settings, typ string, b
 	case model.ChangeDisable:
 		items := make([]ad.DisableItem, 0, len(claimed))
 		for _, c := range claimed {
+			desc := "Disabled by IDLifecycle on " + e.Now().UTC().Format("2006-01-02") + " (no longer active in source)"
+			wrote[c.ID] = map[string]*string{"description": &desc}
 			items = append(items, ad.DisableItem{ChangeID: c.ID, ExternalID: c.ExternalID, ObjectGUID: c.Payload.ObjectGUID,
-				MoveTo: c.Payload.MoveTo, RemoveGroups: c.Payload.RemoveGroups, AddGroups: c.Payload.AddGroups,
-				Description: "Disabled by IDLifecycle on " + e.Now().UTC().Format("2006-01-02") + " (no longer active in source)"})
+				MoveTo: c.Payload.MoveTo, RemoveGroups: c.Payload.RemoveGroups, AddGroups: c.Payload.AddGroups, Description: desc})
 		}
 		results, callErr = e.AD.Disable(ctx, opts, items)
 	case model.ChangeDelete:
@@ -236,6 +268,23 @@ func (e *Engine) applyBatch(ctx context.Context, s model.Settings, typ string, b
 		if len(items) > 0 {
 			results, callErr = e.AD.Link(ctx, opts, items)
 		}
+	case model.ChangeCloudGroups:
+		conn, err := e.cloudConnection(s)
+		if err != nil {
+			callErr = err
+			break
+		}
+		items := make([]cloud.SetItem, 0, len(claimed))
+		for _, c := range claimed {
+			items = append(items, cloud.SetItem{ChangeID: c.ID, ExternalID: c.ExternalID, UserID: c.Payload.CloudUserID,
+				Add: c.Payload.CloudAdd, Remove: c.Payload.CloudRemove, RemoveAll: c.Payload.CloudRemoveAll, Keep: c.Payload.CloudKeep})
+		}
+		results, callErr = e.Cloud.SetGroups(ctx, conn, false, items)
+	case model.ChangeUndo:
+		for _, c := range claimed {
+			wrote[c.ID] = wroteBy(c.Payload)
+		}
+		results = e.runUndo(ctx, s, claimed, false)
 	default:
 		callErr = fmt.Errorf("unknown change type %q", typ)
 	}
@@ -257,7 +306,7 @@ func (e *Engine) applyBatch(ctx context.Context, s model.Settings, typ string, b
 				r = ad.Result{ChangeID: c.ID, Status: ad.StatusFailed, Error: "no result returned"}
 			}
 		}
-		e.recordResult(ctx, c, r)
+		e.recordResult(ctx, c, r, wrote[c.ID])
 		if r.OK() {
 			res.applied++
 		} else {
@@ -310,7 +359,7 @@ func (e *Engine) releaseClaimed(claimed []model.Change, cause error) {
 }
 
 // recordResult finishes the change and updates the identity link.
-func (e *Engine) recordResult(ctx context.Context, c model.Change, r ad.Result) {
+func (e *Engine) recordResult(ctx context.Context, c model.Change, r ad.Result, wrote map[string]*string) {
 	status, msg := model.StatusApplied, ""
 	if !r.OK() {
 		status = model.StatusFailed
@@ -324,9 +373,28 @@ func (e *Engine) recordResult(ctx context.Context, c model.Change, r ad.Result) 
 		action = "change.failed"
 	}
 	e.audit(ctx, "system", action, "change", c.ID, map[string]any{
-		"type": c.Type, "external_id": c.ExternalID, "result": r.Status, "message": r.Message, "error": msg, "dn": r.DN,
+		"type": c.Type, "external_id": c.ExternalID, "identity_id": c.IdentityID, "result": r.Status, "message": r.Message, "error": msg, "dn": r.DN,
+		"sam": r.Sam, "upn": r.UPN,
 	})
+	if status == model.StatusApplied && r.Status == ad.StatusApplied && r.Before != nil {
+		st := model.AppliedState{Before: *r.Before, ObjectGUID: firstNonEmpty(r.ObjectGUID, c.Payload.ObjectGUID), DN: r.DN, Sam: r.Sam, UPN: r.UPN, Wrote: wrote, At: e.Now()}
+		if err := e.Store.SetChangeAppliedState(ctx, c.ID, st); err != nil {
+			e.Log.Error("record the state before the change", "change", c.ID, "error", err)
+		}
+	}
+	if c.Type == model.ChangeUndo {
+		if r.OK() {
+			e.finishUndo(ctx, c, r)
+		}
+		return
+	}
 
+	if c.Type == model.ChangeCloudGroups {
+		if r.OK() && c.Payload.CloudRemoveAll {
+			e.markCloudRemovedAll(ctx, c.IdentityID)
+		}
+		return
+	}
 	// Link whenever AD gave us an object, even on partial failure, so the next run does not try to re-create it.
 	if r.ObjectGUID == "" && !(r.OK() && c.Type == model.ChangeDelete) {
 		return
@@ -339,6 +407,7 @@ func (e *Engine) recordResult(ctx context.Context, c model.Change, r ad.Result) 
 		e.Log.Error("load identity after apply", "identity", c.IdentityID, "error", err)
 		return
 	}
+	prev := id
 	now := e.Now()
 	if r.ObjectGUID != "" {
 		id.ADGUID = r.ObjectGUID
@@ -406,7 +475,17 @@ func (e *Engine) recordResult(ctx context.Context, c model.Change, r ad.Result) 
 	}
 	if err := e.Store.UpdateIdentity(ctx, id); err != nil {
 		e.Log.Error("update identity after apply", "identity", id.ID, "error", err)
+		return
 	}
+	if c.Type == model.ChangeDelete && r.OK() {
+		// The permanent record of the account: the identity row stays, and this row says what the account was.
+		d := stateDetail(prev, id, c.ID, c.Type)
+		d["ad_guid"], d["ad_dn"], d["ad_sam"], d["ad_upn"] = prev.ADGUID, prev.ADDN, prev.ADSam, r.UPN
+		d["attributes"] = prev.Applied
+		e.identityAudit(ctx, "system", ActAccountDeleted, id, d)
+		return
+	}
+	e.noteState(ctx, prev, id, c.ID, c.Type)
 }
 
 func firstNonEmpty(vals ...string) string {

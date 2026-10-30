@@ -51,7 +51,7 @@ func mustOpen(t *testing.T, drv, dsn string) *Store {
 
 func resetTables(t *testing.T, s *Store) {
 	t.Helper()
-	for _, tbl := range []string{"audit_log", "changes", "sync_runs", "role_rules", "mappings", "identities", "sources", "sessions", "users", "settings"} {
+	for _, tbl := range []string{"audit_log", "manual_people", "identity_retention", "retention_policies", "identity_hold_state", "identity_holds", "change_undo_items", "change_undo", "changes", "sync_runs", "role_rules", "mappings", "identities", "sources", "sessions", "users", "settings"} {
 		if _, err := s.exec(context.Background(), "DELETE FROM "+tbl); err != nil {
 			t.Fatalf("reset %s: %v", tbl, err)
 		}
@@ -69,6 +69,9 @@ func TestStoreSuite(t *testing.T) {
 			t.Run("mappings_roles", func(t *testing.T) { testMappingsRoles(t, s) })
 			t.Run("changes", func(t *testing.T) { testChanges(t, s) })
 			t.Run("audit", func(t *testing.T) { testAudit(t, s) })
+			t.Run("undo_holds", func(t *testing.T) { testUndoHolds(t, s) })
+			t.Run("retention", func(t *testing.T) { testRetention(t, s) })
+			t.Run("identity_history", func(t *testing.T) { testIdentityHistory(t, s) })
 			t.Run("tables", func(t *testing.T) { testTables(t, s) })
 		})
 	}

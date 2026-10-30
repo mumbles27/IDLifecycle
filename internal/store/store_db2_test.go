@@ -594,7 +594,10 @@ func db2Exercises() map[string]func(ctx context.Context, s *Store) error {
 			return ign(s.ListIdentitiesBySource(ctx, "s"))
 		},
 		"ListIdentities": func(ctx context.Context, s *Store) error {
-			return ign3(s.ListIdentities(ctx, IdentityFilter{Q: "Jo[h]n_100%!", State: "linked"}, Page{Limit: 5, Offset: 10}))
+			if err := ign3(s.ListIdentities(ctx, IdentityFilter{Q: "Jo[h]n_100%!", State: "linked"}, Page{Limit: 5, Offset: 10})); err != nil {
+				return err
+			}
+			return ign3(s.ListIdentities(ctx, IdentityFilter{Manual: true, ManualAt: now}, Page{Limit: 5}))
 		},
 		"CreateRun":            func(ctx context.Context, s *Store) error { return s.CreateRun(ctx, model.Run{ID: "r", StartedAt: now}) },
 		"UpdateRun":            func(ctx context.Context, s *Store) error { return s.UpdateRun(ctx, model.Run{ID: "r"}) },
@@ -650,6 +653,50 @@ func db2Exercises() map[string]func(ctx context.Context, s *Store) error {
 			return s.SetIdentityNameOverride(ctx, "i", &model.Candidate{Sam: "a", UPN: "a@b", CN: "A"})
 		},
 		"AddIdentityLinkRejects": func(ctx context.Context, s *Store) error { return s.AddIdentityLinkRejects(ctx, "i", "g") },
+		"SetChangeAppliedState": func(ctx context.Context, s *Store) error {
+			return s.SetChangeAppliedState(ctx, "c", model.AppliedState{At: now})
+		},
+		"SetChangeUndoneBy": func(ctx context.Context, s *Store) error { return s.SetChangeUndoneBy(ctx, "c", "u") },
+		"OpenUndos":         func(ctx context.Context, s *Store) error { _, err := s.OpenUndos(ctx); return err },
+		"OpenUndoList":      func(ctx context.Context, s *Store) error { _, err := s.OpenUndoList(ctx); return err },
+		"AddUndoneItems": func(ctx context.Context, s *Store) error {
+			return s.AddUndoneItems(ctx, "c", "u", []string{"attribute:title", "group_add:CN=G,OU=Groups,DC=x"})
+		},
+		"UndoneItems": func(ctx context.Context, s *Store) error { _, err := s.UndoneItems(ctx, "c"); return err },
+		"SetHoldSuppressed": func(ctx context.Context, s *Store) error {
+			return s.SetHoldSuppressed(ctx, "h", "would set title to 'X'", now)
+		},
+		"ManualCounts": func(ctx context.Context, s *Store) error { _, err := s.ManualCounts(ctx, now); return err },
+		"InsertHold": func(ctx context.Context, s *Store) error {
+			return s.InsertHold(ctx, model.Hold{ID: "h", IdentityID: "i", Kind: model.HoldState, CreatedAt: now})
+		},
+		"ListHolds": func(ctx context.Context, s *Store) error { _, err := s.ListHolds(ctx, "i"); return err },
+		"ListIdentityHistory": func(ctx context.Context, s *Store) error {
+			_, err := s.ListIdentityHistory(ctx, "i", "s", "e", 10, 50)
+			return err
+		},
+		"LastIdentityEvent": func(ctx context.Context, s *Store) error {
+			_, _, err := s.LastIdentityEvent(ctx, "i", "identity.state")
+			return err
+		},
+		"ActiveHolds": func(ctx context.Context, s *Store) error { _, err := s.ActiveHolds(ctx, now); return err },
+		"CreateRetentionPolicy": func(ctx context.Context, s *Store) error {
+			return s.CreateRetentionPolicy(ctx, model.RetentionPolicy{ID: "p", Name: "Execs", Match: "all", CreatedAt: now, UpdatedAt: now})
+		},
+		"GetRetentionPolicy":    func(ctx context.Context, s *Store) error { return ign(s.GetRetentionPolicy(ctx, "p")) },
+		"ListRetentionPolicies": func(ctx context.Context, s *Store) error { return ign(s.ListRetentionPolicies(ctx)) },
+		"UpdateRetentionPolicy": func(ctx context.Context, s *Store) error {
+			return s.UpdateRetentionPolicy(ctx, model.RetentionPolicy{ID: "p", Name: "Execs", Match: "all"})
+		},
+		"DeleteRetentionPolicy": func(ctx context.Context, s *Store) error { return s.DeleteRetentionPolicy(ctx, "p") },
+		"SetIdentityRetention":  func(ctx context.Context, s *Store) error { return s.SetIdentityRetention(ctx, "i", "p", "alice") },
+		"GetIdentityRetention":  func(ctx context.Context, s *Store) error { return ign(s.GetIdentityRetention(ctx, "i")) },
+		"ListIdentityRetention": func(ctx context.Context, s *Store) error { return ign(s.ListIdentityRetention(ctx)) },
+		"PutIdentityRetention": func(ctx context.Context, s *Store) error {
+			return s.PutIdentityRetention(ctx, model.IdentityRetention{IdentityID: "i", PolicyID: "p", PolicyName: "Execs", Reason: "rule", DeleteDue: &now, ResolvedAt: now})
+		},
+		"RetentionCounts": func(ctx context.Context, s *Store) error { return ign(s.RetentionCounts(ctx)) },
+		"DeleteHold":      func(ctx context.Context, s *Store) error { _, err := s.DeleteHold(ctx, "i", "h"); return err },
 		"CreateManualPerson": func(ctx context.Context, s *Store) error {
 			return s.CreateManualPerson(ctx, model.ManualPerson{ID: "m", SourceID: "s", ExternalID: "C-1", CreatedAt: now, UpdatedAt: now})
 		},

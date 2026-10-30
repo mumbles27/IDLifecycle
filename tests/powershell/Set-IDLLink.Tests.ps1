@@ -219,7 +219,7 @@ Describe 'Set-IDLLink.ps1' {
             (New-LinkItem -ChangeId 'bad-sam' -Rename @{ sam = 'way-too-long-for-a-sam-account' }),
             (New-LinkItem -ChangeId 'bad-sam2' -Rename @{ sam = 'j doe' }),
             (New-LinkItem -ChangeId 'empty-rename' -Rename @{ sam = '' }),
-            (New-LinkItem -ChangeId 'no-ext' -ExternalId ''),
+            (New-LinkItem -ChangeId 'no-ext' -ExternalId '' -Expected ''),
             (New-LinkItem -ChangeId 'ad-error' -Guid $oldGuid -Expected '' -ExternalId 'E2001'),
             (New-LinkItem -ChangeId 'ok')
         )
@@ -260,5 +260,119 @@ Describe 'Set-IDLLink.ps1' {
         $r = Invoke-IDLScript -Script 'Set-IDLLink' -Request (New-Request @(New-LinkItem)) -StatePath $down
         $r.ExitCode | Should Be 4
         $r.Json.ok | Should Be $false
+    }
+}
+
+Describe 'Set-IDLLink.ps1 undo support (before, unlink, proxyAddresses, expect)' {
+
+    $contractorGuid = '22222222-2222-2222-2222-222222222222'
+    $oldGuid = '33333333-3333-3333-3333-333333333333'
+
+    function New-LinkState {
+        $contractor = New-StubUserEntry -Sam 'jdoe.c' -ExternalId 'C-100' -Cn 'Jane Doe (Contractor)' -Guid $contractorGuid -Attributes @{
+            mail           = 'jdoe.c@stub.test'
+            proxyAddresses = @('SMTP:jdoe.c@stub.test', 'smtp:jdoe.contractor@vendor.example', 'X500:/o=Stub/cn=jdoe.c')
+        }
+        $unlinked = New-StubUserEntry -Sam 'old.bob' -ExternalId '' -Cn 'Bob Old' -Guid $oldGuid
+        return (New-StandardState -Users @($contractor, $unlinked))
+    }
+
+    function New-Request {
+        param([object[]]$Items)
+        return [ordered]@{ server = ''; idAttribute = 'employeeID'; items = @($Items) }
+    }
+
+    $rename = [ordered]@{ sam = 'jdoe'; upn = 'jdoe@stub.test'; cn = 'Jane Doe'; mail = 'jane.doe@stub.test' }
+
+    It 'returns before: the old ID value and DN; names with the full proxyAddresses list only when it renames' {
+        foreach ($dry in @($true, $false)){
+            $state = New-LinkState
+            $item = [ordered]@{ changeId = 'c1'; objectGuid = $contractorGuid; externalId = 'E5678'; expectedExternalId = 'C-100'; rename = $rename }
+            $r = Invoke-IDLScript -Script 'Set-IDLLink' -Request (New-Request @($item)) -StatePath $state -DryRun:$dry
+
+            $r.ExitCode | Should Be 0
+            $b = $r.Json.results[0].before
+            $b.idValue | Should Be 'C-100'
+            $b.dn | Should Be "CN=Jane Doe (Contractor),OU=Staff,$script:Root"
+            $b.names.sam | Should Be 'jdoe.c'
+            $b.names.upn | Should Be 'jdoe.c@stub.test'
+            $b.names.cn | Should Be 'Jane Doe (Contractor)'
+            $b.names.mail | Should Be 'jdoe.c@stub.test'
+            @($b.names.proxyAddresses) -join '|' | Should Be 'SMTP:jdoe.c@stub.test|smtp:jdoe.contractor@vendor.example|X500:/o=Stub/cn=jdoe.c'
+        }
+
+        $state = New-LinkState
+        $item = [ordered]@{ changeId = 'c2'; objectGuid = $oldGuid; externalId = 'E2001'; expectedExternalId = '' }
+        $r = Invoke-IDLScript -Script 'Set-IDLLink' -Request (New-Request @($item)) -StatePath $state
+        $b = $r.Json.results[0].before
+        $b.idValue | Should Be ''
+        @($b.PSObject.Properties | ForEach-Object { $_.Name }) -contains 'names' | Should Be $false
+    }
+
+    It 'unlinks: an empty externalId clears the ID attribute when it still has expectedExternalId; refuses otherwise' {
+        $state = New-LinkState
+        $r = Invoke-IDLScript -Script 'Set-IDLLink' -Request (New-Request @([ordered]@{ changeId = 'c1'; objectGuid = $oldGuid; externalId = 'E2001'; expectedExternalId = '' })) -StatePath $state
+        $r.Json.results[0].status | Should Be 'applied'
+
+        $wrong = [ordered]@{ changeId = 'u1'; objectGuid = $oldGuid; externalId = ''; expectedExternalId = 'E9999' }
+        $r = Invoke-IDLScript -Script 'Set-IDLLink' -Request (New-Request @($wrong)) -StatePath $state
+        $r.Json.results[0].status | Should Be 'failed'
+        $r.Json.results[0].error | Should Match "employeeID mismatch.*expects 'E9999'"
+
+        $dry = [ordered]@{ changeId = 'u2'; objectGuid = $oldGuid; externalId = ''; expectedExternalId = 'E2001' }
+        $r = Invoke-IDLScript -Script 'Set-IDLLink' -Request (New-Request @($dry)) -StatePath $state -DryRun
+        $r.Json.results[0].status | Should Be 'would'
+        $r.Json.results[0].message | Should Match 'would clear employeeID'
+        (Get-StubUser -Path $state -Sam 'old.bob').attributes.employeeID | Should Be 'E2001'
+
+        $r = Invoke-IDLScript -Script 'Set-IDLLink' -Request (New-Request @($dry)) -StatePath $state
+        $r.Json.results[0].status | Should Be 'applied'
+        $r.Json.results[0].externalId | Should Be ''
+        $r.Json.results[0].before.idValue | Should Be 'E2001'
+        @((Get-StubUser -Path $state -Sam 'old.bob').attributes.PSObject.Properties | ForEach-Object { $_.Name }) -contains 'employeeID' | Should Be $false
+
+        # Already unset: nothing to do.
+        $r = Invoke-IDLScript -Script 'Set-IDLLink' -Request (New-Request @($dry)) -StatePath $state
+        $r.Json.results[0].status | Should Be 'skipped'
+    }
+
+    It 'drift (ID value or names changed since) fails before any change; a bad proxyAddresses entry is refused' {
+        $state = New-LinkState
+        $item = [ordered]@{ changeId = 'c1'; objectGuid = $contractorGuid; externalId = 'E5678'; expectedExternalId = 'C-100'; expect = [ordered]@{ idValue = 'C-999'; names = @{ sam = 'someone' } } }
+        $bad = [ordered]@{ changeId = 'c2'; objectGuid = $contractorGuid; externalId = 'E5678'; expectedExternalId = 'C-100'; proxyAddresses = @('not-an-address') }
+        $r = Invoke-IDLScript -Script 'Set-IDLLink' -Request (New-Request @($item, $bad)) -StatePath $state
+        $r.Json.results[0].error | Should Be "drift: employeeID is 'C-100', expected 'C-999'; sam is 'jdoe.c', expected 'someone'"
+        $r.Json.results[1].error | Should Match 'not of the form type:address'
+        (Get-StubCalls -Path $state).Count | Should Be 0
+    }
+
+    It 'round trip: link with rename, then the inverse (old id, old names, exact proxyAddresses) puts the account back' {
+        $state = New-LinkState
+        $original = Get-StubUserShape -Path $state -Guid $contractorGuid
+        $item = [ordered]@{ changeId = 'c1'; objectGuid = $contractorGuid; externalId = 'E5678'; expectedExternalId = 'C-100'; rename = $rename }
+        $r = Invoke-IDLScript -Script 'Set-IDLLink' -Request (New-Request @($item)) -StatePath $state
+        $applied = $r.Json.results[0]
+        $applied.status | Should Be 'applied'
+        (Get-StubUserShape -Path $state -Guid $contractorGuid) | Should Not Be $original
+
+        $b = $applied.before
+        $undo = [ordered]@{
+            changeId = 'u1'; objectGuid = $contractorGuid; externalId = $b.idValue; expectedExternalId = 'E5678'
+            rename = [ordered]@{ sam = $b.names.sam; upn = $b.names.upn; cn = $b.names.cn; mail = $b.names.mail }
+            proxyAddresses = @($b.names.proxyAddresses)
+            expect = [ordered]@{ idValue = 'E5678'; dn = $applied.dn; names = $rename }
+        }
+        $r = Invoke-IDLScript -Script 'Set-IDLLink' -Request (New-Request @($undo)) -StatePath $state
+        $r.ExitCode | Should Be 0
+        $r.Json.results[0].status | Should Be 'applied'
+        (Get-StubUserShape -Path $state -Guid $contractorGuid) | Should Be $original
+
+        # Unlinked account: link, then unlink.
+        $original = Get-StubUserShape -Path $state -Guid $oldGuid
+        $r = Invoke-IDLScript -Script 'Set-IDLLink' -Request (New-Request @([ordered]@{ changeId = 'c2'; objectGuid = $oldGuid; externalId = 'E2001'; expectedExternalId = '' })) -StatePath $state
+        $b = $r.Json.results[0].before
+        $r = Invoke-IDLScript -Script 'Set-IDLLink' -Request (New-Request @([ordered]@{ changeId = 'u2'; objectGuid = $oldGuid; externalId = $b.idValue; expectedExternalId = 'E2001'; expect = @{ idValue = 'E2001' } })) -StatePath $state
+        $r.Json.results[0].status | Should Be 'applied'
+        (Get-StubUserShape -Path $state -Guid $oldGuid) | Should Be $original
     }
 }

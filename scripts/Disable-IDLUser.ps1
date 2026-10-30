@@ -22,11 +22,15 @@
          a privileged group (adminCount=1 or a protected RID) is refused, an ambiguous or unknown one ignored - each with a
          WARN log, a 'Skipped' report row and a "not added: ..." note in the message,
       6. moves it to moveTo (if given and it is not already there).
+    Optional "set" / "clear" (Set-IDLUser semantics, LDAP names) are applied after step 3. Before step 1 the item fails
+    with nothing changed when "expect" does not match ("drift: ...", see Set-IDLUser; "force": true skips it) or when
+    set/clear is invalid. Applied and would results carry "before": {enabled, dn, attributes (incl. description when it
+    changed), groupsAdded, groupsRemoved}.
     It is idempotent: an already-disabled account still gets steps 2-6; if nothing needed doing the status is "skipped".
     One failing item never stops the others.
 
     Response: {"ok":true,"dryRun":false,"results":[{"changeId","externalId","status":"applied|would|skipped|failed",
-    "message","objectGuid","dn","sam","upn","error"}],"summary":{"total","applied","would","skipped","failed"}}
+    "message","objectGuid","dn","sam","upn","error","before"}],"summary":{"total","applied","would","skipped","failed"}}
 
 .PARAMETER DryRun
     Do every lookup and log/report everything as WOULD: statements, but make NO changes. Successful items
@@ -72,6 +76,8 @@ try{
     Add-IDLCounter -Name 'Total' -By $items.Count
     Write-IDLLog ("Request: server='{0}' idAttribute={1} items={2}" -f $server, $idAttribute, $items.Count)
 
+    $blocked = @(Get-IDLProtectedAttributes) + @('cn', 'name', $idAttribute.ToLowerInvariant())
+
     # ---- Phase: dependencies and connection ----
     try{
         Import-Module ActiveDirectory -Global -ErrorAction Stop
@@ -92,7 +98,12 @@ try{
     $needDescription = $false
     $needMemberOf = $false
     $allGroups = [System.Collections.Generic.List[string]]::new()
+    $expectNeeds = Get-IDLExpectNeeds -Items $items
+    $allGroups.AddRange($expectNeeds.Groups)
+    $extraProperties = @($expectNeeds.Properties)
     foreach ($item in $items){
+        $extraProperties += Get-IDLAttributeRequestNames -Item $item
+
         if (-not [string]::IsNullOrWhiteSpace((ConvertTo-IDLString -Value (Get-IDLField -Object $item -Name 'description')))){
             $needDescription = $true
         }
@@ -110,7 +121,6 @@ try{
         }
     }
 
-    $extraProperties = @()
     if ($needDescription){
         $extraProperties += 'description'
     }
@@ -153,10 +163,23 @@ try{
             $description = ConvertTo-IDLString -Value (Get-IDLField -Object $item -Name 'description')
             $moveTo = ConvertTo-IDLString -Value (Get-IDLField -Object $item -Name 'moveTo')
             $moveTo = (($null -eq $moveTo) ? ('') : ($moveTo.Trim()))
+            # Before any change: the account must still be as the request expects (undo), and set/clear must be
+            # valid - these are the only checks that can stop the disable.
+            Assert-IDLExpect -Item $item -User $user -GroupMap $groupMap -IdAttribute $idAttribute
+            $attributeRequest = Get-IDLAttributeRequest -Item $item -Blocked $blocked -ScriptName 'Disable-IDLUser'
+            if (
+                (-not [string]::IsNullOrWhiteSpace($description)) -and
+                (@(@($attributeRequest.Desired.Keys) + @($attributeRequest.Clear) | Where-Object { $_ -ieq 'description' }).Count -gt 0)
+            ){
+                throw "'description' is given both as a field and in set/clear"
+            }
+
+            $before = New-IDLBefore -User $user
             $changes = 0
             $guid = [guid]$user.ObjectGUID
 
-            # Step 1: disable FIRST. Nothing else in the request (bad moveTo, privileged or ambiguous groups) may
+            # Step 1: disable FIRST.
+            # Nothing else in the request (bad moveTo, privileged or ambiguous groups) may
             # leave a terminated account enabled; later failures end the item as "failed after: disabled; ...".
             if ([bool]$user.Enabled){
                 $changes++
@@ -207,20 +230,24 @@ try{
             ){
                 $changes++
                 if ($DryRun){
+                    $before.attributes['description'] = Get-IDLAdValue -Object $user -Name 'description'
                     Write-IDLLog "  WOULD: set description on $identity"
                     Add-IDLReportRow -Action 'SetDescription' -Result 'Would' -Identity $identity -ObjectIdOrDN $userDn -Details $description
                     $done.Add('would set description')
                 }
                 else{
                     Set-ADUser -Identity $guid -Replace @{ description = $description } @serverParams
+                    $before.attributes['description'] = Get-IDLAdValue -Object $user -Name 'description'
                     Write-IDLLog "  Set description on $identity"
                     Add-IDLReportRow -Action 'SetDescription' -Result 'Applied' -Identity $identity -ObjectIdOrDN $userDn -Details $description
                     $done.Add('set description')
                 }
             }
 
+            $changes += Update-IDLUserAttributes -User $user -Desired $attributeRequest.Desired -ClearNames $attributeRequest.Clear -Server $server -DryRun:$DryRun -Done $done -Before $before.attributes
+
             if ($removeDns.Count -gt 0){
-                $changes += Update-IDLGroupMembership -User $user -RemoveDns $removeDns -Server $server -DryRun:$DryRun -Done $done
+                $changes += Update-IDLGroupMembership -User $user -RemoveDns $removeDns -Server $server -DryRun:$DryRun -Done $done -Removed $before.groupsRemoved
             }
 
             # Groups a disabled account joins (e.g. "Disabled Users"). Like the removals this never blocks the disable:
@@ -241,7 +268,7 @@ try{
             }
 
             if ($addInfo.Dns.Count -gt 0){
-                $changes += Update-IDLGroupMembership -User $user -AddDns $addInfo.Dns -Server $server -DryRun:$DryRun -Done $done
+                $changes += Update-IDLGroupMembership -User $user -AddDns $addInfo.Dns -Server $server -DryRun:$DryRun -Done $done -Added $before.groupsAdded
             }
 
             $finalDn = $userDn
@@ -276,10 +303,10 @@ try{
                 Add-IDLReportRow -Action 'DisableUser' -Result 'Skipped' -Identity $identity -ObjectIdOrDN $userDn -Details 'already in desired state'
             }
             elseif ($DryRun){
-                $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status would -Message ((@($done) + $notes) -join '; ') @userFields
+                $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status would -Message ((@($done) + $notes) -join '; ') -Before $before @userFields
             }
             else{
-                $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status applied -Message ((@($done) + $notes) -join '; ') @userFields
+                $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status applied -Message ((@($done) + $notes) -join '; ') -Before $before @userFields
             }
         }
         catch{

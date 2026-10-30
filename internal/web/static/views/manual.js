@@ -5,6 +5,7 @@ import { api } from '../api.js';
 import {
   h, replaceContent, pageHeader, card, errorBox, loading, field, act, toast, notice, dataTable, pill, fmtTime,
   relTime, confirmDialog, noteDialog, formModal, dl,
+  historyLink,
 } from '../ui.js';
 import { conflictList } from '../components.js';
 
@@ -180,14 +181,16 @@ export async function render(root, ctx) {
       return [a.FirstName, a.LastName].filter(Boolean).join(' ') || a.DisplayName || p.external_id;
     };
     const actions = (p) => {
-      if (!canAdd) {
-        return '';
-      }
       const cell = h('div', { class: 'row-actions' });
+      if (!canAdd) {
+        cell.append(historyLink('manual_person', p.id));
+        return cell;
+      }
       cell.append(h('button', { type: 'button', class: 'btn btn-sm', 'data-mutating': '', 'data-test': 'mp-edit', onclick: () => edit(p, fields) }, 'Edit…'));
       if (!p.ended) {
         cell.append(h('button', { type: 'button', class: 'btn btn-sm btn-danger', 'data-mutating': '', 'data-test': 'mp-end', onclick: (e) => end(p, e.currentTarget) }, 'End…'));
       }
+      cell.append(historyLink('manual_person', p.id));
       if (isAdmin && !p.ad_sam) {
         cell.append(h('button', { type: 'button', class: 'btn btn-sm btn-danger', 'data-mutating': '', 'data-test': 'mp-delete', onclick: (e) => remove(p, e.currentTarget) }, 'Delete'));
       }

@@ -29,6 +29,7 @@
     }
 
       * users[].objectClass defaults to "user" (use "computer" to test the not-a-user refusal).
+      * users[].objectSid (optional, "S-1-5-21-...") is returned as the SID property; without it a stable SID is derived from the objectGUID.
       * groups[] and objects[] may carry an "attributes" table too (e.g. a contact with mail / proxyAddresses);
         multi-valued attributes are JSON arrays and match filters value by value, case-insensitively.
       * Set-ADUser supports -Replace/-Clear/-Add/-Remove (applied Remove, Add, Replace, Clear like the real cmdlet; adding
@@ -108,6 +109,19 @@ function New-StubDeterministicGuid {
     }
 }
 
+function Get-StubUserSid {
+    # users[].objectSid when set, else a stable domain SID derived from the objectGUID (real Get-ADUser always returns SID).
+    param($Entity)
+
+    $sid = [string]$Entity.Source['objectSid']
+    if ([string]::IsNullOrEmpty($sid)){
+        $rid = [System.BitConverter]::ToUInt32(([guid]$Entity.Guid).ToByteArray(), 0) % 100000000
+        $sid = 'S-1-5-21-1111111111-2222222222-3333333333-{0}' -f ($rid + 1000)
+    }
+
+    return [System.Security.Principal.SecurityIdentifier]::new($sid)
+}
+
 function ConvertTo-StubAttributeTable {
     param($Source)
 
@@ -162,6 +176,7 @@ function Read-StubState {
                 upn         = [string](Get-StubKey $u 'upn')
                 enabled     = [bool](Get-StubKey $u 'enabled' $true)
                 objectClass = [string](Get-StubKey $u 'objectClass' 'user')
+                objectSid   = (Get-StubKey $u 'objectSid')
                 attributes  = (ConvertTo-StubAttributeTable (Get-StubKey $u 'attributes'))
                 memberOf    = [string[]]@(@(Get-StubKey $u 'memberOf' @()) | Where-Object { $_ } | ForEach-Object { [string]$_ })
             })
@@ -828,6 +843,7 @@ function New-StubAdObject {
     switch ($Entity.Kind){
         'user' {
             $o['Enabled'] = [bool]$Entity.Source.enabled
+            $o['SID'] = Get-StubUserSid -Entity $Entity
             $given = @(Get-StubEntityValues -Entity $Entity -Attribute 'givenName')
             if ($given.Count -gt 0){
                 $o['GivenName'] = $given[0]
@@ -1146,6 +1162,7 @@ function New-ADUser {
             enabled     = $enabledValue
             objectClass = 'user'
             attributes  = $attributes
+            objectSid   = $null
             memberOf    = [string[]]@()
         }
         $state.users.Add($user)

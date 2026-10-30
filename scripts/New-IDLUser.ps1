@@ -27,7 +27,8 @@
     One failing item never stops the others. The password is never logged or echoed (it is also scrubbed from errors).
 
     Response: {"ok":true,"dryRun":false,"results":[{"changeId","externalId","status":"applied|would|skipped|failed",
-    "message","objectGuid","dn","sam","upn","error"}],"summary":{"total","applied","would","skipped","failed"}}
+    "message","objectGuid","dn","sam","upn","error","before"}],"summary":{"total","applied","would","skipped","failed"}}    A created account (status applied, or would in DryRun) carries "before": {"created": true} (undo disables it).
+
 
 .PARAMETER DryRun
     Do every lookup and candidate selection and log/report WOULD: statements, but create nothing. Successful
@@ -483,10 +484,10 @@ try{
                 Add-IDLReportRow -Action 'CreateUser' -Result 'Failed' -Identity $chosen.Sam -ObjectIdOrDN $userFields['Dn'] -Details 'groups not found' -ErrorText "group(s) not found: $($missing -join ', ')"
             }
             elseif ($DryRun){
-                $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status would -Message ($done -join '; ') @userFields
+                $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status would -Message ($done -join '; ') -Before ([ordered]@{ created = $true }) @userFields
             }
             else{
-                $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status applied -Message ($done -join '; ') @userFields
+                $result = New-IDLResult -ChangeId $changeId -ExternalId $externalId -Status applied -Message ($done -join '; ') -Before ([ordered]@{ created = $true }) @userFields
             }
         }
         catch{

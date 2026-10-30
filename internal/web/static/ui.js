@@ -254,7 +254,7 @@ export function debounce(fn, ms = 350) {
 const KNOWN_PILLS = new Set([
   'pending', 'approved', 'applying', 'applied', 'failed', 'rejected', 'superseded', 'simulated',
   'running', 'ok', 'error', 'aborted', 'new', 'linked', 'disabled', 'deleted', 'active', 'inactive',
-  'enabled', 'admin', 'approver', 'viewer', 'live', 'dry_run', 'create_only', 'sync', 'immutable',
+  'enabled', 'admin', 'approver', 'viewer', 'live', 'dry_run', 'create_only', 'sync', 'immutable', 'undone', 'undo_pending', 'partly_undone', 'manual', 'auto', 'never', 'leaving', 'deletion',
 ]);
 
 export function pill(status, label) {
@@ -748,6 +748,18 @@ export function chip(text) {
   return h('span', { class: 'chip' }, text);
 }
 
+const CHANGE_TYPE_NAMES = { cloud_groups: 'cloud groups' };
+
+/** The word shown for a change type ("cloud_groups" reads "cloud groups"; the rest are shown as they are). */
+export function changeTypeName(type) {
+  return CHANGE_TYPE_NAMES[type] || type || '';
+}
+
+/** The coloured tag of a change type in lists (the text carries the meaning; the colour only repeats it). */
+export function typeTag(type) {
+  return h('span', { class: `type-tag type-${type}` }, changeTypeName(type));
+}
+
 export function codeBlock(value) {
   return h('pre', { class: 'code' }, typeof value === 'string' ? value : pretty(value));
 }
@@ -759,6 +771,17 @@ export function mutBtn(label, attrs = {}) {
 
 export function btn(label, attrs = {}) {
   return h('button', { type: 'button', ...attrs, class: `btn ${attrs.class || ''}`.trim() }, label);
+}
+
+/** The History page filtered to one object (everyone who can read History may follow it). */
+export function historyHref(entityType, entityId) {
+  return `#/audit${qs({ q: `type:${entityType} id:"${entityId}"` })}`;
+}
+
+export function historyLink(entityType, entityId, label = 'History') {
+  return h('a', {
+    class: 'btn btn-sm', href: historyHref(entityType, entityId), 'data-test': 'history-link', title: `Everything recorded about this ${entityType.replace('_', ' ')}`,
+  }, label);
 }
 
 /** Query-string builder that skips empty values. */

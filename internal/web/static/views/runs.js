@@ -6,6 +6,20 @@ import {
   act, confirmDialog, toast, errorBox, loading, truncCell, dl, mutBtn,
 } from '../ui.js';
 import { counterGrid } from '../components.js';
+import { requestRunUndo } from '../undo.js';
+
+// People who left HR but are Manual (whole person or account state): their accounts were not disabled.
+function manualLeaversNotice(run) {
+  const n = Number((run.counters || {}).manual_not_disabled) || 0;
+  if (n <= 0) {
+    return null;
+  }
+  const one = n === 1;
+  return h('div', { class: 'notice notice-warn', role: 'status', 'data-test': 'run-manual-leavers' },
+    h('strong', null, `${n} ${one ? 'person who has' : 'people who have'} left HR ${one ? 'is' : 'are'} Manual and ${one ? 'was' : 'were'} not disabled. `),
+    'Handle their accounts by hand, or set them back to Auto: ',
+    h('a', { href: '#/identities?manual=1' }, 'people with Manual items'), '.');
+}
 
 function compactCounters(c) {
   const entries = Object.entries(c || {}).filter(([, v]) => Number(v) > 0);
@@ -77,6 +91,29 @@ async function renderDetail(root, ctx, id) {
   const body = h('div', { class: 'stack' }, loading());
   root.append(pageHeader('Run detail', h('a', { href: '#/runs', class: 'btn' }, 'Back to runs')), body);
   let timer = null;
+  // Undo is offered only when the server has it and it is switched on (settings.undo).
+  let undoOn = false;
+  if (ctx.can('admin')) {
+    try {
+      const s = await api.get('/settings');
+      undoOn = Boolean(s && s.undo && typeof s.undo === 'object' && s.undo.enabled !== false);
+    }
+    catch (e) {
+      undoOn = false;
+    }
+  }
+  const undoBtn = (run) => (undoOn && run.status !== 'running'
+    ? h('div', { class: 'row-gap' },
+      mutBtn('Undo changes from this run…', {
+        'data-test': 'run-undo',
+        title: 'Pick applied changes of this run (or single attributes and groups) to roll back; shows a live check first',
+        onclick: (e) => act(e.currentTarget, async () => {
+          if (await requestRunUndo(run)) {
+            ctx.navigate('#/approvals?status=pending&type=undo');
+          }
+        }),
+      }))
+    : null);
 
   async function load() {
     let run;
@@ -97,7 +134,9 @@ async function renderDetail(root, ctx, id) {
         ['Duration', fmtDuration(run.started_at, run.finished_at)],
       ])),
       run.error ? card('Errors', h('pre', { class: 'code code-error', 'data-test': 'run-error' }, run.error)) : null,
+      manualLeaversNotice(run),
       card('Counters', counterGrid(run.counters)),
+      undoBtn(run),
       h('p', null, h('a', { href: '#/approvals?status=' }, 'Browse all changes'), ' (filter by identity to see what this run planned).'));
     if (run.status === 'running' && !timer) {
       timer = setInterval(load, 3000);

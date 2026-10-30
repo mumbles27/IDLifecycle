@@ -377,3 +377,68 @@ function Invoke-StubSnippet {
     $psi = New-ChildProcessInfo -Arguments @('-NoProfile', '-NonInteractive', '-Command', $Code) -StatePath $StatePath -NoState:$NoState.IsPresent
     return (Invoke-ChildProcess -Psi $psi -TimeoutSec 60)
 }
+
+function Get-StubUserShape {
+    # Everything undo must put back, as one comparable string: dn, sam, upn, enabled, attributes, memberOf.
+    param([string]$Path, [string]$Guid)
+
+    $u = @((Read-StubStateFile -Path $Path).users | Where-Object { $_.objectGuid -eq $Guid })[0]
+    $attrs = @($u.attributes.PSObject.Properties | Sort-Object Name | ForEach-Object {
+            '{0}={1}' -f $_.Name.ToLowerInvariant(), (@($_.Value) -join ',')
+        })
+    $groups = @(@($u.memberOf) | Where-Object { $_ } | ForEach-Object { $_.ToLowerInvariant() } | Sort-Object)
+    return ('dn={0}|sam={1}|upn={2}|enabled={3}|{4}|memberOf={5}' -f $u.dn.ToLowerInvariant(), $u.sam, $u.upn, $u.enabled, ($attrs -join '|'), ($groups -join ';'))
+}
+
+function New-UndoItem {
+    <#
+      Builds the inverse of an applied Set/Disable/Enable item from its result's "before" (what the Go engine does):
+      attributes back (set / clear), groupsAdded removed, groupsRemoved re-added, moved back when the DN's parent
+      changed. -Expect is passed through as the item's expect.
+    #>
+    param(
+        [Parameter(Mandatory)]$Result,
+        [string]$ChangeId = 'undo-1',
+        $Expect = $null,
+        [switch]$Force
+    )
+
+    $before = $Result.before
+    $set = [ordered]@{}
+    $clear = @()
+    foreach ($p in $before.attributes.PSObject.Properties){
+        if ($null -eq $p.Value){
+            $clear += $p.Name
+        }
+        else{
+            $set[$p.Name] = $p.Value
+        }
+    }
+
+    $item = [ordered]@{
+        changeId     = $ChangeId
+        externalId   = $Result.externalId
+        objectGuid   = $Result.objectGuid
+        set          = $set
+        clear        = $clear
+        addGroups    = @($before.groupsRemoved)
+        removeGroups = @($before.groupsAdded)
+        moveTo       = ''
+    }
+
+    $oldParent = ($before.dn -replace '^(?:\\.|[^,])+,', '')
+    $newParent = ($Result.dn -replace '^(?:\\.|[^,])+,', '')
+    if ($oldParent -ine $newParent){
+        $item.moveTo = $oldParent
+    }
+
+    if ($null -ne $Expect){
+        $item['expect'] = $Expect
+    }
+
+    if ($Force){
+        $item['force'] = $true
+    }
+
+    return $item
+}

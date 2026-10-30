@@ -62,6 +62,7 @@ func sameFold(a, b []string) bool { return subsetFold(a, b) && subsetFold(b, a) 
 // mergeRequests is a snapshot request that answers both.
 func mergeRequests(a, b ad.SnapshotRequest) ad.SnapshotRequest {
 	out := a
+	out.SearchBases = unionFold(a.SearchBases, b.SearchBases) // a proposed retention policy may name another disabled OU
 	out.Properties = unionFold(a.Properties, b.Properties)
 	out.Groups = unionFold(a.Groups, b.Groups)
 	out.IncludeUnlinked = a.IncludeUnlinked || b.IncludeUnlinked
@@ -71,22 +72,42 @@ func mergeRequests(a, b ad.SnapshotRequest) ad.SnapshotRequest {
 // ImpactRequest is what an impact preview compares: the proposed roles, mappings and settings (nil = the saved ones)
 // against the saved configuration, plus filters for the returned page.
 type ImpactRequest struct {
-	Roles       *[]model.RoleRule
-	Mappings    *[]model.Mapping
-	Settings    *model.Settings
-	Refresh     bool
-	Q           string
-	OnlyChanged bool
-	Type        string
-	Offset      int
-	Limit       int
-	By          string
+	Roles    *[]model.RoleRule
+	Mappings *[]model.Mapping
+	// RetentionPolicies is a proposed full list of retention policies (nil = the saved ones).
+	RetentionPolicies *[]model.RetentionPolicy
+	Settings          *model.Settings
+	Refresh           bool
+	Q                 string
+	OnlyChanged       bool
+	Type              string
+	Offset            int
+	Limit             int
+	By                string
 }
 
 // ImpactSide is one configuration's plan for a person.
 type ImpactSide struct {
 	Type    string   `json:"type"` // a change type, or "error"
 	Summary []string `json:"summary"`
+	// Also lists the other change types of this side (cloud_groups next to an AD change); Summary covers all of them.
+	Also []string `json:"also,omitempty"`
+}
+
+// has reports whether the side plans a change of this type.
+func (s *ImpactSide) has(typ string) bool {
+	if s == nil {
+		return false
+	}
+	if s.Type == typ {
+		return true
+	}
+	for _, t := range s.Also {
+		if t == typ {
+			return true
+		}
+	}
+	return false
 }
 
 // ImpactLine is one difference between the baseline and the proposed plan.
@@ -164,7 +185,19 @@ func (e *Engine) PreviewImpact(ctx context.Context, req ImpactRequest) (*ImpactR
 	if err != nil {
 		return nil, err
 	}
-	base := planConfig{Settings: saved, Mappings: mappings, Rules: rules}
+	holds, err := st.ActiveHolds(ctx, e.Now())
+	if err != nil {
+		return nil, err
+	}
+	retention, err := st.ListRetentionPolicies(ctx)
+	if err != nil {
+		return nil, err
+	}
+	srcList, err := st.ListSources(ctx)
+	if err != nil {
+		return nil, err
+	}
+	base := planConfig{Settings: saved, Mappings: mappings, Rules: rules, Holds: holds, Retention: retention, Sources: srcList}
 	prop := base
 	var notes []string
 	if req.Settings != nil {
@@ -178,6 +211,14 @@ func (e *Engine) PreviewImpact(ctx context.Context, req ImpactRequest) (*ImpactR
 			s.AD.Server, s.AD.SearchBases, s.AD.IDAttribute = saved.AD.Server, saved.AD.SearchBases, saved.AD.IDAttribute
 			s.AD.DisabledOU = saved.AD.DisabledOU
 		}
+		// The cloud connection is previewed as saved too (switching it on or off is previewed).
+		if c := s.Cloud; c.Environment != saved.Cloud.Environment || c.TenantID != saved.Cloud.TenantID || c.ClientID != saved.Cloud.ClientID ||
+			c.Auth != saved.Cloud.Auth || c.CertThumbprint != saved.Cloud.CertThumbprint || c.UserMatch != saved.Cloud.UserMatch || c.Exchange != saved.Cloud.Exchange {
+			notes = append(notes, "the Microsoft 365 connection is previewed with the saved values")
+		}
+		enabled := s.Cloud.Enabled
+		s.Cloud = saved.Cloud
+		s.Cloud.Enabled = enabled
 		prop.Settings = s
 	}
 	if req.Roles != nil {
@@ -195,6 +236,17 @@ func (e *Engine) PreviewImpact(ctx context.Context, req ImpactRequest) (*ImpactR
 			}
 		}
 		prop.Mappings = *req.Mappings
+	}
+	if req.RetentionPolicies != nil {
+		list := make([]model.RetentionPolicy, len(*req.RetentionPolicies))
+		for i, p := range *req.RetentionPolicies {
+			NormalizeRetentionPolicy(&p)
+			if err := ValidateRetentionPolicy(p); err != nil {
+				return nil, fmt.Errorf("%w: retention_policies[%d] (%s): %v", ErrInvalid, i, p.Name, err)
+			}
+			list[i] = p
+		}
+		prop.Retention = list
 	}
 	if len(saved.AD.SearchBases) == 0 {
 		return nil, fmt.Errorf("%w: ad.search_bases is not configured", ErrInvalid)
@@ -221,17 +273,29 @@ func (e *Engine) PreviewImpact(ctx context.Context, req ImpactRequest) (*ImpactR
 	if err != nil {
 		return nil, fmt.Errorf("AD snapshot: %w", err)
 	}
+	var cv *cloudView
+	switch {
+	case needsCloud(base) || needsCloud(prop):
+		if !saved.Cloud.Enabled {
+			notes = append(notes, "cloud groups are not previewed: switch the Microsoft 365 connection on and save it first")
+		} else if cv, _, err = e.cloudSnapshot(ctx, saved, unionFold(cloudGroupIDs(base), cloudGroupIDs(prop)), !req.Refresh); err != nil {
+			cv = nil
+			notes = append(notes, "cloud groups are not previewed: "+err.Error())
+		}
+	case len(cloudGroupIDs(prop)) > 0:
+		notes = append(notes, "cloud groups are configured but the Microsoft 365 connection is off; they are not previewed")
+	}
 	now := e.Now()
-	bp, err := planEveryone(base, snap, idents, now, map[string]int{}, nil)
+	bp, err := planEveryone(base, snap, cv, idents, now, map[string]int{}, nil)
 	if err != nil {
 		return nil, err
 	}
-	pp, err := planEveryone(prop, snap, idents, now, map[string]int{}, nil)
+	pp, err := planEveryone(prop, snap, cv, idents, now, map[string]int{}, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	res := buildImpact(bp, pp, idents)
+	res := buildImpact(bp, pp, idents, cv)
 	res.GeneratedAt, res.SnapshotAt, res.NamesChecked = now, snapAt, false
 	res.Notes = append(notes, "account names are not checked against AD in a preview (a sync does that)")
 	res.People = len(idents)
@@ -261,25 +325,41 @@ func (e *Engine) previewSnapshot(ctx context.Context, want ad.SnapshotRequest, r
 	return snap, e.Now(), nil
 }
 
-// groupAdds / groupRemoves are the group DNs a plan adds or removes.
-func groupAdds(p *Planned) map[string]bool {
+// cloudAllKey stands for "every cloud group" in the impact counts (a disable that removes all cloud memberships).
+const cloudAllKey = model.CloudGroupPrefix + "*"
+
+// groupAdds / groupRemoves are the groups plans add or remove: AD DNs, and entra:<id> for cloud groups.
+func groupAdds(plans ...*Planned) map[string]bool {
 	out := map[string]bool{}
-	if p == nil {
-		return out
-	}
-	for _, g := range append(append([]string{}, p.Payload.Groups...), p.Payload.AddGroups...) {
-		out[strings.ToLower(g)] = true
+	for _, p := range plans {
+		if p == nil {
+			continue
+		}
+		for _, g := range append(append([]string{}, p.Payload.Groups...), p.Payload.AddGroups...) {
+			out[strings.ToLower(g)] = true
+		}
+		for _, g := range p.Payload.CloudAdd {
+			out[model.CloudGroupPrefix+g] = true
+		}
 	}
 	return out
 }
 
-func groupRemoves(p *Planned) map[string]bool {
+func groupRemoves(plans ...*Planned) map[string]bool {
 	out := map[string]bool{}
-	if p == nil {
-		return out
-	}
-	for _, g := range p.Payload.RemoveGroups {
-		out[strings.ToLower(g)] = true
+	for _, p := range plans {
+		if p == nil {
+			continue
+		}
+		for _, g := range p.Payload.RemoveGroups {
+			out[strings.ToLower(g)] = true
+		}
+		for _, g := range p.Payload.CloudRemove {
+			out[model.CloudGroupPrefix+g] = true
+		}
+		if p.Payload.CloudRemoveAll {
+			out[cloudAllKey] = true
+		}
 	}
 	return out
 }
@@ -302,39 +382,59 @@ func attrValues(p *Planned) map[string]string {
 	return out
 }
 
-func buildImpact(bp, pp *planPass, idents []model.Identity) *ImpactResult {
+// samePlan: both plans exist and carry the same payload, or neither exists.
+func samePlan(a, b *Planned) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return PayloadHash(a.Type, a.Payload) == PayloadHash(b.Type, b.Payload)
+}
+
+func buildImpact(bp, pp *planPass, idents []model.Identity, cv *cloudView) *ImpactResult {
 	res := &ImpactResult{Summary: ImpactSummary{Baseline: map[string]int{}, Proposed: map[string]int{}, GroupsAdded: []ImpactCount{}, GroupsRemoved: []ImpactCount{}, Attributes: []ImpactCount{}}, Items: []ImpactItem{}}
-	planIndex := func(pass *planPass) map[string]int {
-		m := map[string]int{}
-		for i := range pass.plans {
-			m[pass.plans[i].id.ID] = i
+	planIndex := func(list []plannedFor) map[string]*Planned {
+		m := map[string]*Planned{}
+		for i := range list {
+			m[list[i].id.ID] = list[i].p
 		}
 		return m
 	}
-	bIdx, pIdx := planIndex(bp), planIndex(pp)
-	side := func(pass *planPass, idx map[string]int, id string) (*ImpactSide, *Planned) {
-		if i, ok := idx[id]; ok {
-			p := pass.plans[i].p
-			return &ImpactSide{Type: p.Type, Summary: append([]string{}, p.Summary...)}, p
+	bIdx, pIdx, bCloud, pCloud := planIndex(bp.plans), planIndex(pp.plans), planIndex(bp.cloud), planIndex(pp.cloud)
+	// side is one configuration's view of a person: the AD plan and the cloud plan in one summary.
+	side := func(pass *planPass, idx, cidx map[string]*Planned, id string) (*ImpactSide, *Planned, *Planned) {
+		p, cp := idx[id], cidx[id]
+		switch {
+		case p != nil:
+			s := &ImpactSide{Type: p.Type, Summary: append([]string{}, p.Summary...)}
+			if cp != nil {
+				s.Also = []string{cp.Type}
+				s.Summary = append(s.Summary, cp.Summary...)
+			}
+			return s, p, cp
+		case pass.errs[id] != "":
+			return &ImpactSide{Type: "error", Summary: []string{pass.errs[id]}}, nil, nil
+		case cp != nil:
+			return &ImpactSide{Type: cp.Type, Summary: append([]string{}, cp.Summary...)}, nil, cp
 		}
-		if msg, ok := pass.errs[id]; ok {
-			return &ImpactSide{Type: "error", Summary: []string{msg}}, nil
-		}
-		return nil, nil
+		return nil, nil, nil
 	}
 	added, removed, attrs := map[string]int{}, map[string]int{}, map[string]int{}
 	display := map[string]string{}
 	for _, id := range idents {
-		bs, bplan := side(bp, bIdx, id.ID)
-		ps, pplan := side(pp, pIdx, id.ID)
+		bs, bplan, bcloud := side(bp, bIdx, bCloud, id.ID)
+		ps, pplan, pcloud := side(pp, pIdx, pCloud, id.ID)
 		if bs == nil && ps == nil {
 			continue
 		}
 		if bs != nil {
-			res.Summary.Baseline[bs.Type]++
+			for _, t := range append([]string{bs.Type}, bs.Also...) {
+				res.Summary.Baseline[t]++
+			}
 		}
 		if ps != nil {
-			res.Summary.Proposed[ps.Type]++
+			for _, t := range append([]string{ps.Type}, ps.Also...) {
+				res.Summary.Proposed[t]++
+			}
 		}
 		cur := pp.byID[id.ID]
 		item := ImpactItem{IdentityID: id.ID, ExternalID: id.ExternalID, Display: id.Display, ADSam: cur.ADSam, State: cur.State, Baseline: bs, Proposed: ps, Lines: []ImpactLine{}}
@@ -344,7 +444,7 @@ func buildImpact(bp, pp *planPass, idents []model.Identity) *ImpactResult {
 		case ps == nil:
 			item.Difference = "gone"
 		case bs.Type != ps.Type || strings.Join(bs.Summary, "\n") != strings.Join(ps.Summary, "\n") ||
-			(bplan != nil && pplan != nil && PayloadHash(bplan.Type, bplan.Payload) != PayloadHash(pplan.Type, pplan.Payload)):
+			(bplan != nil && pplan != nil && !samePlan(bplan, pplan)) || !samePlan(bcloud, pcloud):
 			item.Difference = "changed"
 		default:
 			item.Difference = "same"
@@ -372,13 +472,13 @@ func buildImpact(bp, pp *planPass, idents []model.Identity) *ImpactResult {
 					}
 				}
 			}
-			ba, pa := groupAdds(bplan), groupAdds(pplan)
+			ba, pa := groupAdds(bplan, bcloud), groupAdds(pplan, pcloud)
 			for g := range pa {
 				if !ba[g] {
 					added[g]++
 				}
 			}
-			br, pr := groupRemoves(bplan), groupRemoves(pplan)
+			br, pr := groupRemoves(bplan, bcloud), groupRemoves(pplan, pcloud)
 			for g := range pr {
 				if !br[g] {
 					removed[g]++
@@ -399,6 +499,12 @@ func buildImpact(bp, pp *planPass, idents []model.Identity) *ImpactResult {
 			display[strings.ToLower(dn)] = dn
 		}
 	}
+	if cv != nil {
+		for id := range cv.groups {
+			display[model.CloudGroupPrefix+id] = "Entra: " + cv.name(id)
+		}
+	}
+	display[cloudAllKey] = "Entra: all cloud groups (disable)"
 	toCounts := func(m map[string]int, group bool) []ImpactCount {
 		out := []ImpactCount{}
 		for k, n := range m {
@@ -439,7 +545,7 @@ func filterImpact(res *ImpactResult, req ImpactRequest) {
 		if req.OnlyChanged && it.Difference == "same" {
 			continue
 		}
-		if req.Type != "" && !((it.Proposed != nil && it.Proposed.Type == req.Type) || (it.Baseline != nil && it.Baseline.Type == req.Type)) {
+		if req.Type != "" && !it.Proposed.has(req.Type) && !it.Baseline.has(req.Type) {
 			continue
 		}
 		if q != "" && !strings.Contains(strings.ToLower(it.Display), q) && !strings.Contains(strings.ToLower(it.ExternalID), q) &&

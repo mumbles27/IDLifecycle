@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -74,8 +75,30 @@ func isTerminated(opt model.SourceOptions, attrs map[string]string) bool {
 	return false
 }
 
+// termination says whether a record is terminated: reason "terminated" (status value) or "termination_date" (the date
+// plus termination_after_days has passed in loc); date is the termination date (YYYY-MM-DD) when one was read, and bad
+// is the raw value when the date field holds something unreadable.
+func termination(opt model.SourceOptions, attrs map[string]string, now time.Time, loc *time.Location) (reason, date, bad string) {
+	if f := strings.TrimSpace(opt.TerminationDateField); f != "" {
+		if raw := strings.TrimSpace(lookupAttr(attrs, f)); raw != "" {
+			if d, ok := sources.ParseTerminationDate(raw, opt.TerminationDateFormat); ok {
+				date = d.Format(time.DateOnly)
+				if sources.TerminationPassed(d, opt.TerminationAfterDays, now, loc) {
+					reason = "termination_date"
+				}
+			} else {
+				bad = raw
+			}
+		}
+	}
+	if isTerminated(opt, attrs) {
+		reason = "terminated"
+	}
+	return reason, date, bad
+}
+
 // ingest fetches one source and upserts identities. The returned slice is the source's full identity set.
-func (e *Engine) ingest(ctx context.Context, src model.Source, cnt map[string]int) ([]model.Identity, error) {
+func (e *Engine) ingest(ctx context.Context, src model.Source, cnt map[string]int, loc *time.Location, notes *runNotes) ([]model.Identity, error) {
 	built, err := sources.BuildFor(src, e.Cipher, e.Store.ListManualPeople)
 	if err != nil {
 		return nil, err
@@ -138,6 +161,25 @@ func (e *Engine) ingest(ctx context.Context, src model.Source, cnt map[string]in
 			return nil, fmt.Errorf("%d of %d active identities are missing from the feed (over %d%%); refusing to process a feed that looks truncated", absent, active, maxFeedShrinkPercent)
 		}
 	}
+	// Who typed each console person in (for the identity's first history row).
+	createdBy := map[string]string{}
+	if !feed {
+		people, err := e.Store.ListManualPeople(ctx, src.ID)
+		if err != nil {
+			return nil, err
+		}
+		for _, p := range people {
+			createdBy[p.ExternalID] = p.CreatedBy
+		}
+	}
+	srcInfo := map[string]any{"source_id": src.ID, "source": src.Name, "source_type": src.Type}
+	withSrc := func(d map[string]any) map[string]any {
+		for k, v := range srcInfo {
+			d[k] = v
+		}
+		return d
+	}
+	badDates, badExample := 0, ""
 	seen := map[string]bool{}
 	for _, r := range rows {
 		ext := strings.TrimSpace(lookupAttr(r, idField))
@@ -153,7 +195,14 @@ func (e *Engine) ingest(ctx context.Context, src model.Source, cnt map[string]in
 		}
 
 		attrs := map[string]string(r)
-		active := !isTerminated(src.Options, attrs)
+		why, leaveDate, bad := termination(src.Options, attrs, now, loc)
+		active := why == ""
+		if bad != "" {
+			badDates++
+			if badExample == "" {
+				badExample = bad
+			}
+		}
 		hash := hashAttrs(attrs)
 		display := displayName(attrs, ext)
 
@@ -169,30 +218,74 @@ func (e *Engine) ingest(ctx context.Context, src model.Source, cnt map[string]in
 			cnt["new_identities"]++
 			byExt[ext] = id
 			all = append(all, id)
+			d := withSrc(map[string]any{"origin": OriginSource, "active": active, "fields": attrs})
+			if !feed {
+				d["origin"], d["created_by"] = OriginManual, createdBy[ext]
+			}
+			e.identityAudit(ctx, "system", ActFirstSeen, *id, d)
 			continue
 		}
 		if cur.AttrsHash != hash || cur.Active != active || cur.MissingRuns != 0 || cur.Display != display {
+			prevAttrs, prevActive, prevHash := cur.Attrs, cur.Active, cur.AttrsHash
 			cur.Attrs, cur.AttrsHash, cur.Active, cur.MissingRuns, cur.Display, cur.LastSeen = attrs, hash, active, 0, display, now
 			if err := e.Store.UpdateIdentity(ctx, *cur); err != nil {
 				return nil, fmt.Errorf("update identity %s: %w", ext, err)
 			}
 			cnt["updated_identities"]++
+			if prevHash != hash {
+				if ch := attrChanges(prevAttrs, attrs); len(ch) > 0 {
+					e.identityAudit(ctx, "system", ActSourceChanged, *cur, withSrc(map[string]any{"changes": ch}))
+				}
+			}
+			switch {
+			case prevActive && !active && why == "termination_date":
+				e.identityAudit(ctx, "system", ActInactive, *cur, withSrc(map[string]any{"reason": why,
+					"termination_date_field": src.Options.TerminationDateField, "termination_date": leaveDate}))
+			case prevActive && !active:
+				e.identityAudit(ctx, "system", ActInactive, *cur, withSrc(map[string]any{"reason": "terminated",
+					"status_field": src.Options.StatusField, "status": lookupAttr(attrs, src.Options.StatusField)}))
+			case !prevActive && active:
+				e.identityAudit(ctx, "system", ActReactivated, *cur, withSrc(map[string]any{}))
+			}
 		}
 	}
 
+	if badDates > 0 {
+		cnt["warnings"]++
+		msg := fmt.Sprintf("Source %q: %d termination date(s) in %q could not be read (e.g. %q); those people are not treated as leavers by date. Check termination_date_format.",
+			src.Name, badDates, src.Options.TerminationDateField, clipText(badExample, 40))
+		e.Log.Warn("unreadable termination dates", "source", src.Name, "count", badDates)
+		if notes != nil {
+			notes.issues = append(notes.issues, msg)
+		}
+	}
 	out := make([]model.Identity, 0, len(all))
 	for _, cur := range all {
 		if !seen[cur.ExternalID] {
 			cur.MissingRuns++
+			wentInactive := false
 			if src.Options.MissingMeansTerminated && cur.MissingRuns > src.Options.MissingGraceRuns && cur.Active {
 				cur.Active = false
 				cnt["terminated_by_absence"]++
+				wentInactive = true
 			}
 			if err := e.Store.UpdateIdentity(ctx, *cur); err != nil {
 				return nil, err
+			}
+			if wentInactive {
+				e.identityAudit(ctx, "system", ActInactive, *cur, withSrc(map[string]any{"reason": "missing", "missing_runs": cur.MissingRuns}))
 			}
 		}
 		out = append(out, *cur)
 	}
 	return out, nil
+}
+
+// clipText shortens s to at most n runes for a message.
+func clipText(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }

@@ -4,6 +4,7 @@ import { api } from '../api.js';
 import {
   h, replaceContent, pageHeader, pill, dataTable, listItems, act, confirmDialog, toast,
   errorBox, loading, field, inputText, inputNumber, inputArea, inputCheck, formModal, mutBtn, truncCell, notice,
+  historyLink,
 } from '../ui.js';
 import {
   selectWithHelp, previewPanel, MODE_OPTIONS, MODE_INFO, ON_EMPTY_OPTIONS, ON_EMPTY_INFO,
@@ -62,15 +63,14 @@ export async function render(root, ctx) {
       { label: 'Type', key: 'value_type' },
       { label: 'Enabled', render: (m) => pill(m.enabled ? 'enabled' : 'disabled') },
     ];
-    if (isAdmin) {
-      columns.push({
-        label: 'Actions',
-        className: 'col-actions',
-        render: (m) => h('div', { class: 'row-actions' },
-          mutBtn('Edit', { class: 'btn-sm', 'data-test': 'edit-mapping', onclick: () => openEditor(m) }),
-          mutBtn('Delete', { class: 'btn-sm btn-danger', 'data-test': 'delete-mapping', onclick: (e) => remove(m, e.currentTarget) })),
-      });
-    }
+    columns.push({
+      label: 'Actions',
+      className: 'col-actions',
+      render: (m) => h('div', { class: 'row-actions' },
+        isAdmin ? mutBtn('Edit', { class: 'btn-sm', 'data-test': 'edit-mapping', onclick: () => openEditor(m) }) : null,
+        historyLink('mapping', m.id),
+        isAdmin ? mutBtn('Delete', { class: 'btn-sm btn-danger', 'data-test': 'delete-mapping', onclick: (e) => remove(m, e.currentTarget) }) : null),
+    });
     replaceContent(listEl, dataTable(columns, items, {
       caption: 'Attribute mappings',
       empty: 'No mappings yet. Add one to start populating AD attributes.',

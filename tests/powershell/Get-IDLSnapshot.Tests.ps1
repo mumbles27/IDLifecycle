@@ -194,3 +194,19 @@ Describe 'Get-IDLSnapshot.ps1' {
         $r.ExitCode | Should Be 2
     }
 }
+
+Describe 'Get-IDLSnapshot.ps1 sid' {
+
+    It 'returns every user''s objectSid as an S-1-5-... string (matched against Entra onPremisesSecurityIdentifier)' {
+        $jane = New-StubUserEntry -Sam 'jdoe' -ExternalId 'E1001'
+        $jane['objectSid'] = 'S-1-5-21-100-200-300-1105'
+        $bob = New-StubUserEntry -Sam 'bsmith' -ExternalId 'E1002'
+        $state = New-StubStateFile -Users @($jane, $bob) -Ous @("OU=Staff,$script:Root")
+        $request = @{ searchBases = @("OU=Staff,$script:Root"); idAttribute = 'employeeID'; properties = @(); groups = @() }
+        $r = Invoke-IDLScript -Script 'Get-IDLSnapshot' -Request $request -StatePath $state
+
+        $r.ExitCode | Should Be 0
+        @($r.Json.users | Where-Object { $_.sam -eq 'jdoe' })[0].sid | Should Be 'S-1-5-21-100-200-300-1105'
+        @($r.Json.users | Where-Object { $_.sam -eq 'bsmith' })[0].sid | Should Match '^S-1-5-21-\d+-\d+-\d+-\d+$'
+    }
+}

@@ -287,3 +287,114 @@ Describe 'Disable-IDLUser.ps1 addGroups (lifecycle groups for disabled accounts)
         (Get-StubCalls -Path $f.State).Count | Should Be 0
     }
 }
+
+Describe 'Disable-IDLUser.ps1 undo support (before, set/clear, expect, force)' {
+
+    function New-Fixture {
+        $jane = New-StubUserEntry -Sam 'jdoe' -ExternalId 'E1001' -Cn 'Jane Doe' -Attributes @{ description = 'Analyst team'; title = 'Analyst' } -MemberOf @("CN=GG-AllStaff,OU=Groups,$script:Root", "CN=GG-Sales,OU=Groups,$script:Root")
+        $path = New-StandardState -Users @($jane)
+        return @{ State = $path; Jane = $jane }
+    }
+
+    function New-DisableRequest {
+        param([object[]]$Items)
+        return [ordered]@{ server = ''; idAttribute = 'employeeID'; items = @($Items) }
+    }
+
+    function New-JaneItem {
+        param($Jane)
+        return [ordered]@{
+            changeId = 'c1'; externalId = 'E1001'; objectGuid = $Jane.objectGuid
+            moveTo = "OU=Disabled,$script:Root"; removeGroups = @('GG-AllStaff', 'GG-Old'); addGroups = @('GG-Old')
+            description = 'Disabled by IDLifecycle 2026-10-29'
+        }
+    }
+
+    It 'returns before: enabled, DN, the old description and only the groups actually changed (applied and DryRun)' {
+        foreach ($dry in @($true, $false)){
+            $f = New-Fixture
+            $r = Invoke-IDLScript -Script 'Disable-IDLUser' -Request (New-DisableRequest @(New-JaneItem $f.Jane)) -StatePath $f.State -DryRun:$dry
+
+            $r.ExitCode | Should Be 0
+            $b = $r.Json.results[0].before
+            $b.enabled | Should Be $true
+            $b.dn | Should Be "CN=Jane Doe,OU=Staff,$script:Root"
+            $b.attributes.description | Should Be 'Analyst team'
+            @($b.groupsRemoved) -join '|' | Should Be "CN=GG-AllStaff,OU=Groups,$script:Root"   # GG-Old: was not a member
+            @($b.groupsAdded) -join '|' | Should Be "CN=GG-Old,OU=Groups,$script:Root"
+            if ($dry){
+                (Get-StubCalls -Path $f.State).Count | Should Be 0
+            }
+        }
+    }
+
+    It 'applies set/clear after disabling and records the old values' {
+        $f = New-Fixture
+        $item = [ordered]@{ changeId = 'c1'; externalId = 'E1001'; objectGuid = $f.Jane.objectGuid; set = @{ title = 'Former analyst' }; clear = @('description') }
+        $r = Invoke-IDLScript -Script 'Disable-IDLUser' -Request (New-DisableRequest @($item)) -StatePath $f.State
+
+        $r.Json.results[0].status | Should Be 'applied'
+        $r.Json.results[0].before.attributes.title | Should Be 'Analyst'
+        $r.Json.results[0].before.attributes.description | Should Be 'Analyst team'
+        $u = Get-StubUser -Path $f.State -Sam 'jdoe'
+        $u.enabled | Should Be $false
+        $u.attributes.title | Should Be 'Former analyst'
+        @($u.attributes.PSObject.Properties | ForEach-Object { $_.Name }) -contains 'description' | Should Be $false
+        $calls = @(Get-StubCalls -Path $f.State | ForEach-Object { $_.cmdlet })
+        $calls.IndexOf('Disable-ADAccount') | Should BeLessThan $calls.IndexOf('Set-ADUser')
+    }
+
+    It 'refuses before the disable: drift, a protected attribute in set, description given twice' {
+        $f = New-Fixture
+        $drift = New-JaneItem $f.Jane
+        $drift['expect'] = [ordered]@{ enabled = $false; attributes = @{ description = 'Something else' } }
+        $protected = [ordered]@{ changeId = 'c2'; externalId = 'E1001'; objectGuid = $f.Jane.objectGuid; set = @{ employeeID = 'X' } }
+        $twice = New-JaneItem $f.Jane
+        $twice.changeId = 'c3'
+        $twice['set'] = @{ description = 'other' }
+        $r = Invoke-IDLScript -Script 'Disable-IDLUser' -Request (New-DisableRequest @($drift, $protected, $twice)) -StatePath $f.State
+
+        $r.ExitCode | Should Be 1
+        $r.Json.results[0].error | Should Match "^drift: account is enabled, expected disabled; description is 'Analyst team', expected 'Something else'$"
+        $r.Json.results[1].error | Should Match 'protected'
+        $r.Json.results[2].error | Should Match 'both as a field and in set/clear'
+        foreach ($res in $r.Json.results){
+            $res.message | Should Be 'failed'
+        }
+
+        (Get-StubCalls -Path $f.State).Count | Should Be 0
+        (Get-StubUser -Path $f.State -Sam 'jdoe').enabled | Should Be $true
+    }
+
+    It 'force overrides the expect check' {
+        $f = New-Fixture
+        $item = New-JaneItem $f.Jane
+        $item['expect'] = [ordered]@{ enabled = $false }
+        $item['force'] = $true
+        $r = Invoke-IDLScript -Script 'Disable-IDLUser' -Request (New-DisableRequest @($item)) -StatePath $f.State
+        $r.Json.results[0].status | Should Be 'applied'
+        (Get-StubUser -Path $f.State -Sam 'jdoe').enabled | Should Be $false
+    }
+
+    It 'round trip: Enable-IDLUser with the inverse built from before puts the account back exactly' {
+        $f = New-Fixture
+        $original = Get-StubUserShape -Path $f.State -Guid $f.Jane.objectGuid
+        $r = Invoke-IDLScript -Script 'Disable-IDLUser' -Request (New-DisableRequest @(New-JaneItem $f.Jane)) -StatePath $f.State
+        $applied = $r.Json.results[0]
+        $applied.status | Should Be 'applied'
+
+        $expect = [ordered]@{
+            enabled     = $false
+            dn          = $applied.dn
+            attributes  = @{ description = 'Disabled by IDLifecycle 2026-10-29' }
+            memberOf    = @($applied.before.groupsAdded)
+            notMemberOf = @($applied.before.groupsRemoved)
+        }
+        $undo = New-UndoItem -Result $applied -Expect $expect
+        $r = Invoke-IDLScript -Script 'Enable-IDLUser' -Request (New-DisableRequest @($undo)) -StatePath $f.State
+
+        $r.ExitCode | Should Be 0
+        $r.Json.results[0].status | Should Be 'applied'
+        (Get-StubUserShape -Path $f.State -Guid $f.Jane.objectGuid) | Should Be $original
+    }
+}

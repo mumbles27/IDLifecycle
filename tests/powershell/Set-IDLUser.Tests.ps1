@@ -235,3 +235,147 @@ Describe 'Set-IDLUser.ps1' {
         (Get-StubUser -Path $state -Sam 'jdoe').attributes.title | Should Be 'Old'
     }
 }
+
+Describe 'Set-IDLUser.ps1 undo support (before, expect, force)' {
+
+    function New-Fixture {
+        $jane = New-StubUserEntry -Sam 'jdoe' -ExternalId 'E1001' -Cn 'Jane Doe' -Attributes @{ title = 'Old'; telephoneNumber = '555-0100'; department = 'Ops' } -MemberOf @("CN=GG-Old,OU=Groups,$script:Root")
+        $bob = New-StubUserEntry -Sam 'bsmith' -ExternalId 'E1002' -Cn 'Bob Smith' -Attributes @{ title = 'Clerk' }
+        $path = New-StandardState -Users @($jane, $bob)
+        return @{ State = $path; Jane = $jane; Bob = $bob }
+    }
+
+    function New-SetRequest {
+        param([object[]]$Items)
+        return [ordered]@{ server = ''; idAttribute = 'employeeID'; items = @($Items) }
+    }
+
+    function New-JaneItem {
+        param($Jane)
+        return [ordered]@{
+            changeId = 'c1'; externalId = 'E1001'; objectGuid = $Jane.objectGuid
+            set = [ordered]@{ title = 'New'; department = 'Ops'; pager = '123' }
+            clear = @('telephoneNumber')
+            addGroups = @('GG-AllStaff', 'GG-Old')
+            removeGroups = @('GG-Sales')
+            moveTo = "OU=Sales,$script:Root"
+        }
+    }
+
+    It 'returns before: old values of the changed attributes only, the groups actually added or removed, the old DN' {
+        $f = New-Fixture
+        $r = Invoke-IDLScript -Script 'Set-IDLUser' -Request (New-SetRequest @(New-JaneItem $f.Jane)) -StatePath $f.State
+
+        $r.ExitCode | Should Be 0
+        $res = $r.Json.results[0]
+        $res.status | Should Be 'applied'
+        $b = $res.before
+        $b.enabled | Should Be $true
+        $b.dn | Should Be "CN=Jane Doe,OU=Staff,$script:Root"
+        $b.attributes.title | Should Be 'Old'
+        $b.attributes.telephoneNumber | Should Be '555-0100'
+        @($b.attributes.PSObject.Properties | ForEach-Object { $_.Name }) -contains 'pager' | Should Be $true
+        $b.attributes.pager | Should Be $null
+        @($b.attributes.PSObject.Properties | ForEach-Object { $_.Name }) -contains 'department' | Should Be $false   # unchanged: not recorded
+        @($b.groupsAdded) -join '|' | Should Be "CN=GG-AllStaff,OU=Groups,$script:Root"    # GG-Old: already a member
+        @($b.groupsRemoved).Count | Should Be 0                                             # GG-Sales: was not a member
+        $res.dn | Should Be "CN=Jane Doe,OU=Sales,$script:Root"
+    }
+
+    It 'DryRun returns the same before with zero mutating calls; a skipped item has none' {
+        $f = New-Fixture
+        $r = Invoke-IDLScript -Script 'Set-IDLUser' -Request (New-SetRequest @(New-JaneItem $f.Jane)) -StatePath $f.State -DryRun
+
+        $r.ExitCode | Should Be 0
+        $res = $r.Json.results[0]
+        $res.status | Should Be 'would'
+        $res.before.attributes.title | Should Be 'Old'
+        @($res.before.groupsAdded) -join '|' | Should Be "CN=GG-AllStaff,OU=Groups,$script:Root"
+        (Get-StubCalls -Path $f.State).Count | Should Be 0
+
+        $noop = [ordered]@{ changeId = 'c2'; externalId = 'E1002'; objectGuid = $f.Bob.objectGuid; set = @{ title = 'Clerk' } }
+        $r = Invoke-IDLScript -Script 'Set-IDLUser' -Request (New-SetRequest @($noop)) -StatePath $f.State
+        $r.Json.results[0].status | Should Be 'skipped'
+        @($r.Json.results[0].PSObject.Properties | ForEach-Object { $_.Name }) -contains 'before' | Should Be $false
+    }
+
+    It 'drift: an account that changed since fails before any change, with every difference listed; other items continue' {
+        $f = New-Fixture
+        $item = New-JaneItem $f.Jane
+        $item['expect'] = [ordered]@{
+            enabled     = $false
+            dn          = "CN=Jane Doe,OU=Sales,$script:Root"
+            attributes  = [ordered]@{ title = 'Senior'; telephoneNumber = $null }
+            memberOf    = @("CN=GG-Sales,OU=Groups,$script:Root")
+            notMemberOf = @('GG-Old')
+        }
+        $bob = [ordered]@{ changeId = 'c2'; externalId = 'E1002'; objectGuid = $f.Bob.objectGuid; set = @{ title = 'Lead' } }
+        $r = Invoke-IDLScript -Script 'Set-IDLUser' -Request (New-SetRequest @($item, $bob)) -StatePath $f.State
+
+        $r.ExitCode | Should Be 1
+        $res = $r.Json.results[0]
+        $res.status | Should Be 'failed'
+        $res.message | Should Be 'failed'
+        $res.error | Should Match '^drift: '
+        $res.error | Should Match 'account is enabled, expected disabled'
+        $res.error | Should Match "account is at CN=Jane Doe,OU=Staff,DC=stub,DC=test, expected CN=Jane Doe,OU=Sales"
+        $res.error | Should Match "title is 'Old', expected 'Senior'"
+        $res.error | Should Match "telephoneNumber is '555-0100', expected empty"
+        $res.error | Should Match 'no longer a member of CN=GG-Sales'
+        $res.error | Should Match 'is a member of GG-Old again'
+        @($res.PSObject.Properties | ForEach-Object { $_.Name }) -contains 'before' | Should Be $false
+        $r.Json.results[1].status | Should Be 'applied'
+        @(Get-StubCalls -Path $f.State | Where-Object { $_.args.Identity -eq $f.Jane.objectGuid -or ($_.args | ConvertTo-Json -Compress) -match 'Jane Doe' }).Count | Should Be 0
+        (Get-StubUser -Path $f.State -Sam 'jdoe').attributes.title | Should Be 'Old'
+    }
+
+    It 'expect that matches passes; force skips the check (WARN) and applies' {
+        $f = New-Fixture
+        $item = New-JaneItem $f.Jane
+        $item['expect'] = [ordered]@{ enabled = $true; dn = "cn=jane doe,ou=staff,$script:Root"; attributes = @{ title = 'Old'; pager = $null }; memberOf = @('GG-Old'); notMemberOf = @('GG-AllStaff') }
+        $r = Invoke-IDLScript -Script 'Set-IDLUser' -Request (New-SetRequest @($item)) -StatePath $f.State -DryRun
+        $r.Json.results[0].status | Should Be 'would'
+
+        $f = New-Fixture
+        $item = New-JaneItem $f.Jane
+        $item['expect'] = [ordered]@{ attributes = @{ title = 'Senior' } }
+        $item['force'] = $true
+        $r = Invoke-IDLScript -Script 'Set-IDLUser' -Request (New-SetRequest @($item)) -StatePath $f.State
+        $r.Json.results[0].status | Should Be 'applied'
+        $r.LogText | Should Match 'expect check skipped \(force\)'
+        (Get-StubUser -Path $f.State -Sam 'jdoe').attributes.title | Should Be 'New'
+    }
+
+    It 'rejects a malformed expect before any change' {
+        $f = New-Fixture
+        $item = New-JaneItem $f.Jane
+        $item['expect'] = [ordered]@{ enabled = 'yes' }
+        $r = Invoke-IDLScript -Script 'Set-IDLUser' -Request (New-SetRequest @($item)) -StatePath $f.State
+        $r.Json.results[0].status | Should Be 'failed'
+        $r.Json.results[0].error | Should Match 'expect.enabled must be true or false'
+        (Get-StubCalls -Path $f.State).Count | Should Be 0
+    }
+
+    It 'round trip: the inverse built from before (with expect) puts the account back exactly' {
+        $f = New-Fixture
+        $original = Get-StubUserShape -Path $f.State -Guid $f.Jane.objectGuid
+        $r = Invoke-IDLScript -Script 'Set-IDLUser' -Request (New-SetRequest @(New-JaneItem $f.Jane)) -StatePath $f.State
+        $applied = $r.Json.results[0]
+        (Get-StubUserShape -Path $f.State -Guid $f.Jane.objectGuid) | Should Not Be $original
+
+        $expect = [ordered]@{
+            dn          = $applied.dn
+            attributes  = [ordered]@{ title = 'New'; pager = '123'; telephoneNumber = $null }
+            memberOf    = @($applied.before.groupsAdded)
+            notMemberOf = @($applied.before.groupsRemoved)
+        }
+        $undo = New-UndoItem -Result $applied -Expect $expect
+        $r = Invoke-IDLScript -Script 'Set-IDLUser' -Request (New-SetRequest @($undo)) -StatePath $f.State
+
+        $r.ExitCode | Should Be 0
+        $r.Json.results[0].status | Should Be 'applied'
+        (Get-StubUserShape -Path $f.State -Guid $f.Jane.objectGuid) | Should Be $original
+        # The undo's own before is the redo record.
+        $r.Json.results[0].before.attributes.title | Should Be 'New'
+    }
+}

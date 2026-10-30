@@ -5,13 +5,10 @@
 A Windows service that keeps Active Directory in step with your HR system.
 
 **Documentation:** [Install and initial setup guide](docs/SETUP-GUIDE.md) (step by step, for the people installing it) ·
-<<<<<<< HEAD
 [Architecture and interface contracts](docs/ARCHITECTURE.md) · [Web UI notes](docs/UI.md) · [Code map](https://mumbles27.github.io/IDLifecycle/CODEMAP.html)
-(a diagram of how the packages, scripts and web UI connect; its source is `docs/CODEMAP.html`) · this README (reference).
-=======
-[Architecture and interface contracts](docs/ARCHITECTURE.md) · [Web UI notes](docs/UI.md) · [Code map](https://mumbles27.github.io/IDLifecycle/CODEMAP.html) (a diagram of how the
-packages, scripts and web UI connect; open the file in a browser) · this README (reference).
->>>>>>> 2bd76dae70eb77afae28f180fe6637596d8b46cd
+(a diagram of how the packages, scripts and web UI connect; its source is `docs/CODEMAP.html`) ·
+[Testing guide](docs/TESTING.md) (how the tests work and how to check your own environment) ·
+[Test map](https://mumbles27.github.io/IDLifecycle/TESTMAP.html) (which test covers what; its source is `docs/TESTMAP.html`) · this README (reference).
 
 * **Sources**: any HR system with a REST/JSON API (generic connector, no code), a CSV file, or a SQL database table/view (SQL Server, PostgreSQL, MySQL/MariaDB,
   SQLite) filled by your own HR export job; more can be added by implementing one small Go interface.
@@ -356,6 +353,82 @@ difference (+ added / − removed steps). A live search box finds one person (na
 only changed people or one change type. Nothing is written and no names are checked in AD; the AD snapshot is reused
 for 15 minutes (**Refresh from AD** takes a new one). Without changes, the page shows exactly what the next sync plans.
 
+### Microsoft 365, Entra ID and Exchange Online groups
+
+Role rules and lifecycle groups can also grant **cloud groups**. Once the Microsoft 365 connection is set up, the
+group search has a second source, **Entra ID / Microsoft 365**, next to Active Directory. Cloud groups are stored as
+`entra:<object id>`.
+
+| Group type | Changed through | Notes |
+|---|---|---|
+| Entra ID security group (cloud) | Microsoft Graph | |
+| Microsoft 365 group (Teams, SharePoint, shared mailbox) | Microsoft Graph | |
+| Mail-enabled security group (cloud) | Exchange Online PowerShell | Graph cannot change these |
+| Distribution list (cloud) | Exchange Online PowerShell | Graph cannot change these |
+| Any group synced from AD, including on-prem Exchange distribution groups | Active Directory (as before) | pick it under *Active Directory*; the cloud copy follows by sync |
+| Dynamic groups, role-assignable groups | never | shown greyed out with the reason |
+
+How it works:
+- The service changes the **cloud copy of each AD account** (users synced by Entra Connect or Cloud Sync). It
+  matches the account by its SID (`onPremisesSecurityIdentifier`, the default), by `onPremisesImmutableId`, or by UPN.
+- A new hire gets their cloud groups on the first sync after their account appears in Entra ID, normally within 30
+  minutes. Until then the preview shows "waiting for Entra sync".
+- Cloud group changes are a separate change type, **Cloud groups**. They have their own approval setting, so they
+  can fail or wait for approval without holding up the AD change for the same person.
+- They follow the same lifecycle rules as AD groups: active accounts are added to role and *active* groups, and
+  stale managed groups are removed. On disable, the account is taken out of all cloud groups except the kept ones,
+  or only the managed ones, or none. A rehire leaves the *disabled* groups again.
+- Dynamic, role-assignable and AD-synced groups are always left alone.
+- If Microsoft 365 cannot be reached, the run warns and plans no cloud changes; the AD work still runs.
+
+#### Access required
+
+You need one app registration in Entra ID (single tenant) with a certificate. A client secret also works if you only
+use Graph.
+
+1. **Certificate.** On the IDLifecycle server, as an administrator, run:
+   ```powershell
+   scripts\New-IDLCloudCertificate.ps1 -OutDir C:\Temp
+   ```
+   It creates a self-signed certificate in `LocalMachine\My`, valid for 2 years, with the key held by the older key
+   provider (CSP) that Exchange Online requires. It gives the service account read access to the private key and
+   exports only the public `.cer` file. Upload that file under the app's **Certificates & secrets**.
+2. **Microsoft Graph application permissions**, with admin consent granted:
+   | Permission | Why |
+   |---|---|
+   | `GroupMember.ReadWrite.All` | search groups, read members, add and remove members (security and Microsoft 365 groups) |
+   | `Group.Read.All` | read every group's properties, including whether it is role-assignable (without it such groups are refused as *unverified*) |
+   | `User.Read.All` | find the cloud copy of each AD account, and its group memberships on disable |
+
+   Do **not** grant `RoleManagement.ReadWrite.Directory`. Role-assignable groups are refused by design.
+3. **Exchange Online** (only for mail-enabled security groups and distribution lists):
+   - Under **API permissions → APIs my organization uses → Office 365 Exchange Online → Application**, add
+     **`Exchange.ManageAsApp`** and grant admin consent.
+   - Give the app's service principal Exchange rights. The least-privilege way is a custom role group with the
+     **Distribution Groups** and **Security Group Creation and Membership** roles. Use the *Enterprise application*
+     object id, not the app registration's:
+     ```powershell
+     Connect-ExchangeOnline     # as an Exchange admin
+     New-ServicePrincipal -AppId <client-id> -ObjectId <enterprise-app-object-id> -DisplayName "IDLifecycle"
+     New-RoleGroup -Name "IDLifecycle Group Membership" -Roles "Distribution Groups","Security Group Creation and Membership"
+     Add-RoleGroupMember -Identity "IDLifecycle Group Membership" -Member <enterprise-app-object-id>
+     ```
+     The simpler, broader alternative is to assign the Entra role **Exchange Recipient Administrator** to the app.
+   - Install the **ExchangeOnlineManagement** module (3.x) for all users on the server:
+     `Install-Module ExchangeOnlineManagement -Scope AllUsers`.
+4. **Settings → Microsoft 365 / Entra ID**:
+   - Fill in the environment (Global, GCC High, DoD or China), tenant ID, client ID and the certificate thumbprint
+     (or client secret).
+   - Choose the user matching.
+   - Turn on Exchange Online and enter the organization (`contoso.onmicrosoft.com`).
+   - Click **Test connection**. It checks the certificate (private key, CSP, days to expiry), the token, the Graph
+     permissions in the token (permissions broader than needed get a warning), reading groups and users and, if
+     Exchange Online is on, the module, the connection and the Exchange rights.
+
+Secrets are stored encrypted and shown as `********`. A certificate never leaves the server. Anyone holding the
+certificate's private key can act as the app, so keep `LocalMachine\My` restricted to administrators and the service
+account. Renew the certificate before it expires; **Test connection** warns 30 days ahead.
+
 ### Templates
 
 Go `text/template` over the source record: `{{ .FirstName }}`, `{{ index . "currentStatus.statusType" }}`.
@@ -400,9 +473,10 @@ keep a random part in it. The preview shows a sample password and whether AD's c
 
 ### Lifecycle & safety rails
 
-* Terminated (status field matches `terminated_values`, or absent from the feed for more than `missing_grace_runs`
-  runs when `missing_means_terminated`) → **disable** (optionally move to the Disabled OU; groups by *Lifecycle groups*). After
-  `delete_after_days` → **delete**. Active again → **enable**.
+* Terminated (status field matches `terminated_values`, the leaving date has passed, or absent from the feed for more
+  than `missing_grace_runs` runs when `missing_means_terminated`) → **disable** (move to the Disabled OU of the
+  person's retention policy; groups by *Lifecycle groups*). After the retention policy's days (default
+  `delete_after_days`) → **delete**. Active again → **enable**. See *Leavers: termination dates and retention*.
 * An empty or failed source fetch never means "everyone left": the run is flagged and nothing is proposed for it.
 * **Bulk-destructive guard**: more than `max_destructive_per_run` disables/deletes in one run are held for manual
   approval even when the policy is `auto`.
@@ -419,6 +493,118 @@ keep a random part in it. The preview shows a sample password and whether AD's c
   external id before touching it. New accounts get a random (or template, see *Templates*) password that is never stored
   or logged; hand-over is out of scope (use your normal reset process).
 * Every action is in an append-only, hash-chained **audit log**, searchable on the **History** page (*Verify integrity* checks the chain).
+
+### Leavers: termination dates and retention
+
+**When someone counts as having left.** Any of these, per source (*Sources* → the source):
+* the status field has a terminated value (`terminated_values`);
+* **Leaving date**: the date in `termination_date_field` has passed (plus `termination_after_days`, 0 = from the day after
+  the date), in the schedule's time zone. Formats: *Automatic* (`2026-10-31`, ISO date-times, `10/31/2026`, `31.10.2026`,
+  an Excel day number) or your own Go layout. A future date does nothing yet; the person's page and *Leavers* show
+  "Leaving on …". An unreadable date is ignored and counted as a warning. A date that is cleared or moved later makes
+  the person active again (re-enabled like any rehire);
+* they are missing from the source for `missing_grace_runs` runs (`missing_means_terminated`).
+
+**What happens then.** A **disable** change: the account is disabled, moved to the Disabled OU, removed from its
+groups except those you keep (*Lifecycle groups*: *disabled_remove*, *disabled_keep*) and added to the groups for
+disabled accounts. After the **retention** period, a **delete** change. Both follow the approval policy, the bulk guard
+and the delete limits; a person who is Manual (whole person or state) is never disabled or deleted automatically.
+
+**Retention policies** (*Configure → Retention*) decide how long a disabled account is kept and where it goes:
+
+| Setting | |
+|---|---|
+| Delete after | N days after the account was disabled, or **Never delete automatically** (e.g. a legal hold) |
+| Disabled OU | optional; overrides the global Disabled OU (the snapshot reads every policy's OU, so the account stays tracked) |
+| Extra groups to keep | kept on disable in addition to *Lifecycle groups → keep* |
+| Deletes always wait for a person | the delete is held for manual approval even when deletes are `auto` |
+| Conditions | the role-rule condition builder (ALL / ANY, nested groups), on the person's last HR record (kept after they leave) and `ad.memberOf` (any of the account's groups, by DN or name), `ad.ou`, `ad.sam`, `source`, `origin` (`source` / `manual`) |
+
+Which policy applies, in order: a policy **assigned to the person** (*Identities* → the person → **Change retention…**,
+approvers, reason required), else the **first enabled policy by priority whose conditions match**, else the built-in
+**Default** (the global *delete after* days and Disabled OU, edited on the same page). A policy without conditions
+applies only to people assigned to it. Changing a policy recalculates the delete date of people already disabled.
+Each policy has **Test this policy** (against a person), **Preview impact** (who would be deleted now, later or no
+longer), a people count and a History link.
+
+**Seeing what is coming.** *Operate → Leavers* lists upcoming deletions (overdue ones first) and people leaving in the
+next 7 / 30 / 90 / 365 days, with the policy and why it applies. The person's page shows "Disabled on … · deleted on …
+(policy Executives, matched its conditions)" or "Leaving on …". History records `identity.inactive` (reason
+`termination_date`), `identity.retention_changed` (another policy now applies) and `identity.retention_set` (assigned
+by a person); policy edits are `retention.create|update|delete` with before/after detail.
+
+### Undoing a change
+
+An applied change, part of one, or several changes of a run can be rolled back: attributes, AD groups, an OU move, a disable, an enable, a create, a link, or
+cloud group memberships. It is built so that it can't happen by accident or without knowing exactly what it does.
+
+**What makes it possible.** When a script applies a change, it reports what the account looked like *just before*:
+the attribute values it replaced, the groups it actually added or removed, the DN, whether the account was enabled,
+the ID value and names (links), and the cloud groups it changed. That is stored with the change. Changes applied
+before this feature have no such record and can't be undone.
+
+| Change | Undo does |
+|---|---|
+| update | puts the previous attribute values back, re-adds removed groups, removes added groups, moves back to the previous OU |
+| disable | enables the account, moves it back, restores its groups and description |
+| enable | disables it again, moves it back, restores its groups |
+| create | **disables** the account it created (it is not deleted) |
+| link | puts the previous ID value and names (incl. `proxyAddresses`) back; that account is not offered for this person again |
+| cloud groups | re-adds the groups it removed and removes the groups it added |
+| an undo | can itself be undone (redo) |
+| delete | **not possible**: deleted accounts can only be restored from the AD Recycle Bin (`Restore-ADObject`) |
+
+**How it works**
+
+1. **Request** (admins): *Approvals* → status *applied* → **Undo…** on the change. The dialog shows the change being
+   undone, every step in plain words, and a **live dry run** against AD (or Microsoft 365): the script runs with
+   `-DryRun`, reads the account and reports what it would do, writing nothing.
+   * **Drift**: if anything the change set was changed since (by someone, or by a later change), it is listed in red
+     and the undo is refused unless you tick *Overwrite the later changes* **and** a second box confirming you checked
+     them.
+   * You must enter a **reason** (10+ characters) and **type the account's username** to confirm.
+   * The server recomputes the undo when you submit; if it differs from what you previewed, it refuses and asks you to
+     preview again.
+2. **Approve** (approvers): an undo always waits in *Approvals*, red **undo** tag; it is never approved automatically,
+   never in bulk. *Approve undo…* shows who asked and why, runs a fresh dry run, and needs the username typed again.
+   With **Settings → Undo → Require a second person**, the requester can't approve their own undo.
+3. **Apply**: the script checks the account still looks as the original change left it (`expect`); if not, nothing is
+   changed and the undo fails with the differences (`drift: title is 'Lead', expected 'Senior'`). The original change is
+   marked *undone*; the identity's state follows (an undone disable makes it linked again, and so on).
+
+**Undoing only part of a change.** For an update or a cloud-group change, the dialog lists each part with a tick box:
+every attribute, every group added or removed, the OU move, every cloud group. Untick what you want to keep; the
+dry run, the drift check and the steps then cover only the ticked parts. A later edit to a part you are *not* undoing
+never blocks the undo (the account's OU is only checked when you undo the move). Undo the remaining parts later if you
+need to; the change shows *partly undone* until every part is. Creates, deletes, disables, enables and links are undone
+whole.
+
+**Undoing several changes of a run.** *Runs* → a run → **Undo changes from this run…** (admins) lists every applied
+change of that run by person, with the same part tick boxes (changes that can't be undone are greyed, with the reason).
+**Preview** dry-runs the whole selection at once; then a reason, *Mark every undone item as Manual* (ticked) and typing
+`UNDO <n>` (the number of undo changes) request one undo per change, as a **batch** (at most 200). In *Approvals*,
+**Approve batch…** shows a fresh dry run of each and needs `UNDO <n>` typed again; if any of them would now overwrite a
+later change, the batch is refused and those are approved or rejected one at a time. Individual approval still works.
+
+**Manual: stopping the next sync from redoing it.** If the HR data and the rules still say the same thing, the next
+sync would plan the change again. So everything an undo rolls back is set to **Manual** by default: IDLifecycle will not
+change that item for that person until someone sets it back to **Auto**. Items: an attribute, a group, the OU, a cloud
+group, the person's **state** (no create, link, disable, enable or delete), or the **whole person** (nothing at all is
+planned for them). Manual items need no end date (one can be set).
+
+*Identities* → a person → **Managed fields** shows every mapped attribute, group and the OU with the value in AD, what
+the rules would set, and *Auto* / *Manual*. Approvers can **Make Manual…** (reason required; also without an undo, e.g.
+after fixing something in AD by hand) and **Set back to Auto…** (it says what the next sync will then do). Each Manual
+item shows what IDLifecycle *would* have set at the last sync. *Identities* has a *Managed* filter and a *Manual (n)*
+badge. The planner and *Preview impact* skip Manual items; the run counts them as `on_hold`.
+
+> A person who left HR but is Manual (whole person or state) is **not disabled**. The run counts them as
+> `manual_not_disabled`, the *identity issues* email names them and their page shows a warning.
+
+Undo can't be requested while **dry run** is on (nothing is applied in dry run) or when **Settings → Undo** is off.
+Every step is in History: `change.undo_requested`, the approval, `change.applied` / `change.failed` of the undo, `change.undone` on the original,
+`undo.batch_requested` / `undo.batch_approved` / `undo.batch_rejected`, and `identity.hold_added` / `identity.hold_released`
+(shown as *Set to Manual* / *Set back to Auto*).
 
 ### OU placement (by department)
 
@@ -537,21 +723,54 @@ it restores into **any** supported database - also to move from SQLite to SQL Se
 ## History and search
 
 **History** (Operate) searches the hash-chained audit log: every proposed, approved, rejected, applied or failed change,
-sync runs, sign-ins and failed sign-ins, settings / mapping / role / source / user changes, backups and restores,
-service start and stop. Type words or a query, or use the filters (*What*, *When*, *Errors and failures only*):
+sync runs, sign-ins and failed sign-ins, settings / mapping / role / source / user changes, people added by hand,
+undos and holds, what happened to each person (below), backups and restores, service start and stop. Type words or a
+query, or use the filters (*What*, *When*, *Errors and failures only*). **Console activity** shows everything people
+did (`-actor:system -actor:oidc -actor:anonymous`), **Sign-ins** the sign-ins:
 
 | Query | Finds |
 |---|---|
 | `timeout dc01` / `"password expired"` | entries mentioning both words / the phrase (actor, action, entity or detail) |
 | `-dryrun` | leaves out entries mentioning a word |
 | `actor:alice` (repeat for any of several), `actor:system` | who did it |
+| `-actor:system`, `-action:auth.*`, `-type:change` | leaves out an actor, action or entity type |
 | `action:change.failed`, `action:change.*` | what happened; `*` at the end = prefix |
-| `type:change id:<id>` | everything about one change, run, source, user ... |
+| `type:change id:<id>` | everything about one change, run, source, mapping, role, user, manual_person, identity ... |
 | `level:error` | failures: `*failed / *denied / *rejected / *blocked` actions, or a non-empty `error` in the detail |
 | `since:7d`, `since:2026-10-01`, `before:2026-10-25T08:00` | time range (local time) |
 
 Click an actor, action or entity in the results to add it to the query. *Export CSV* downloads up to 10,000 matching
 entries (`/api/audit?q=...&format=csv`; the export itself is recorded).
+
+**What a console change records.** The signed-in user and their IP address, and:
+* updates: every changed field with its value before and after (`changes`), shown as a *Field / Before / After* table;
+* creates and deletes: the object's fields (`fields`), so a deleted source, mapping, role or user can be read back;
+* passwords, API keys, client secrets, DSNs and the backup passphrase: only that they **changed** (or `(hidden)`),
+  never a value or its ciphertext.
+
+**History of one object.** Sources, mappings, roles, console users and people added by hand have a **History** link
+that opens this page filtered to that object (`type:source id:"<id>"`).
+
+**History of one person.** *Identities* → a person → **History** tab: one timeline, newest first, of everything that
+happened to that person and their account:
+
+| Entry | When |
+|---|---|
+| First seen in *source* / Added in the console by *user* | the identity was created (origin, and who added a manual person) |
+| Record changed in *source* | the HR record changed: each field, before → after (only real changes, not every sync) |
+| Became inactive / Active again | terminated (status value) or missing from the source, and back |
+| Account created, updated, linked, disabled, enabled, deleted | each change: proposed, approved / rejected by whom, applied or failed, with the attributes, groups and OU it set |
+| AD account no longer found | the account disappeared from AD outside IDLifecycle (once per disappearance) |
+| Account deleted from AD | a delete was applied; the last known username, UPN, DN, GUID and attributes are kept |
+| Undo requested / undone (whole or in part), set to Manual / back to Auto | see *Undoing a change* |
+
+The **Overview** tab shows where the person came from and, once the account is gone, a *Removed from AD* box with the
+last known account. **Changes** lists every change for that person.
+
+**Nothing is ever purged.** People stay in the app database after they leave HR and after their account is deleted from
+AD, with their changes and history; a source that still has people can only be disabled, not deleted. The audit log
+holds HR field changes permanently, so it contains whatever personal data those fields hold (a source set to *Only
+these fields* keeps it to that list). Backups include all of it.
 
 ## Operating notes
 
@@ -691,9 +910,15 @@ provider, SMTP host, tenant or client id changes (a stored secret is never sent 
 
 ```powershell
 go test ./...                                  # unit + integration (SQLite, fake AD, httptest, headless-Edge GUI test if Edge is present)
-pwsh -NoProfile -File tests\powershell\Run-Tests.ps1   # Pester tests for the scripts against a stub ActiveDirectory module
+pwsh -NoProfile -File tests\powershell\Run-Tests.ps1   # Pester tests for the scripts against a stub ActiveDirectory module, a fake Graph and a stub Exchange Online module
 $env:IDL_TEST_POSTGRES_DSN = '...'; go test ./internal/store/   # same store suite on PostgreSQL (also IDL_TEST_MSSQL_DSN, IDL_TEST_MYSQL_DSN, IDL_TEST_DB2_DSN)
+go run ./cmd/idl-mockui                        # the web console against an in-browser mock API, no server needed
 ```
+
+[docs/TESTING.md](docs/TESTING.md) explains what each suite proves, how to run a single test or script by hand, and how
+to check your own environment (health check, Test buttons, Preview impact, dry run) before going live. The
+[test map](https://mumbles27.github.io/IDLifecycle/TESTMAP.html) shows which suite covers which code and what stands in
+for AD, Microsoft 365, HR systems and mail.
 
 The PowerShell tests run the real scripts against a **stub** `ActiveDirectory` module with `PSModulePath` restricted
 to the stub, so they cannot reach a real domain.

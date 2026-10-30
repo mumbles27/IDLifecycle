@@ -15,8 +15,10 @@ import (
 
 	"idlifecycle/internal/ad"
 	"idlifecycle/internal/app"
+	"idlifecycle/internal/cloud"
 	"idlifecycle/internal/config"
 	"idlifecycle/internal/datadir"
+	"idlifecycle/internal/secrets"
 )
 
 // checkResult is one readiness check; the installer reads the JSON form. A check that did not
@@ -60,6 +62,7 @@ func cmdCheck(args []string, stdout, stderr io.Writer) int {
 	cfgPath := configFlag(fs)
 	asJSON := fs.Bool("json", false, "print the results as JSON")
 	skipAD := fs.Bool("skip-ad-module", false, "do not check for the ActiveDirectory PowerShell module")
+	testCloud := fs.Bool("cloud", false, "also sign in with the saved Microsoft 365 / Entra ID connection (adds a \"cloud\" check; changes nothing)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -151,6 +154,17 @@ func cmdCheck(args []string, stdout, stderr io.Writer) int {
 		}
 		res = append(res, r)
 	}
+	// Only on request, after the fixed list: the installer never asks for it, so a tenant problem cannot fail an install.
+	if *testCloud {
+		r := checkResult{Name: "cloud", Detail: "not checked: the configuration did not load", Skipped: true}
+		if got["config"].OK {
+			r = cloudCheck(cfg)
+		}
+		if !r.Skipped {
+			ok = ok && r.OK
+		}
+		res = append(res, r)
+	}
 	if *asJSON {
 		b, _ := json.MarshalIndent(map[string]any{"ok": ok, "checks": res}, "", "  ")
 		fmt.Fprintln(stdout, string(b))
@@ -172,4 +186,60 @@ func cmdCheck(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+// cloudCheck signs in with the Microsoft 365 / Entra ID connection saved in the settings (check -cloud) and reports
+// the connection test's result as one check. Skipped when the connection is off.
+func cloudCheck(cfg config.Config) checkResult {
+	r := checkResult{Name: "cloud"}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	st, err := app.OpenStore(ctx, cfg)
+	if err != nil {
+		r.Detail = "not checked: the database is not available"
+		r.Skipped = true
+		return r
+	}
+	settings, err := st.GetSettings(ctx)
+	_ = st.Close()
+	if err != nil {
+		r.Detail = "cannot read the settings: " + err.Error()
+		return r
+	}
+	if !settings.Cloud.Enabled {
+		r.Detail, r.Skipped = "not checked: the Microsoft 365 connection is off", true
+		return r
+	}
+	cipher, err := secrets.Load(cfg.DataDir)
+	if err != nil {
+		r.Detail = "secrets: " + err.Error()
+		return r
+	}
+	conn, err := cloud.ConnectionFrom(settings.Cloud, cipher)
+	if err != nil {
+		r.Detail = err.Error()
+		return r
+	}
+	ps := &ad.PowerShellClient{Exe: cfg.PowerShell.Exe, ScriptsDir: cfg.PowerShell.ScriptsDir, ExecutionPolicy: cfg.PowerShell.ExecutionPolicy,
+		Timeout: time.Duration(cfg.PowerShell.TimeoutSeconds) * time.Second}
+	checks, err := cloud.NewPowerShell(ps).Test(ctx, conn)
+	if err != nil {
+		r.Detail = err.Error()
+		return r
+	}
+	var failed []string
+	for _, c := range checks {
+		if !c.OK {
+			failed = append(failed, c.Name+": "+c.Detail)
+		}
+	}
+	if len(failed) > 0 || len(checks) == 0 {
+		r.Detail = strings.Join(failed, "; ")
+		if r.Detail == "" {
+			r.Detail = "the connection test returned no checks"
+		}
+		return r
+	}
+	r.OK, r.Detail = true, fmt.Sprintf("%d check(s) passed (tenant %s)", len(checks), settings.Cloud.TenantID)
+	return r
 }

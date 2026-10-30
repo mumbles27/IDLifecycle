@@ -4,6 +4,7 @@ import { api } from '../api.js';
 import {
   h, replaceContent, pageHeader, pill, fmtTime, dataTable, listItems, act, confirmDialog, toast,
   errorBox, loading, field, inputText, inputSelect, inputCheck, formModal, mutBtn, notice,
+  historyLink,
 } from '../ui.js';
 
 const ROLES = [
@@ -45,6 +46,7 @@ export async function render(root, ctx) {
             entra ? null : mutBtn('Edit', { class: 'btn-sm', 'data-test': 'edit-user', onclick: () => openEditor(u) }),
             entra ? null : mutBtn('Reset password', { class: 'btn-sm', 'data-test': 'reset-user', onclick: () => openReset(u) }),
             self ? null : mutBtn(u.disabled ? 'Enable' : 'Disable', { class: 'btn-sm', 'data-test': 'toggle-user', onclick: (e) => toggle(u, e.currentTarget) }),
+            historyLink('user', u.id),
             self ? null : mutBtn('Delete', { class: 'btn-sm btn-danger', 'data-test': 'delete-user', onclick: (e) => remove(u, e.currentTarget) }));
         },
       },

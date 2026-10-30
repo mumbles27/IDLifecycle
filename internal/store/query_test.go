@@ -26,10 +26,14 @@ func TestParseAuditQuery(t *testing.T) {
 	if err != nil || strings.Join(f.Actors, ",") != "system:auto" || f.From.Hour() != 8 {
 		t.Errorf("quoted value / local datetime: %+v %v", f, err)
 	}
-	for _, bad := range []string{"colour:red", "level:info", "since:yesterday", "since:1d before:2d", "-actor:x", "actor:"} {
+	for _, bad := range []string{"colour:red", "level:info", "since:yesterday", "since:1d before:2d", "-id:x", "-level:error", "-actor:", "actor:"} {
 		if _, err := ParseAuditQuery(bad, now, time.UTC); err == nil {
 			t.Errorf("%q must be refused", bad)
 		}
+	}
+	f, err = ParseAuditQuery(`-actor:system -by:bob -action:sync.* -type:Run`, now, time.UTC)
+	if err != nil || strings.Join(f.NotActors, ",") != "system,bob" || strings.Join(f.NotActions, ",") != "sync.*" || strings.Join(f.NotEntityTypes, ",") != "run" || len(f.Actors) != 0 {
+		t.Errorf("negated field terms: %+v %v", f, err)
 	}
 	if f, err := ParseAuditQuery("   ", now, time.UTC); err != nil || len(f.Text) != 0 {
 		t.Errorf("empty query: %+v %v", f, err)
@@ -78,20 +82,24 @@ func testSearchAudit(t *testing.T, s *Store) {
 		return out
 	}
 	cases := map[string]string{
-		"level:error":                 "auth.login_failed,change.failed",
-		"action:change.*":             "change.applied,change.failed,change.approve",
-		"action:change.* -approve":    "change.applied,change.failed",
-		"actor:alice":                 "settings.update,change.approve",
-		"actor:alice actor:bob":       "settings.update,auth.login_failed,change.approve",
-		"timeout":                     "change.failed",
-		"TIMEOUT dc01":                "change.failed",
-		`"looks fine"`:                "change.approve",
-		"dry_run":                     "settings.update",
-		"type:user":                   "auth.login_failed",
-		"id:c-3":                      "change.applied",
-		"since:1h action:sync.finish": "sync.finish",
-		"before:2000-01-01":           "",
-		"100%_wild":                   "",
+		"level:error":                  "auth.login_failed,change.failed",
+		"action:change.*":              "change.applied,change.failed,change.approve",
+		"action:change.* -approve":     "change.applied,change.failed",
+		"actor:alice":                  "settings.update,change.approve",
+		"actor:alice actor:bob":        "settings.update,auth.login_failed,change.approve",
+		"timeout":                      "change.failed",
+		"TIMEOUT dc01":                 "change.failed",
+		`"looks fine"`:                 "change.approve",
+		"dry_run":                      "settings.update",
+		"type:user":                    "auth.login_failed",
+		"id:c-3":                       "change.applied",
+		"since:1h action:sync.finish":  "sync.finish",
+		"before:2000-01-01":            "",
+		"100%_wild":                    "",
+		"-actor:system":                "settings.update,auth.login_failed,change.approve",
+		"-actor:system -actor:bob":     "settings.update,change.approve",
+		"action:change.* -actor:alice": "change.applied,change.failed",
+		"-action:change.* -type:run":   "settings.update,auth.login_failed",
 	}
 	for q, want := range cases {
 		if got := strings.Join(search(q), ","); got != want {

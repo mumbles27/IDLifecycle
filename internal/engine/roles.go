@@ -47,6 +47,9 @@ func ValidateRole(r model.RoleRule) error {
 		if strings.TrimSpace(g) == "" {
 			return fmt.Errorf("grants.groups[%d] is empty", i)
 		}
+		if _, ok := model.CloudGroupID(g); model.IsCloudGroupRef(g) && !ok {
+			return fmt.Errorf("grants.groups[%d]: %q is not a cloud group reference (entra:<group object id>)", i, g)
+		}
 	}
 	seen := map[string]bool{}
 	for i, a := range r.Grants.Attributes {

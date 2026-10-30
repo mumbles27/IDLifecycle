@@ -13,7 +13,7 @@
 
     Response (ok:true):
       {"ok":true,
-       "users":[{"objectGuid","dn","sam","upn","enabled","parentOu","externalId","attributes":{..},"memberOf":[..]}],
+       "users":[{"objectGuid","dn","sam","upn","sid","enabled","parentOu","externalId","attributes":{..},"memberOf":[..]}],
        "groups":[{"identity","dn","found"}]}
 
     Users are every user under the search bases whose idAttribute is populated (enabled or not), fetched with
@@ -144,6 +144,7 @@ try{
                     dn         = [string]$user.DistinguishedName
                     sam        = [string]$user.SamAccountName
                     upn        = (Get-IDLAdValue -Object $user -Name 'UserPrincipalName')
+                    sid        = (Get-IDLAdValue -Object $user -Name 'SID')
                     enabled    = [bool]$user.Enabled
                     parentOu   = (Get-IDLParentDn -Dn ([string]$user.DistinguishedName))
                     externalId = $externalId
