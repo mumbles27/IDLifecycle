@@ -100,7 +100,7 @@ func (s *Server) handleDownloadBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := filepath.Join(backup.Folder(s.Config, st.Backup), name)
-	f, err := os.Open(path)
+	f, err := os.Open(path) // #nosec G304 -- name checked by backup.ValidName (fixed pattern, no separators) above
 	if err != nil {
 		http.NotFound(w, r)
 		return

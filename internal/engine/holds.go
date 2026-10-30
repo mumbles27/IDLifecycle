@@ -31,12 +31,7 @@ func (pc *PlanContext) holdFor(identityID, kind, key string) *model.Hold {
 	return nil
 }
 
-// held reports whether an active hold of identityID covers kind/key.
-func (pc *PlanContext) held(identityID, kind, key string) bool {
-	return pc.holdFor(identityID, kind, key) != nil
-}
-
-// hold is held, counting a suppressed item and remembering what the hold stopped (what, e.g. "would set title to
+// hold reports whether an active hold of identityID covers kind/key, counting a suppressed item and remembering what the hold stopped (what, e.g. "would set title to
 // 'Lead'"), so the console can say what IDLifecycle would do if the item were set back to Auto.
 func (pc *PlanContext) hold(identityID, kind, key, what string) bool {
 	h := pc.holdFor(identityID, kind, key)

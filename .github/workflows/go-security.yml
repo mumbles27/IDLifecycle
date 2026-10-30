@@ -26,8 +26,22 @@ jobs:
       - name: Go vet
         run: go vet ./...
       - name: Tests with race detector
-        run: go test -race ./...
+        # The plain test output goes to the log; every failed test (with its output, e.g. a data race report) also
+        # becomes an annotation, which can be read without opening the log.
+        run: |
+          status=0
+          go test -race -json ./... > test-results.json || status=$?
+          jq -r 'select(.Action=="output") | .Output' test-results.json | tr -d '\r'
+          jq -rs '
+            (map(select(.Action=="output")) | group_by([.Package, (.Test // "")])
+              | map({key: "\(.[0].Package)|\(.[0].Test // "")", value: (map(.Output) | join(""))}) | from_entries) as $out
+            | map(select(.Action=="fail"))[]
+            | "::error title=FAIL \(.Package) \(.Test // "(package)")::"
+              + (($out["\(.Package)|\(.Test // "")"] // "") | .[-3500:] | gsub("%"; "%25") | gsub("\r"; "") | gsub("\n"; "%0A"))
+          ' test-results.json
+          exit $status
       - name: Staticcheck
+        if: ${{ !cancelled() }}
         run: |
           go install honnef.co/go/tools/cmd/staticcheck@latest
           "$(go env GOPATH)/bin/staticcheck" ./...
@@ -69,7 +83,18 @@ jobs:
           scan-ref: .
           scanners: vuln,misconfig
           severity: HIGH,CRITICAL
-          exit-code: '1'
+          format: json
+          output: trivy-results.json
+          exit-code: '0'
+      - name: Report findings
+        # One annotation per HIGH/CRITICAL finding; fails when there is any (as exit-code 1 did).
+        run: |
+          jq -r '.Results[]? | .Target as $t
+            | ((.Vulnerabilities // [])[] | "::error file=\($t),title=\(.VulnerabilityID) (\(.Severity))::\(.PkgName) \(.InstalledVersion), fixed in \(.FixedVersion // "no fix yet"): \(.Title // "")"),
+              ((.Misconfigurations // [])[] | "::error file=\($t),title=\(.ID) (\(.Severity))::\(.Title): \(.Message)")' trivy-results.json
+          n=$(jq '[.Results[]? | ((.Vulnerabilities // []) + (.Misconfigurations // []))[]] | length' trivy-results.json)
+          echo "HIGH/CRITICAL findings: $n"
+          test "$n" -eq 0
 
   gitleaks:
     name: Secrets in Git history

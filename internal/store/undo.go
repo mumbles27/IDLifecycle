@@ -78,7 +78,7 @@ func (s *Store) attachUndo(ctx context.Context, list []model.Change) error {
 	for rows.Next() {
 		var id, state, by string
 		if err := rows.Scan(&id, &state, &by); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return err
 		}
 		c := &list[idx[id]]
@@ -89,7 +89,7 @@ func (s *Store) attachUndo(ctx context.Context, list []model.Change) error {
 		}
 		c.UndoneBy = by
 	}
-	rows.Close()
+	_ = rows.Close()
 	if err := rows.Err(); err != nil {
 		return err
 	}
@@ -239,12 +239,12 @@ func (s *Store) listHolds(ctx context.Context, q string, args ...any) ([]model.H
 	for rows.Next() {
 		h, err := scanHold(rows)
 		if err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return nil, err
 		}
 		out = append(out, h)
 	}
-	rows.Close()
+	_ = rows.Close()
 	if err := rows.Err(); err != nil || len(out) == 0 {
 		return out, err
 	}

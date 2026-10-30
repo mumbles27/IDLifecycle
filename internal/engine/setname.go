@@ -271,7 +271,7 @@ func (e *Engine) SetIdentityLink(ctx context.Context, identityID, guid string, c
 	decision := ""
 	if !clear {
 		guid = strings.TrimSpace(guid)
-		if guid == "" || len(guid) > 64 || strings.Trim(guid, "0123456789abcdefABCDEF-guid") != "" {
+		if guid == "" || len(guid) > 64 || strings.Trim(guid, "0123456789abcdefABCDEF-gui") != "" {
 			return id, fmt.Errorf("%w: %q is not an objectGUID", ErrInvalid, guid)
 		}
 		if id.ADGUID != "" {

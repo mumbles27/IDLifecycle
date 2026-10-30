@@ -20,13 +20,6 @@ func (e *env) onePending(typ string) model.Change {
 	return list[0]
 }
 
-func (e *env) execute() {
-	e.t.Helper()
-	if _, err := e.eng.Execute(e.ctx); err != nil {
-		e.t.Fatal(err)
-	}
-}
-
 func TestManualNameConflictWaitsForAPersonToChoose(t *testing.T) {
 	e := newEnv(t)
 	n := &recordingNotifier{}

@@ -311,7 +311,7 @@ func (s *Store) ListChanges(ctx context.Context, f ChangeFilter, p Page) ([]mode
 	if err := rows.Err(); err != nil {
 		return nil, 0, err
 	}
-	rows.Close()
+	_ = rows.Close()
 	return out, total, s.attachUndo(ctx, out)
 }
 

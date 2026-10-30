@@ -3,6 +3,7 @@
 package sources
 
 import (
+	"math"
 	"unicode/utf16"
 
 	"golang.org/x/sys/windows"
@@ -23,12 +24,16 @@ func ansiToUTF8(b []byte) string {
 	if len(b) == 0 {
 		return ""
 	}
-	n, err := windows.MultiByteToWideChar(cpACP, 0, &b[0], int32(len(b)), nil, 0)
+	if len(b) > math.MaxInt32 {
+		return string(b)
+	}
+	size := int32(len(b)) // #nosec G115 -- at most MaxInt32, checked above
+	n, err := windows.MultiByteToWideChar(cpACP, 0, &b[0], size, nil, 0)
 	if err != nil || n <= 0 {
 		return string(b)
 	}
 	w := make([]uint16, n)
-	n, err = windows.MultiByteToWideChar(cpACP, 0, &b[0], int32(len(b)), &w[0], n)
+	n, err = windows.MultiByteToWideChar(cpACP, 0, &b[0], size, &w[0], n)
 	if err != nil || n <= 0 {
 		return string(b)
 	}

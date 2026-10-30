@@ -95,7 +95,7 @@ func (c *CloudSettings) Validate() error {
 	c.applyDefaults()
 	c.TenantID = strings.ToLower(strings.TrimSpace(c.TenantID))
 	c.ClientID = strings.ToLower(strings.TrimSpace(c.ClientID))
-	c.CertThumbprint = strings.ToUpper(strings.NewReplacer(" ", "", ":", "", "‎", "").Replace(strings.TrimSpace(c.CertThumbprint)))
+	c.CertThumbprint = strings.ToUpper(strings.NewReplacer(" ", "", ":", "", "\u200e", "").Replace(strings.TrimSpace(c.CertThumbprint)))
 	c.Exchange.Organization = strings.ToLower(strings.TrimSpace(c.Exchange.Organization))
 	switch c.Environment {
 	case CloudGlobal, CloudUSGov, CloudUSGovDoD, CloudChina:

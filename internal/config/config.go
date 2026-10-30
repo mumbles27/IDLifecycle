@@ -88,7 +88,7 @@ func (c Config) BrandingFolder() string {
 
 // Load reads and validates path. Missing fields take defaults.
 func Load(path string) (Config, error) {
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(path) // #nosec G304 -- config.json given by the administrator
 	if err != nil {
 		return Config{}, fmt.Errorf("read config: %w", err)
 	}

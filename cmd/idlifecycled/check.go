@@ -130,7 +130,7 @@ func cmdCheck(args []string, stdout, stderr io.Writer) int {
 			skip("ad_module", "not checked: PowerShell was not found")
 		default:
 			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-			out, err := exec.CommandContext(ctx, pwsh, "-NoProfile", "-NonInteractive", "-Command",
+			out, err := exec.CommandContext(ctx, pwsh, "-NoProfile", "-NonInteractive", "-Command", // #nosec G204 -- pwsh from the protected config, fixed arguments
 				"$m = Get-Module -ListAvailable ActiveDirectory | Select-Object -First 1; if ($m) { $m.Version.ToString() } else { exit 1 }").Output()
 			cancel()
 			if err != nil {

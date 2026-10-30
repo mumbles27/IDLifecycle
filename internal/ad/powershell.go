@@ -140,7 +140,7 @@ func (c *PowerShellClient) run(ctx context.Context, script string, dryRun bool, 
 		args = append(args, "-DryRun")
 	}
 
-	cmd := exec.CommandContext(ctx, c.Exe, args...)
+	cmd := exec.CommandContext(ctx, c.Exe, args...) // #nosec G204 -- pwsh from the protected config; args are fixed flags and a script in the protected scripts folder; data goes on stdin
 	cmd.Stdin = bytes.NewReader(payload)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

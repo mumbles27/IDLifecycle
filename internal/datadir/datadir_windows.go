@@ -75,7 +75,7 @@ func broadReaders(path string, isDir bool) ([]Problem, error) {
 		if isDir && ace.Header.AceFlags&objInherit == 0 {
 			continue
 		}
-		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart)).String()
+		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart)).String() // #nosec G103 -- the SID inside an ACE returned by the Windows API
 		if name, ok := broadName(sid); ok {
 			out = append(out, Problem{Path: path, Principal: name})
 		}
@@ -188,7 +188,7 @@ func broadWritersMask(path string, isDir bool, mask uint32) ([]Problem, error) {
 		if isDir && ace.Header.AceFlags&inheritOnly != 0 {
 			continue
 		}
-		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart)).String()
+		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart)).String() // #nosec G103 -- the SID inside an ACE returned by the Windows API
 		if name, ok := broadName(sid); ok {
 			out = append(out, Problem{Path: path, Principal: name})
 		}

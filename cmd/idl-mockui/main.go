@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 func main() {
@@ -42,7 +43,8 @@ func main() {
 	fmt.Printf("Mock console:   %s/mock/mock.html?autologin=admin#/dashboard\n", base)
 	fmt.Printf("Mock selftest:  %s/mock/mock-selftest.html?user=admin&pass=admin-pass\n", base)
 	fmt.Println("Mock sign-ins: admin / admin-pass, approver1 / approver-pass (see mock-api.js). Ctrl+C to stop.")
-	if err := http.Serve(ln, mux); err != nil {
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: time.Minute, WriteTimeout: time.Minute, IdleTimeout: 2 * time.Minute}
+	if err := srv.Serve(ln); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
