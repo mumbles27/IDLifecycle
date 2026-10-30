@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/cookiejar"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -22,7 +23,7 @@ import (
 
 func TestServiceBootsServesGUIAndStopsGracefully(t *testing.T) {
 	api.BcryptCost = 4
-	dir := t.TempDir()
+	dir := privateTempDir(t)
 	cfg := config.Default(dir)
 	cfg.Listen = "127.0.0.1:0"
 	cfg.PowerShell.ScriptsDir = filepath.Join(dir, "no-scripts-here") // missing scripts only warn at startup
@@ -117,10 +118,21 @@ func TestServiceBootsServesGUIAndStopsGracefully(t *testing.T) {
 }
 
 func TestNewFailsClearlyOnBadDatabase(t *testing.T) {
-	cfg := config.Default(t.TempDir())
+	cfg := config.Default(privateTempDir(t))
 	cfg.Database.Driver = "postgres"
 	cfg.Database.DSN = "env:IDL_DEFINITELY_UNSET_DSN"
 	if _, err := New(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil))); err == nil || !strings.Contains(err.Error(), "IDL_DEFINITELY_UNSET_DSN") {
 		t.Fatalf("expected a clear DSN error, got %v", err)
 	}
+}
+
+// privateTempDir is a data folder the service accepts: on Linux/macOS a temp dir is 0755, which the startup check
+// refuses (group/other can read the database and the key), so make it owner-only like `idlifecycled lockdown` does.
+func privateTempDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return dir
 }

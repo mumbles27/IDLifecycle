@@ -37,7 +37,9 @@ jobs:
               | map({key: "\(.[0].Package)|\(.[0].Test // "")", value: (map(.Output) | join(""))}) | from_entries) as $out
             | map(select(.Action=="fail"))[]
             | "::error title=FAIL \(.Package) \(.Test // "(package)")::"
-              + (($out["\(.Package)|\(.Test // "")"] // "") | .[-3500:] | gsub("%"; "%25") | gsub("\r"; "") | gsub("\n"; "%0A"))
+              + (($out["\(.Package)|\(.Test // "")"] // "")
+                  | (if contains("WARNING: DATA RACE") then .[index("WARNING: DATA RACE"):][0:6000] else .[-3500:] end)
+                  | gsub("%"; "%25") | gsub("\r"; "") | gsub("\n"; "%0A"))
           ' test-results.json
           exit $status
       - name: Staticcheck
